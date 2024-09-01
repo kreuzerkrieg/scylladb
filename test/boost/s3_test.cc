@@ -50,8 +50,8 @@ s3::endpoint_config_ptr make_minio_config() {
         .aws = {{
             .access_key_id = tests::getenv_safe("AWS_ACCESS_KEY_ID"),
             .secret_access_key = tests::getenv_safe("AWS_SECRET_ACCESS_KEY"),
-            .session_token = ::getenv("AWS_SESSION_TOKEN") ? : "",
-            .region = ::getenv("AWS_DEFAULT_REGION") ? : "local",
+            .session_token = ::getenv("AWS_SESSION_TOKEN") ?: "",
+            .region = ::getenv("AWS_DEFAULT_REGION") ?: "local",
         }},
     };
     return make_lw_shared<s3::endpoint_config>(std::move(cfg));
@@ -62,6 +62,33 @@ s3::endpoint_config_ptr make_minio_config() {
  * with the bucket named env['S3_BUCKET_FOR_TEST'] created with
  * unrestricted anonymous read-write access
  */
+
+SEASTAR_THREAD_TEST_CASE(test_delete_object_idempotency) {
+    const sstring name(fmt::format("/{}/testobject-{}", tests::getenv_safe("S3_BUCKET_FOR_TEST"), ::getpid()));
+
+    testlog.info("Make client\n");
+    semaphore mem(16 << 20);
+    auto cln = s3::client::make(tests::getenv_safe("S3_SERVER_ADDRESS_FOR_TEST"), make_minio_config(), mem);
+    auto close_client = deferred_close(*cln);
+
+    testlog.info("Put object {}\n", name);
+    temporary_buffer<char> data = sstring("1234567890").release();
+    cln->put_object(name, std::move(data)).get();
+
+    testlog.info("Get object size\n");
+    size_t sz = cln->get_object_size(name).get();
+    BOOST_REQUIRE_EQUAL(sz, 10);
+
+    testlog.info("Delete object\n");
+    cln->delete_object(name).get();
+
+    testlog.info("Verify it's gone\n");
+    BOOST_REQUIRE_EXCEPTION(cln->get_object_size(name).get(), storage_io_error, [](const storage_io_error& ex) { return ex.code().value() == ENOENT; });
+
+    testlog.info("Try to delete non-existent objects\n");
+    BOOST_REQUIRE_NO_THROW(cln->delete_object(name).get());
+    BOOST_REQUIRE_NO_THROW(cln->delete_object(fmt::format("/{}/foo/bar/baz.object", tests::getenv_safe("S3_BUCKET_FOR_TEST"))).get());
+}
 
 SEASTAR_THREAD_TEST_CASE(test_client_put_get_object) {
     const sstring name(fmt::format("/{}/testobject-{}", tests::getenv_safe("S3_BUCKET_FOR_TEST"), ::getpid()));
