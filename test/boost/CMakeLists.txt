@@ -263,6 +263,8 @@ add_scylla_test(s3_test
   KIND SEASTAR)
 add_scylla_test(aws_errors_test
   KIND BOOST)
+add_scylla_test(aws_error_injection_test
+  KIND SEASTAR)
 add_scylla_test(schema_change_test
   KIND SEASTAR)
 add_scylla_test(schema_changes_test
