@@ -72,7 +72,15 @@ const std::unordered_map<std::string_view, const aws_error> aws_error_map{
     {"RequestTimeTooSkewedException", aws_error(aws_error_type::REQUEST_TIME_TOO_SKEWED, retryable::yes)},
     {"RequestTimeTooSkewed", aws_error(aws_error_type::REQUEST_TIME_TOO_SKEWED, retryable::yes)},
     {"RequestTimeoutException", aws_error(aws_error_type::REQUEST_TIMEOUT, retryable::yes)},
-    {"RequestTimeout", aws_error(aws_error_type::REQUEST_TIMEOUT, retryable::yes)}};
+    {"RequestTimeout", aws_error(aws_error_type::REQUEST_TIMEOUT, retryable::yes)},
+    {"NoSuchUpload", aws_error(aws_error_type::NO_SUCH_UPLOAD, retryable::no)},
+    {"BucketAlreadyOwnedByYou", aws_error(aws_error_type::BUCKET_ALREADY_OWNED_BY_YOU, retryable::no)},
+    {"ObjectAlreadyInActiveTierError", aws_error(aws_error_type::OBJECT_ALREADY_IN_ACTIVE_TIER, retryable::no)},
+    {"NoSuchBucket", aws_error(aws_error_type::NO_SUCH_BUCKET, retryable::no)},
+    {"NoSuchKey", aws_error(aws_error_type::NO_SUCH_KEY, retryable::no)},
+    {"ObjectNotInActiveTierError", aws_error(aws_error_type::OBJECT_NOT_IN_ACTIVE_TIER, retryable::no)},
+    {"BucketAlreadyExists", aws_error(aws_error_type::BUCKET_ALREADY_EXISTS, retryable::no)},
+    {"BucketAlreadyExists", aws_error(aws_error_type::INVALID_OBJECT_STATE, retryable::no)}};
 
 aws_error::aws_error(aws_error_type error_type, retryable is_retryable) : _type(error_type), _is_retryable(is_retryable) {
 }

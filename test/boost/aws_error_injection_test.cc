@@ -14,7 +14,6 @@
 #include "utils/s3/aws_errors.hh"
 #include "utils/s3/client.hh"
 #include <cstdlib>
-#include <sched.h>
 #include <seastar/core/fstream.hh>
 #include <seastar/core/units.hh>
 #include <seastar/http/httpd.hh>
@@ -38,6 +37,9 @@ struct server {
             sstring response_body;
             if (method == "DELETE") {
                 rep->set_status(http::reply::status_type::no_content);
+                if (url_params.contains("uploadId") && _test_server.test_failure_policy == failure_policy::NONRETRYABLE_FAILURE) {
+                    rep->set_status(http::reply::status_type::not_found);
+                }
             } else if (method == "PUT") {
                 rep->set_status(http::reply::status_type::ok);
                 if (url_params.contains("partNumber") && url_params.contains("uploadId")) {

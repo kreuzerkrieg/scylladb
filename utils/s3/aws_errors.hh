@@ -49,7 +49,17 @@ enum class aws_error_type : uint8_t {
     USER_CANCELLED = 102,
     ENDPOINT_RESOLUTION_FAILURE = 103,
     SERVICE_EXTENSION_START_RANGE = 128,
-    OK = 255 // No error set
+    // S3 specific
+    BUCKET_ALREADY_EXISTS = 129,
+    BUCKET_ALREADY_OWNED_BY_YOU = 130,
+    INVALID_OBJECT_STATE = 131,
+    NO_SUCH_BUCKET = 132,
+    NO_SUCH_KEY = 133,
+    NO_SUCH_UPLOAD = 134,
+    OBJECT_ALREADY_IN_ACTIVE_TIER = 135,
+    OBJECT_NOT_IN_ACTIVE_TIER = 136,
+    // No error set
+    OK = 255
 };
 
 using retryable = seastar::bool_class<struct is_retryable>;
