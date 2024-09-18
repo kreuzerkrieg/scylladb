@@ -14,7 +14,6 @@
 #include "utils/s3/aws_errors.hh"
 #include "utils/s3/client.hh"
 #include <cstdlib>
-#include <sched.h>
 #include <seastar/core/fstream.hh>
 #include <seastar/core/units.hh>
 #include <seastar/http/httpd.hh>
@@ -27,6 +26,7 @@ struct server {
         SUCCESS = 0,
         RETRYABLE_FAILURE = 1,
         NONRETRYABLE_FAILURE = 2,
+        NEVERENDING_RETRYABLE_FAILURE = 3,
     };
     class dummy_aws_request_handler : public httpd::handler_base {
     public:
@@ -38,6 +38,9 @@ struct server {
             sstring response_body;
             if (method == "DELETE") {
                 rep->set_status(http::reply::status_type::no_content);
+                if (url_params.contains("uploadId") && _test_server.test_failure_policy == failure_policy::NONRETRYABLE_FAILURE) {
+                    rep->set_status(http::reply::status_type::not_found);
+                }
             } else if (method == "PUT") {
                 rep->set_status(http::reply::status_type::ok);
                 if (url_params.contains("partNumber") && url_params.contains("uploadId")) {
@@ -71,8 +74,11 @@ struct server {
                                      <ETag>"3858f62230ac3c915f300c664312c11f-9"</ETag>
                                 </CompleteMultipartUploadResult>)";
                 case failure_policy::RETRYABLE_FAILURE:
-                    // should succeed on retry
-                    _test_server.test_failure_policy = failure_policy::SUCCESS;
+                case failure_policy::NEVERENDING_RETRYABLE_FAILURE:
+                    if (_test_server.test_failure_policy == failure_policy::RETRYABLE_FAILURE) {
+                        // should succeed on retry
+                        _test_server.test_failure_policy = failure_policy::SUCCESS;
+                    }
                     assert(aws::aws_error_map.at("InternalError").is_retryable());
                     return R"(<?xml version="1.0" encoding="UTF-8"?>
 
@@ -238,7 +244,22 @@ SEASTAR_THREAD_TEST_CASE(test_multipart_upload_file_retryable_success) {
     BOOST_REQUIRE_NO_THROW(test_client_upload_file(seastar_test::get_name(), address, port, total_size, memory_size));
 }
 
-SEASTAR_THREAD_TEST_CASE(test_multipart_upload_file_failure) {
+SEASTAR_THREAD_TEST_CASE(test_multipart_upload_file_failure_1) {
+    auto port = network_unshare.get_port();
+    auto address = network_unshare.get_address();
+    server server(server::failure_policy::NEVERENDING_RETRYABLE_FAILURE);
+    server.start(address, port).get();
+    auto close_server = deferred_stop(server);
+    const size_t part_size = 5_MiB;
+    const size_t remainder_size = part_size / 2;
+    const size_t total_size = 4 * part_size + remainder_size;
+    const size_t memory_size = part_size;
+    BOOST_REQUIRE_EXCEPTION(test_client_upload_file(seastar_test::get_name(), address, port, total_size, memory_size),
+                            storage_io_error,
+                            [](const storage_io_error& e) { return e.code().value() == EIO; });
+}
+
+SEASTAR_THREAD_TEST_CASE(test_multipart_upload_file_failure_2) {
     auto port = network_unshare.get_port();
     auto address = network_unshare.get_address();
     server server(server::failure_policy::NONRETRYABLE_FAILURE);
@@ -293,7 +314,17 @@ SEASTAR_THREAD_TEST_CASE(test_multipart_upload_sink_retryable_success) {
     BOOST_REQUIRE_NO_THROW(do_test_client_multipart_upload(address, port));
 }
 
-SEASTAR_THREAD_TEST_CASE(test_multipart_upload_sink_failure) {
+SEASTAR_THREAD_TEST_CASE(test_multipart_upload_sink_failure_1) {
+    auto port = network_unshare.get_port();
+    auto address = network_unshare.get_address();
+    server server(server::failure_policy::NEVERENDING_RETRYABLE_FAILURE);
+    server.start(address, port).get();
+    auto close_server = deferred_stop(server);
+    BOOST_REQUIRE_EXCEPTION(
+        do_test_client_multipart_upload(address, port), storage_io_error, [](const storage_io_error& e) { return e.code().value() == EIO; });
+}
+
+SEASTAR_THREAD_TEST_CASE(test_multipart_upload_sink_failure_2) {
     auto port = network_unshare.get_port();
     auto address = network_unshare.get_address();
     server server(server::failure_policy::NONRETRYABLE_FAILURE);

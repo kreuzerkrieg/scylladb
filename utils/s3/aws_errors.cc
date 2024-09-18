@@ -13,6 +13,8 @@
 #endif
 
 #include "utils/s3/aws_errors.hh"
+
+#include <seastar/http/reply.hh>
 #include <unordered_map>
 
 namespace aws {
@@ -72,7 +74,15 @@ const std::unordered_map<std::string_view, const aws_error> aws_error_map{
     {"RequestTimeTooSkewedException", aws_error(aws_error_type::REQUEST_TIME_TOO_SKEWED, retryable::yes)},
     {"RequestTimeTooSkewed", aws_error(aws_error_type::REQUEST_TIME_TOO_SKEWED, retryable::yes)},
     {"RequestTimeoutException", aws_error(aws_error_type::REQUEST_TIMEOUT, retryable::yes)},
-    {"RequestTimeout", aws_error(aws_error_type::REQUEST_TIMEOUT, retryable::yes)}};
+    {"RequestTimeout", aws_error(aws_error_type::REQUEST_TIMEOUT, retryable::yes)},
+    {"NoSuchUpload", aws_error(aws_error_type::NO_SUCH_UPLOAD, retryable::no)},
+    {"BucketAlreadyOwnedByYou", aws_error(aws_error_type::BUCKET_ALREADY_OWNED_BY_YOU, retryable::no)},
+    {"ObjectAlreadyInActiveTierError", aws_error(aws_error_type::OBJECT_ALREADY_IN_ACTIVE_TIER, retryable::no)},
+    {"NoSuchBucket", aws_error(aws_error_type::NO_SUCH_BUCKET, retryable::no)},
+    {"NoSuchKey", aws_error(aws_error_type::NO_SUCH_KEY, retryable::no)},
+    {"ObjectNotInActiveTierError", aws_error(aws_error_type::OBJECT_NOT_IN_ACTIVE_TIER, retryable::no)},
+    {"BucketAlreadyExists", aws_error(aws_error_type::BUCKET_ALREADY_EXISTS, retryable::no)},
+    {"BucketAlreadyExists", aws_error(aws_error_type::INVALID_OBJECT_STATE, retryable::no)}};
 
 aws_error::aws_error(aws_error_type error_type, retryable is_retryable) : _type(error_type), _is_retryable(is_retryable) {
 }
@@ -81,11 +91,9 @@ aws_error::aws_error(aws_error_type error_type, std::string&& error_message, ret
     : _type(error_type), _message(std::move(error_message)), _is_retryable(is_retryable) {
 }
 
-aws_error aws_error::parse(seastar::sstring&& body) {
-    aws_error ret_val;
-
+std::optional<aws_error> aws_error::parse(seastar::sstring&& body) {
     if (body.empty()) {
-        return ret_val;
+        return {};
     }
 
     rapidxml::xml_document<> doc;
@@ -93,7 +101,7 @@ aws_error aws_error::parse(seastar::sstring&& body) {
         doc.parse<0>(body.data());
     } catch (const rapidxml::parse_error&) {
         // Most likely not an XML which is possible, just return
-        return ret_val;
+        return {};
     }
 
     const auto* error_node = doc.first_node("Error");
@@ -105,7 +113,7 @@ aws_error aws_error::parse(seastar::sstring&& body) {
     }
 
     if (!error_node) {
-        return ret_val;
+        return {};
     }
 
     const auto* code_node = error_node->first_node("Code");
@@ -121,16 +129,45 @@ aws_error aws_error::parse(seastar::sstring&& body) {
         } else if (colon_loc != std::string::npos) {
             code = code.substr(0, colon_loc);
         }
+        aws_error ret_val;
         if (aws_error_map.contains(code)) {
             ret_val = aws_error_map.at(code);
         } else {
             ret_val._type = aws_error_type::UNKNOWN;
         }
         ret_val._message = message_node->value();
-    } else {
-        ret_val._type = aws_error_type::UNKNOWN;
+        return ret_val;
     }
-    return ret_val;
+    // No error in the body
+    return {};
 }
 
+aws_error aws_error::from_http_code(seastar::http::reply::status_type http_code) {
+    aws_error error;
+    switch (http_code) {
+    case seastar::http::reply::status_type::unauthorized:
+    case seastar::http::reply::status_type::forbidden:
+        return aws_error_map.at("AccessDenied");
+    case seastar::http::reply::status_type::not_found:
+        return aws_error_map.at("ResourceNotFound");
+    case seastar::http::reply::status_type::too_many_requests:
+        return aws_error_map.at("SlowDown");
+    case seastar::http::reply::status_type::internal_server_error:
+        return aws_error_map.at("InternalError");
+    case seastar::http::reply::status_type::bandwidth_limit_exceeded:
+        return aws_error_map.at("Throttling");
+    case seastar::http::reply::status_type::service_unavailable:
+        return aws_error_map.at("ServiceUnavailable");
+    case seastar::http::reply::status_type::request_timeout:
+    case seastar::http::reply::status_type::page_expired:
+    case seastar::http::reply::status_type::login_timeout:
+    case seastar::http::reply::status_type::gateway_timeout:
+    case seastar::http::reply::status_type::network_connect_timeout:
+    case seastar::http::reply::status_type::network_read_timeout:
+        return aws_error_map.at("RequestTimeout");
+    default:
+        int code_value = static_cast<int>(http_code);
+        return {aws_error_type::UNKNOWN, aws::retryable{code_value >= 500 && code_value < 600}};
+    }
+}
 } // namespace aws
