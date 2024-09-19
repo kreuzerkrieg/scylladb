@@ -36,6 +36,7 @@ from scripts import coverage    # type: ignore
 from test.pylib.artifact_registry import ArtifactRegistry
 from test.pylib.host_registry import HostRegistry
 from test.pylib.pool import Pool
+from test.pylib.s3_server_mock import MockS3Server
 from test.pylib.util import LogPrefixAdapter
 from test.pylib.scylla_cluster import ScyllaServer, ScyllaCluster, get_cluster_manager, merge_cmdline_options
 from test.pylib.minio_server import MinioServer
@@ -1504,6 +1505,11 @@ async def run_all_tests(signaled: asyncio.Event, options: argparse.Namespace) ->
     await ms.start()
     TestSuite.artifacts.add_exit_artifact(None, ms.stop)
 
+    hosts = HostRegistry()
+    mock_s3_server = MockS3Server(await hosts.lease_host(), 2012,
+                                  LogPrefixAdapter(logging.getLogger('s3_mock'), {'prefix': 's3_mock'}))
+    mock_s3_server.start()
+
     console.print_start_blurb()
     try:
         TestSuite.artifacts.add_exit_artifact(None, TestSuite.hosts.cleanup)
@@ -1524,6 +1530,7 @@ async def run_all_tests(signaled: asyncio.Event, options: argparse.Namespace) ->
         return
     finally:
         await TestSuite.artifacts.cleanup_before_exit()
+        mock_s3_server.stop()
 
     console.print_end_blurb()
 
