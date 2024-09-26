@@ -47,6 +47,12 @@ struct server {
                     rep->add_header("ETag", "SomeTag_" + url_params.at("partNumber"));
                 }
                 rep->add_header("ETag", "SomeTag");
+                if (!req->get_header("x-amz-copy-source").empty()) {
+                    response_body= R"(<CopyPartResult>
+                                           <LastModified>2011-04-11T20:34:56.000Z</LastModified>
+                                           <ETag>"9b2cf535f27731c974343645a3985328"</ETag>
+                                        </CopyPartResult>)";
+                }
             } else if (method == "POST") {
                 response_body = build_response(*req);
             }
@@ -274,8 +280,8 @@ SEASTAR_THREAD_TEST_CASE(test_multipart_upload_file_failure_2) {
                             [](const storage_io_error& e) { return e.code().value() == EIO; });
 }
 
-void do_test_client_multipart_upload(const std::string& address, uint16_t port) {
-    const sstring name(fmt::format("/{}/testobject-{}", "test", "large", ::getpid()));
+void do_test_client_multipart_upload(const std::string& address, uint16_t port, bool is_jumbo = false) {
+    const sstring name(fmt::format("/{}/testobject-{}-{}", "test", is_jumbo ? "jumbo" : "large", ::getpid()));
 
     testlog.info("Make client");
     semaphore mem(16 << 20);
@@ -283,7 +289,7 @@ void do_test_client_multipart_upload(const std::string& address, uint16_t port) 
     auto close_client = deferred_close(*cln);
 
     testlog.info("Upload object");
-    auto out = output_stream<char>(cln->make_upload_sink(name));
+    auto out = output_stream<char>(is_jumbo ? cln->make_upload_jumbo_sink(name, 3) : cln->make_upload_sink(name));
 
     static constexpr unsigned chunk_size = 1000;
     auto rnd = tests::random::get_bytes(chunk_size);
@@ -332,4 +338,42 @@ SEASTAR_THREAD_TEST_CASE(test_multipart_upload_sink_failure_2) {
     auto close_server = deferred_stop(server);
     BOOST_REQUIRE_EXCEPTION(
         do_test_client_multipart_upload(address, port), storage_io_error, [](const storage_io_error& e) { return e.code().value() == EIO; });
+}
+
+SEASTAR_THREAD_TEST_CASE(test_multipart_upload_jumbo_sink_success) {
+    auto port = network_unshare.get_port();
+    auto address = network_unshare.get_address();
+    server server(server::failure_policy::SUCCESS);
+    server.start(address, port).get();
+    auto close_server = deferred_stop(server);
+    BOOST_REQUIRE_NO_THROW(do_test_client_multipart_upload(address, port, true));
+}
+
+SEASTAR_THREAD_TEST_CASE(test_multipart_upload_jumbo_sink_retryable_success) {
+    auto port = network_unshare.get_port();
+    auto address = network_unshare.get_address();
+    server server(server::failure_policy::RETRYABLE_FAILURE);
+    server.start(address, port).get();
+    auto close_server = deferred_stop(server);
+    BOOST_REQUIRE_NO_THROW(do_test_client_multipart_upload(address, port, true));
+}
+
+SEASTAR_THREAD_TEST_CASE(test_multipart_upload_jumbo_sink_failure_1) {
+    auto port = network_unshare.get_port();
+    auto address = network_unshare.get_address();
+    server server(server::failure_policy::NEVERENDING_RETRYABLE_FAILURE);
+    server.start(address, port).get();
+    auto close_server = deferred_stop(server);
+    BOOST_REQUIRE_EXCEPTION(
+        do_test_client_multipart_upload(address, port, true), storage_io_error, [](const storage_io_error& e) { return e.code().value() == EIO; });
+}
+
+SEASTAR_THREAD_TEST_CASE(test_multipart_upload_jumbo_sink_failure_2) {
+    auto port = network_unshare.get_port();
+    auto address = network_unshare.get_address();
+    server server(server::failure_policy::NONRETRYABLE_FAILURE);
+    server.start(address, port).get();
+    auto close_server = deferred_stop(server);
+    BOOST_REQUIRE_EXCEPTION(
+        do_test_client_multipart_upload(address, port, true), storage_io_error, [](const storage_io_error& e) { return e.code().value() == EIO; });
 }

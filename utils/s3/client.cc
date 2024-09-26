@@ -258,8 +258,10 @@ client::do_retryable_request(group_client& gc, http::request req, http::experime
                                           .handle_exception_type([this, &retries](const aws::aws_exception& ex) mutable -> future<std::optional<uint32_t>> {
                                               ++retries;
                                               if (_retry_strategy->should_retry(ex.error(), retries)) {
+                                                  s3l.warn("S3 client request failed. Reason: {}. Retry# {}", ex.what(), retries);
                                                   co_await seastar::sleep(std::chrono::milliseconds(_retry_strategy->delay_before_retry(ex.error(), retries)));
                                               } else {
+                                                  s3l.warn("S3 client encountered non-retryable error. Reason: {}. Retry# {}", ex.what(), retries);
                                                   co_await coroutine::return_exception(ex);
                                               }
                                               co_return std::optional<uint32_t>(std::nullopt);
