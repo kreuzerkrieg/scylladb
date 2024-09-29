@@ -48,7 +48,7 @@ struct server {
                 }
                 rep->add_header("ETag", "SomeTag");
                 if (!req->get_header("x-amz-copy-source").empty()) {
-                    response_body= R"(<CopyPartResult>
+                    response_body = R"(<CopyPartResult>
                                            <LastModified>2011-04-11T20:34:56.000Z</LastModified>
                                            <ETag>"9b2cf535f27731c974343645a3985328"</ETag>
                                         </CopyPartResult>)";
@@ -262,7 +262,9 @@ SEASTAR_THREAD_TEST_CASE(test_multipart_upload_file_failure_1) {
     const size_t memory_size = part_size;
     BOOST_REQUIRE_EXCEPTION(test_client_upload_file(seastar_test::get_name(), address, port, total_size, memory_size),
                             storage_io_error,
-                            [](const storage_io_error& e) { return e.code().value() == EIO; });
+                            [](const storage_io_error& e) {
+                                return e.code().value() == EIO;
+                            });
 }
 
 SEASTAR_THREAD_TEST_CASE(test_multipart_upload_file_failure_2) {
@@ -277,7 +279,9 @@ SEASTAR_THREAD_TEST_CASE(test_multipart_upload_file_failure_2) {
     const size_t memory_size = part_size;
     BOOST_REQUIRE_EXCEPTION(test_client_upload_file(seastar_test::get_name(), address, port, total_size, memory_size),
                             storage_io_error,
-                            [](const storage_io_error& e) { return e.code().value() == EIO; });
+                            [](const storage_io_error& e) {
+                                return e.code().value() == EIO;
+                            });
 }
 
 void do_test_client_multipart_upload(const std::string& address, uint16_t port, bool is_jumbo = false) {
@@ -327,7 +331,9 @@ SEASTAR_THREAD_TEST_CASE(test_multipart_upload_sink_failure_1) {
     server.start(address, port).get();
     auto close_server = deferred_stop(server);
     BOOST_REQUIRE_EXCEPTION(
-        do_test_client_multipart_upload(address, port), storage_io_error, [](const storage_io_error& e) { return e.code().value() == EIO; });
+        do_test_client_multipart_upload(address, port), storage_io_error, [](const storage_io_error& e) {
+            return e.code().value() == EIO;
+        });
 }
 
 SEASTAR_THREAD_TEST_CASE(test_multipart_upload_sink_failure_2) {
@@ -337,7 +343,9 @@ SEASTAR_THREAD_TEST_CASE(test_multipart_upload_sink_failure_2) {
     server.start(address, port).get();
     auto close_server = deferred_stop(server);
     BOOST_REQUIRE_EXCEPTION(
-        do_test_client_multipart_upload(address, port), storage_io_error, [](const storage_io_error& e) { return e.code().value() == EIO; });
+        do_test_client_multipart_upload(address, port), storage_io_error, [](const storage_io_error& e) {
+            return e.code().value() == EIO;
+        });
 }
 
 SEASTAR_THREAD_TEST_CASE(test_multipart_upload_jumbo_sink_success) {
@@ -365,7 +373,9 @@ SEASTAR_THREAD_TEST_CASE(test_multipart_upload_jumbo_sink_failure_1) {
     server.start(address, port).get();
     auto close_server = deferred_stop(server);
     BOOST_REQUIRE_EXCEPTION(
-        do_test_client_multipart_upload(address, port, true), storage_io_error, [](const storage_io_error& e) { return e.code().value() == EIO; });
+        do_test_client_multipart_upload(address, port, true), storage_io_error, [](const storage_io_error& e) {
+            return e.code().value() == EIO;
+        });
 }
 
 SEASTAR_THREAD_TEST_CASE(test_multipart_upload_jumbo_sink_failure_2) {
@@ -375,5 +385,7 @@ SEASTAR_THREAD_TEST_CASE(test_multipart_upload_jumbo_sink_failure_2) {
     server.start(address, port).get();
     auto close_server = deferred_stop(server);
     BOOST_REQUIRE_EXCEPTION(
-        do_test_client_multipart_upload(address, port, true), storage_io_error, [](const storage_io_error& e) { return e.code().value() == EIO; });
+        do_test_client_multipart_upload(address, port, true), storage_io_error, [](const storage_io_error& e) {
+            return e.code().value() == EIO;
+        });
 }
