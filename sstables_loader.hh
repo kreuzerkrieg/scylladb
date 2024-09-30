@@ -87,8 +87,8 @@ public:
     /**
      * Download new SSTables not currently tracked by the system from object store
      */
-    future<tasks::task_id> download_new_sstables(sstring ks_name, sstring cf_name,
-            sstring endpoint, sstring bucket, sstring snapshot);
+    future<tasks::task_id>
+    download_new_sstables(sstring ks_name, sstring cf_name, sstring endpoint, sstring bucket, sstring prefix, std::vector<std::string>&& sstables);
 
     class download_task_impl;
 };

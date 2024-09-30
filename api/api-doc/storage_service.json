@@ -847,12 +847,24 @@
                           "paramType":"query"
                       },
                       {
-                          "name":"snapshot",
-                          "description":"Name of a snapshot to copy SSTables from",
-                          "required":true,
-                          "allowMultiple":false,
-                          "type":"string",
-                          "paramType":"query"
+                          "name": "prefix",
+                          "description": "The objects' SSTable prefix to restore",
+                          "required": true,
+                          "allowMultiple": false,
+                          "type": "string",
+                          "paramType": "query"
+                      },
+                      {
+                         "in": "body",
+                         "name": "sstables",
+                         "description": "The list of the object keys of the TOC component of the SSTables to be restored",
+                         "required": true,
+                         "schema": {
+                            "type": "array",
+                            "items": {
+                               "type": "string"
+                            }
+                         }
                       },
                       {
                           "name":"keyspace",

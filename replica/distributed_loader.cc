@@ -267,7 +267,7 @@ distributed_loader::get_sstables_from(distributed<replica::database>& db, sstrin
         };
         process_sstable_dir(directory, flags).get();
         directory.invoke_on_all([&sstables_on_shards] (sstables::sstable_directory& d) mutable {
-            sstables_on_shards[this_shard_id()] = d.get_unsorted_sstables();
+            sstables_on_shards[this_shard_id()] = d.get_unsorted_sstables();        
         }).get();
 
         return std::make_tuple(table_id, std::move(sstables_on_shards));

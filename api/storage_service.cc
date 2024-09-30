@@ -21,11 +21,9 @@
 #include <algorithm>
 #include <functional>
 #include <iterator>
-#include <boost/range/adaptor/map.hpp>
 #include <boost/range/adaptor/filtered.hpp>
 #include <boost/algorithm/string/trim_all.hpp>
 #include <boost/algorithm/string/case_conv.hpp>
-#include <boost/functional/hash.hpp>
 #include <fmt/ranges.h>
 #include "service/raft/raft_group0_client.hh"
 #include "service/storage_service.hh"
@@ -38,7 +36,6 @@
 #include <seastar/coroutine/parallel_for_each.hh>
 #include <seastar/coroutine/exception.hh>
 #include "repair/row_level.hh"
-#include "locator/snitch_base.hh"
 #include "column_family.hh"
 #include "log.hh"
 #include "release.hh"
@@ -50,11 +47,11 @@
 #include "db/snapshot-ctl.hh"
 #include "transport/controller.hh"
 #include "locator/token_metadata.hh"
-#include "cdc/generation_service.hh"
 #include "locator/abstract_replication_strategy.hh"
 #include "sstables_loader.hh"
 #include "db/view/view_builder.hh"
 #include "utils/user_provided_param.hh"
+#include "utils/rjson.hh"
 
 using namespace seastar::httpd;
 using namespace std::chrono_literals;
@@ -496,13 +493,20 @@ void set_sstables_loader(http_context& ctx, routes& r, sharded<sstables_loader>&
         auto keyspace = req->get_query_param("keyspace");
         auto table = req->get_query_param("table");
         auto bucket = req->get_query_param("bucket");
-        auto snapshot_name = req->get_query_param("snapshot");
+        auto prefix = req->get_query_param("prefix");
         if (table.empty()) {
             // TODO: If missing, should restore all tables
             throw httpd::bad_param_exception("The table name must be specified");
         }
 
-        auto task_id = co_await sst_loader.local().download_new_sstables(keyspace, table, endpoint, bucket, snapshot_name);
+        auto sstables_list = rjson::parse(req->content);
+        if (!sstables_list.IsArray())
+            throw httpd::bad_param_exception("Expected an array of SSTable TOCs");
+
+        auto sstables = sstables_list.GetArray();
+        std::vector<std::string> sstables_keys(sstables.begin(), sstables.end());
+
+        auto task_id = co_await sst_loader.local().download_new_sstables(keyspace, table, endpoint, bucket, prefix, sstables_keys);
         co_return json::json_return_type(fmt::to_string(task_id));
     });
 
