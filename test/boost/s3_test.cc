@@ -118,27 +118,45 @@ void do_test_client_multipart_upload(bool with_copy_upload) {
     auto close_client = deferred_close(*cln);
 
     testlog.info("Upload object (with copy = {})\n", with_copy_upload);
-    auto out = output_stream<char>(
-        // Make it 3 parts per piece, so that 128Mb buffer below
-        // would be split into several 15Mb pieces
-        with_copy_upload ? cln->make_upload_jumbo_sink(name, 3) : cln->make_upload_sink(name)
-    );
-    auto close = seastar::deferred_close(out);
 
     static constexpr unsigned chunk_size = 1000;
-    auto rnd = tests::random::get_bytes(chunk_size);
+    bytes rnd;
     uint64_t object_size = 0;
-    for (unsigned ch = 0; ch < 128 * 1024; ch++) {
-        out.write(reinterpret_cast<char*>(rnd.begin()), rnd.size()).get();
-        object_size += rnd.size();
-    }
+    size_t attempt_count = 0;
+    while (true) {
+        auto out = output_stream<char>(
+            // Make it 3 parts per piece, so that 128Mb buffer below
+            // would be split into several 15Mb pieces
+            with_copy_upload ? cln->make_upload_jumbo_sink(name, 3) : cln->make_upload_sink(name)
+        );
+        auto close = seastar::deferred_close(out);
 
-    testlog.info("Flush multipart upload\n");
-    out.flush().get();
+        rnd = tests::random::get_bytes(chunk_size);
+        object_size = 0;
+        for (unsigned ch = 0; ch < 128 * 1024; ch++) {
+            out.write(reinterpret_cast<char*>(rnd.begin()), rnd.size()).get();
+            object_size += rnd.size();
+        }
+
+        testlog.info("Flush multipart upload\n");
+        try {
+            ++attempt_count;
+            out.flush().get();
+            break;
+        } catch (const std::exception& ex) {
+            BOOST_REQUIRE_EQUAL(ex.what(),
+                                "S3 request failed. Reason: The specified multipart upload does not exist. The upload ID may be invalid, or the upload may have "
+                                "been aborted or completed.");
+        }
+        catch (...) {
+            throw;
+        }
+        testlog.info("Closing\n");
+        close.close_now();
+    }
+    testlog.info("Upload succeeded after {} retries.", attempt_count);
     auto delete_object = deferred_delete_object(cln, name);
 
-    testlog.info("Closing\n");
-    close.close_now();
 
     testlog.info("Checking file size\n");
     size_t sz = cln->get_object_size(name).get();

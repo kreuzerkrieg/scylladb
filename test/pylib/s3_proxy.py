@@ -56,48 +56,6 @@ class LRUCache:
                 self.cache.popitem(last=False)
 
 
-# from http.server import BaseHTTPRequestHandler, HTTPServer
-# import requests
-#
-# class ProxyHTTPRequestHandler(BaseHTTPRequestHandler):
-#     def do_GET(self):
-#         # Forward the GET request to another server
-#         target_url = 'http://example.com' + self.path
-#         headers = {key: value for key, value in self.headers.items()}
-#         response = requests.get(target_url, headers=headers)
-#
-#         # Send the response back to the client
-#         self.send_response(response.status_code)
-#         for key, value in response.headers.items():
-#             self.send_header(key, value)
-#         self.end_headers()
-#         self.wfile.write(response.content)
-#
-#     def do_POST(self):
-#         # Forward the POST request to another server
-#         target_url = 'http://example.com' + self.path
-#         headers = {key: value for key, value in self.headers.items()}
-#         content_length = int(self.headers['Content-Length'])
-#         body = self.rfile.read(content_length)
-#         response = requests.post(target_url, headers=headers, data=body)
-#
-#         # Send the response back to the client
-#         self.send_response(response.status_code)
-#         for key, value in response.headers.items():
-#             self.send_header(key, value)
-#         self.end_headers()
-#         self.wfile.write(response.content)
-#
-# def run(server_class=HTTPServer, handler_class=ProxyHTTPRequestHandler, port=8080):
-#     server_address = ('', port)
-#     httpd = server_class(server_address, handler_class)
-#     print(f'Starting proxy server on port {port}...')
-#     httpd.serve_forever()
-#
-# if __name__ == '__main__':
-#     run()
-
-
 # Simple HTTP handler for testing (at this moment) and injecting errors for S3 multipart uploads. It can be easily
 # extended to support whatever S3 call is needed by adding any logic to the `do_*` handlers. Also one can extend this
 # handler to process additional HTTP methods, for example HEAD.
