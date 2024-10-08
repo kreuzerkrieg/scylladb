@@ -76,7 +76,7 @@ std::optional<aws_error>  aws_error::parse(seastar::sstring&& body) {
 
 aws_error aws_error::from_http_code(seastar::http::reply::status_type http_code) {
     aws_error error;
-    const auto& all_errors = aws_error::get_errors();
+    const auto& all_errors = get_errors();
     switch (http_code) {
     case seastar::http::reply::status_type::unauthorized:
     case seastar::http::reply::status_type::forbidden:
@@ -100,7 +100,7 @@ aws_error aws_error::from_http_code(seastar::http::reply::status_type http_code)
         return all_errors.at("RequestTimeout");
     default:
         int code_value = static_cast<int>(http_code);
-        return {aws_error_type::UNKNOWN, aws::retryable{code_value >= 500 && code_value < 600}};
+        return {aws_error_type::UNKNOWN, retryable{code_value >= 500 && code_value < 600}};
     }
 }
 

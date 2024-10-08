@@ -208,7 +208,18 @@ future<> map_s3_client_exception(std::exception_ptr ex) {
     try {
         std::rethrow_exception(std::move(ex));
     } catch (const aws::aws_exception& ex) {
-        return make_exception_future<>(storage_io_error(EIO, format("S3 request failed. Reason: {}", ex.what())));
+        int error_code;
+        switch (ex.error().get_error_type()) {
+        case aws::aws_error_type::RESOURCE_NOT_FOUND:
+            error_code = ENOENT;
+            break;
+        case aws::aws_error_type::ACCESS_DENIED:
+            error_code = EACCES;
+            break;
+        default:
+            error_code = EIO;
+        }
+        return make_exception_future<>(storage_io_error(error_code, format("S3 request failed. Reason: {}", ex.what())));
     } catch (const httpd::unexpected_status_error& e) {
         auto status = e.status();
 
@@ -224,11 +235,10 @@ future<> map_s3_client_exception(std::exception_ptr ex) {
         auto e = std::current_exception();
         return make_exception_future<>(storage_io_error(EIO, format("S3 error ({})", e)));
     }
-
 }
 
 static future<aws::aws_error> look_for_errors(const http::reply& reply, input_stream<char>& in_, bool is_mpu_completion) {
-    if (reply._status != http::reply::status_type::ok || is_mpu_completion) {
+    if (reply._status >= http::reply::status_type::multiple_choices || is_mpu_completion) {
         std::optional<aws::aws_error> possible_error;
         auto response_body = co_await util::read_entire_stream_contiguous(in_);
 
@@ -252,8 +262,9 @@ client::do_retryable_request(group_client& gc, http::request req, http::experime
                    std::move(handler),
                    [this, &gc, expected](uint32_t& retries, http::request& request, http::experimental::client::reply_handler& handler) -> future<> {
                        return repeat_until_value([&gc, &retries, &request, &handler, expected, this]() -> future<std::optional<uint32_t>> {
+                           (void)expected;
                                   if (retries <= _retry_strategy->get_max_retries()) {
-                                      return gc.http.make_raw_request(request, handler, expected)
+                                      return gc.http.make_raw_request(request, handler, std::nullopt)
                                           .then([&retries] { return make_ready_future<std::optional<uint32_t>>(retries); })
                                           .handle_exception_type([this, &retries](const aws::aws_exception& ex) mutable -> future<std::optional<uint32_t>> {
                                               ++retries;
@@ -261,7 +272,10 @@ client::do_retryable_request(group_client& gc, http::request req, http::experime
                                                   s3l.warn("S3 client request failed. Reason: {}. Retry# {}", ex.what(), retries);
                                                   co_await seastar::sleep(std::chrono::milliseconds(_retry_strategy->delay_before_retry(ex.error(), retries)));
                                               } else {
-                                                  s3l.warn("S3 client encountered non-retryable error. Reason: {}. Retry# {}", ex.what(), retries);
+                                                  s3l.warn("S3 client encountered non-retryable error. Reason: {}. Code: {}. Retry# {}",
+                                                           ex.what(),
+                                                           std::to_underlying(ex.error().get_error_type()),
+                                                           retries);
                                                   co_await coroutine::return_exception(ex);
                                               }
                                               co_return std::optional<uint32_t>(std::nullopt);
@@ -1086,7 +1100,7 @@ class client::do_upload_file : private multipart_upload {
             req._headers["x-amz-tagging"] = seastar::format("{}={}", _tag->key, _tag->value);
         }
         req.write_body("bin", len, [f = std::move(f)] (output_stream<char>&& out_) mutable {
-            auto input = make_file_input_stream(std::move(f), input_stream_options());
+            auto input = make_file_input_stream(f, input_stream_options());
             auto output = std::move(out_);
             return copy_to(std::move(input), std::move(output), _transmit_size);
         });

@@ -46,7 +46,7 @@
 s3::endpoint_config_ptr make_minio_config() {
     s3::endpoint_config cfg = {
         .port = std::stoul(tests::getenv_safe("S3_SERVER_PORT_FOR_TEST")),
-        .use_https = ::getenv("AWS_DEFAULT_REGION") != nullptr,
+        .use_https = false,
         .aws = {{
             .access_key_id = tests::getenv_safe("AWS_ACCESS_KEY_ID"),
             .secret_access_key = tests::getenv_safe("AWS_SECRET_ACCESS_KEY"),
