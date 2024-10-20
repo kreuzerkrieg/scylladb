@@ -87,13 +87,13 @@ class client : public enable_shared_from_this<client> {
     group_client& find_or_create_client();
 
     using multipart_upload_completion = bool_class<struct is_multipart_upload_completion_req>;
-    static http::experimental::client::reply_handler make_s3_error_handler(http::experimental::client::reply_handler&& handler,
-            http::reply::status_type expected, multipart_upload_completion is_mpu_completion);
+    static http::experimental::client::reply_handler make_s3_error_handler(
+        http::experimental::client::reply_handler&& handler = ignore_reply,
+        http::reply::status_type expected = http::reply::status_type::ok,
+        multipart_upload_completion is_mpu_completion = multipart_upload_completion::no);
     static future<aws::aws_error> look_for_error(const http::reply& reply, input_stream<char>& in_, multipart_upload_completion is_mpu_completion);
 
-    future<> make_request(http::request req, http::experimental::client::reply_handler handle = ignore_reply,
-            http::reply::status_type expected = http::reply::status_type::ok,
-            multipart_upload_completion is_mpu_completion_req = multipart_upload_completion::no);
+    future<> make_request(http::request req, http::experimental::client::reply_handler handle = make_s3_error_handler());
     using reply_handler_ext = noncopyable_function<future<>(group_client&, const http::reply&, input_stream<char>&& body)>;
     future<> make_request(http::request req, reply_handler_ext handle, http::reply::status_type expected = http::reply::status_type::ok);
     future<> do_retryable_request(group_client& gc, http::request req, http::experimental::client::reply_handler handler) const;

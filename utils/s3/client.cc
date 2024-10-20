@@ -305,13 +305,11 @@ http::experimental::client::reply_handler client::make_s3_error_handler(
     };
 }
 
-future<> client::make_request(http::request req, http::experimental::client::reply_handler handle, http::reply::status_type expected,
-        multipart_upload_completion is_mpu_completion_req) {
+future<> client::make_request(http::request req, http::experimental::client::reply_handler handle) {
     authorize(req);
     auto& gc = find_or_create_client();
-    auto error_aware_handler = make_s3_error_handler(std::move(handle), expected, is_mpu_completion_req);
 
-    return do_retryable_request(gc, std::move(req), std::move(error_aware_handler));
+    return do_retryable_request(gc, std::move(req), std::move(handle));
 }
 
 future<> client::make_request(http::request req, reply_handler_ext handle_ex, http::reply::status_type expected) {
@@ -328,7 +326,7 @@ future<> client::make_request(http::request req, reply_handler_ext handle_ex, ht
 future<> client::get_object_header(sstring object_name, http::experimental::client::reply_handler handler) {
     s3l.trace("HEAD {}", object_name);
     auto req = http::request::make("HEAD", _host, object_name);
-    return make_request(std::move(req), std::move(handler));
+    return make_request(std::move(req), make_s3_error_handler(std::move(handler)));
 }
 
 future<uint64_t> client::get_object_size(sstring object_name) {
@@ -409,12 +407,12 @@ future<tag_set> client::get_object_tagging(sstring object_name) {
     s3l.trace("GET {} tagging", object_name);
     tag_set tags;
     co_await make_request(std::move(req),
-                          [&tags] (const http::reply& reply, input_stream<char>&& in) mutable -> future<> {
+                          make_s3_error_handler([&tags] (const http::reply& reply, input_stream<char>&& in) mutable -> future<> {
         auto& retval = tags;
         auto input = std::move(in);
         auto body = co_await util::read_entire_stream_contiguous(input);
         retval = parse_tagging(body);
-    });
+    }));
     co_return tags;
 }
 
@@ -454,7 +452,7 @@ future<> client::delete_object_tagging(sstring object_name) {
     auto req = http::request::make("DELETE", _host, object_name);
     req.query_parameters["tagging"] = "";
     s3l.trace("DELETE {} tagging", object_name);
-    co_await make_request(std::move(req), ignore_reply, http::reply::status_type::no_content);
+    co_await make_request(std::move(req), make_s3_error_handler(ignore_reply, http::reply::status_type::no_content));
 }
 
 future<temporary_buffer<char>> client::get_object_contiguous(sstring object_name, std::optional<range> range) {
@@ -555,7 +553,7 @@ future<> client::put_object(sstring object_name, ::memory_data_sink_buffers bufs
 future<> client::delete_object(sstring object_name) {
     s3l.trace("DELETE {}", object_name);
     auto req = http::request::make("DELETE", _host, object_name);
-    co_await make_request(std::move(req), ignore_reply, http::reply::status_type::no_content);
+    co_await make_request(std::move(req), make_s3_error_handler(ignore_reply, http::reply::status_type::no_content));
 }
 
 class client::multipart_upload {
@@ -694,7 +692,7 @@ future<> client::multipart_upload::start_upload() {
     if (_tag) {
         rep._headers["x-amz-tagging"] = seastar::format("{}={}", _tag->key, _tag->value);
     }
-    co_await _client->make_request(std::move(rep), [this] (const http::reply& rep, input_stream<char>&& in_) -> future<> {
+    co_await _client->make_request(std::move(rep), make_s3_error_handler([this] (const http::reply& rep, input_stream<char>&& in_) -> future<> {
         auto in = std::move(in_);
         auto body = co_await util::read_entire_stream_contiguous(in);
         _upload_id = parse_multipart_upload_id(body);
@@ -702,7 +700,7 @@ future<> client::multipart_upload::start_upload() {
             co_await coroutine::return_exception(std::runtime_error("cannot initiate upload"));
         }
         s3l.trace("created uploads for {} -> id = {}", _object_name, _upload_id);
-    });
+    }));
 }
 
 future<> client::multipart_upload::upload_part(memory_data_sink_buffers bufs) {
@@ -768,7 +766,7 @@ future<> client::multipart_upload::abort_upload() {
     s3l.trace("DELETE upload {}", _upload_id);
     auto req = http::request::make("DELETE", _client->_host, _object_name);
     req.query_parameters["uploadId"] = std::exchange(_upload_id, ""); // now upload_started() returns false
-    co_await _client->make_request(std::move(req), ignore_reply, http::reply::status_type::no_content).handle_exception([](const std::exception_ptr&) -> future<> {
+    co_await _client->make_request(std::move(req), make_s3_error_handler(ignore_reply, http::reply::status_type::no_content)).handle_exception([](const std::exception_ptr&) -> future<> {
         // Here we discard whatever exception is thrown when aborting multipart upload since we don't care about cleanly aborting it since there are other means
         // to clean up dangling parts, for example `rclone cleanup` or S3 bucket's Lifecycle Management Policy
         co_return;
@@ -792,7 +790,7 @@ future<> client::multipart_upload::finalize_upload() {
     });
     // If this request fails, finalize_upload() throws, the upload should then
     // be aborted in .close() method
-    co_await _client->make_request(std::move(req), ignore_reply, http::reply::status_type::ok, multipart_upload_completion::yes);
+    co_await _client->make_request(std::move(req), make_s3_error_handler(ignore_reply, http::reply::status_type::ok, multipart_upload_completion::yes));
     _upload_id = ""; // now upload_started() returns false
 }
 
@@ -888,7 +886,7 @@ future<> client::multipart_upload::upload_part(std::unique_ptr<upload_sink> piec
     (void)piece.flush().then([&piece] () {
         return piece.close();
     }).then([this, part_number, req = std::move(req)] () mutable {
-        return _client->make_request(std::move(req), [this, part_number] (const http::reply& rep, input_stream<char>&& in_) mutable -> future<> {
+        return _client->make_request(std::move(req), make_s3_error_handler([this, part_number] (const http::reply& rep, input_stream<char>&& in_) mutable -> future<> {
             return do_with(std::move(in_), [this, part_number] (auto& in) mutable {
                 return util::read_entire_stream_contiguous(in).then([this, part_number] (auto body) mutable {
                     auto etag = parse_multipart_copy_upload_etag(body);
@@ -900,7 +898,7 @@ future<> client::multipart_upload::upload_part(std::unique_ptr<upload_sink> piec
                     return make_ready_future<>();
                 });
             });
-        }).handle_exception([this, part_number] (auto ex) {
+        })).handle_exception([this, part_number] (auto ex) {
             // ... the exact exception only remains in logs
             s3l.warn("couldn't copy-upload part {}: {} (upload id {})", part_number, ex, _upload_id);
         });
@@ -1357,14 +1355,14 @@ future<> client::bucket_lister::start_listing() {
         std::vector<sstring> names;
         try {
             co_await _client->make_request(std::move(req),
-                [&names, &continuation_token] (const http::reply& reply, input_stream<char>&& in) mutable -> future<> {
+                make_s3_error_handler([&names, &continuation_token] (const http::reply& reply, input_stream<char>&& in) mutable -> future<> {
                     auto input = std::move(in);
                     auto body = co_await util::read_entire_stream_contiguous(input);
                     auto list = parse_list_of_objects(std::move(body));
                     names = std::move(list.first);
                     continuation_token = std::move(list.second);
                 }
-            );
+            ));
         } catch (...) {
             _queue.abort(std::current_exception());
             co_return;
