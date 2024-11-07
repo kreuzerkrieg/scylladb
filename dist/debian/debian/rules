@@ -17,6 +17,9 @@ override_dh_auto_build:
 
 override_dh_auto_clean:
 
+override_dh_install:
+	dh_install -Xlibp11-kit
+
 override_dh_auto_install:
 	dh_auto_install
 	./scylla/install.sh --packaging --root "$(CURDIR)/debian/tmp" $(install_arg) --sysconfdir "/etc/default"

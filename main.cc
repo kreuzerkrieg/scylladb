@@ -22,7 +22,7 @@
 #include <seastar/core/timer.hh>
 #include "service/qos/raft_service_level_distributed_data_accessor.hh"
 #include "tasks/task_manager.hh"
-#include "utils/assert.hh"
+#include "utils/s3/client.hh"
 #include "utils/build_id.hh"
 #include "supervisor.hh"
 #include "replica/database.hh"
@@ -778,6 +778,17 @@ To start the scylla server proper, simply invoke as: scylla server (or just scyl
             logging::apply_settings(cfg->logging_settings(app.options().log_opts));
 
             startlog.info(startup_msg, scylla_version(), get_build_id());
+
+            {
+                startlog.info("Getting S3 endpoint config");
+                s3::endpoint_config epcfg = cfg->object_storage_config().at("s3.us-east-1.amazonaws.com");
+                startlog.info("Making S3 client");
+                semaphore mem(16 << 20);
+                auto cln = s3::client::make("s3.us-east-1.amazonaws.com", make_lw_shared<s3::endpoint_config>(std::move(epcfg)), mem);
+                startlog.info("Requesting object size");
+                auto sz = cln->get_object_size("/ewz/shards").get();
+                startlog.info("-> {}", sz);
+            }
 
             // Set the default scheduling_group, i.e., the main scheduling
             // group to a lower shares. Subsystems needs higher shares
