@@ -274,7 +274,7 @@ future<> test_client_upload_file(const client_maker_function& client_maker, std:
     // 2. upload the file to s3
     semaphore mem{memory_size};
     auto client = client_maker(mem);
-    co_await client->upload_file(file_path, object_name);
+    co_await client->upload_file(file_path, object_name, {}, memory_size);
     // 3. retrieve the object from s3 and retrieve the object from S3 and
     //    compare it with the pattern
     uint32_t actual_checksum = crc32_utils::init_checksum();
@@ -580,4 +580,18 @@ void client_access_missing_object(const client_maker_function& client_maker) {
 
 SEASTAR_THREAD_TEST_CASE(test_client_access_missing_object_minio) {
     client_access_missing_object(make_minio_client);
+}
+
+
+SEASTAR_TEST_CASE(test_client_file_upload_speed) {
+    const size_t part_size = 20_MiB;
+    const size_t total_size = 100_GiB;
+    const size_t memory_size = part_size;
+    for (auto _ : {0, 1, 2, 3, 4}) {
+        auto begin = std::chrono::high_resolution_clock::now();
+        co_await test_client_upload_file(make_minio_client, seastar_test::get_name(), total_size, memory_size);
+        auto end = std::chrono::high_resolution_clock::now();
+        std::cout << "File size: " << total_size
+                  << ", Upload speed: " << total_size / std::chrono::duration_cast<std::chrono::seconds>(end - begin).count() / 1_MiB << "MiB/s" << std::endl;
+    }
 }
