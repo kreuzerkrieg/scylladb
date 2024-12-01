@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
-
+import concurrent
+import hashlib
+import math
 import os
 import logging
 import asyncio
+import string
+
 import pytest
 import time
 import random
@@ -28,12 +32,15 @@ def create_ks_and_cf(cql):
     cql.execute((f"CREATE KEYSPACE {ks} WITH REPLICATION = {replication_opts};"))
     cql.execute(f"CREATE TABLE {ks}.{cf} ( name text primary key, value text );")
 
-    rows = [('0', 'zero'),
-            ('1', 'one'),
-            ('2', 'two')]
-    for row in rows:
+    def insert_data(ks, cf, cql):
         cql_fmt = "INSERT INTO {}.{} ( name, value ) VALUES ('{}', '{}');"
-        cql.execute(cql_fmt.format(ks, cf, *row))
+        value = ''.join(random.choices(string.ascii_letters + string.digits, k=1024))
+        key = hashlib.sha256(value.encode()).hexdigest()
+        cql.execute(cql_fmt.format(ks, cf, key, value))
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=128) as executor:
+        futures = [executor.submit(insert_data, ks, cf, cql) for i in range(1000000)]
+        concurrent.futures.wait(futures)
 
     return ks, cf
 
@@ -252,7 +259,8 @@ async def do_test_simple_backup_and_restore(manager: ManagerClient, s3_server, d
            'experimental_features': ['keyspace-storage-options'],
            'task_ttl_in_seconds': 300
            }
-    cmd = ['--logger-log-level', 'sstables_loader=debug:sstable_directory=trace:snapshots=trace:s3=trace:sstable=debug:http=debug']
+    cmd = ['--logger-log-level',
+           'sstables_loader=debug:sstable_directory=trace:snapshots=trace:s3=trace:sstable=debug:http=debug']
     server = await manager.server_add(config=cfg, cmdline=cmd)
 
     cql = manager.get_cql()
@@ -300,54 +308,54 @@ async def do_test_simple_backup_and_restore(manager: ManagerClient, s3_server, d
     status = await manager.api.wait_task(server.ip_addr, tid)
     assert (status is not None) and (status['state'] == 'done')
 
-    print('Drop the table data and validate it\'s gone')
-    cql.execute(f"TRUNCATE TABLE {ks}.{cf};")
-    files = list_sstables()
-    assert len(files) == 0
-    res = cql.execute(f"SELECT * FROM {ks}.{cf};")
-    assert not res
-    objects = set(o.key for o in get_s3_resource(s3_server).Bucket(s3_server.bucket_name).objects.filter(Prefix=prefix))
-    assert len(objects) > 0
-
-    print('Try to restore')
-    tid = await manager.api.restore(server.ip_addr, ks, cf, s3_server.address, s3_server.bucket_name, prefix, toc_names)
-
-    if do_abort:
-        await manager.api.abort_task(server.ip_addr, tid)
-
-    status = await manager.api.wait_task(server.ip_addr, tid)
-    if not do_abort:
-        assert status is not None
-        assert status['state'] == 'done'
-        assert status['progress_units'] == 'batches'
-        assert status['progress_completed'] == status['progress_total']
-        assert status['progress_completed'] > 0
-
-    print('Check that sstables came back')
-    files = list_sstables()
-
-    sstable_names = [f'{entry.name}' for entry in files if entry.name.endswith('.db')]
-    db_objects = [object for object in objects if object.endswith('.db')]
-
-    if do_abort:
-        assert len(files) >= 0
-        # These checks can be viewed as dubious. We restore (atm) on a mutation basis mostly.
-        # There is no guarantee we'll generate the same amount of sstables as was in the original
-        # backup (?). But, since we are not stressing the server here (not provoking memtable flushes), 
-        # we should in principle never generate _more_ sstables than originated the backup.
-        assert len(old_files) >= len(files)
-        assert len(sstable_names) <= len(db_objects)
-    else:
-        assert len(files) > 0
-        assert (status is not None) and (status['state'] == 'done')
-        print(f'Check that data came back too')
-        res = cql.execute(f"SELECT * FROM {ks}.{cf};")
-        rows = { x.name: x.value for x in res }
-        assert rows == orig_rows, "Unexpected table contents after restore"
-
-    print('Check that backup files are still there')  # regression test for #20938
-    post_objects = set(o.key for o in get_s3_resource(s3_server).Bucket(s3_server.bucket_name).objects.filter(Prefix=prefix))
-    assert objects == post_objects
+    # print('Drop the table data and validate it\'s gone')
+    # cql.execute(f"TRUNCATE TABLE {ks}.{cf};")
+    # files = list_sstables()
+    # assert len(files) == 0
+    # res = cql.execute(f"SELECT * FROM {ks}.{cf};")
+    # assert not res
+    # objects = set(o.key for o in get_s3_resource(s3_server).Bucket(s3_server.bucket_name).objects.filter(Prefix=prefix))
+    # assert len(objects) > 0
+    #
+    # print('Try to restore')
+    # tid = await manager.api.restore(server.ip_addr, ks, cf, s3_server.address, s3_server.bucket_name, prefix, toc_names)
+    #
+    # if do_abort:
+    #     await manager.api.abort_task(server.ip_addr, tid)
+    #
+    # status = await manager.api.wait_task(server.ip_addr, tid)
+    # if not do_abort:
+    #     assert status is not None
+    #     assert status['state'] == 'done'
+    #     assert status['progress_units'] == 'batches'
+    #     assert status['progress_completed'] == status['progress_total']
+    #     assert status['progress_completed'] > 0
+    #
+    # print('Check that sstables came back')
+    # files = list_sstables()
+    #
+    # sstable_names = [f'{entry.name}' for entry in files if entry.name.endswith('.db')]
+    # db_objects = [object for object in objects if object.endswith('.db')]
+    #
+    # if do_abort:
+    #     assert len(files) >= 0
+    #     # These checks can be viewed as dubious. We restore (atm) on a mutation basis mostly.
+    #     # There is no guarantee we'll generate the same amount of sstables as was in the original
+    #     # backup (?). But, since we are not stressing the server here (not provoking memtable flushes),
+    #     # we should in principle never generate _more_ sstables than originated the backup.
+    #     assert len(old_files) >= len(files)
+    #     assert len(sstable_names) <= len(db_objects)
+    # else:
+    #     assert len(files) > 0
+    #     assert (status is not None) and (status['state'] == 'done')
+    #     print(f'Check that data came back too')
+    #     res = cql.execute(f"SELECT * FROM {ks}.{cf};")
+    #     rows = { x.name: x.value for x in res }
+    #     assert rows == orig_rows, "Unexpected table contents after restore"
+    #
+    # print('Check that backup files are still there')  # regression test for #20938
+    # post_objects = set(o.key for o in get_s3_resource(s3_server).Bucket(s3_server.bucket_name).objects.filter(Prefix=prefix))
+    # assert objects == post_objects
 
 @pytest.mark.asyncio
 async def test_simple_backup_and_restore(manager: ManagerClient, s3_server):

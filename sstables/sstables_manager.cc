@@ -101,6 +101,15 @@ shared_ptr<s3::client> storage_manager::get_endpoint_client(sstring endpoint) {
     return ep.client;
 }
 
+std::tuple<sstring, semaphore&, s3::endpoint_config> storage_manager::get_endpoint_config(sstring endpoint) {
+    auto found = _s3_endpoints.find(endpoint);
+    if (found == _s3_endpoints.end()) {
+        smlogger.error("unable to find {} in configured object-storage endpoints", endpoint);
+        throw std::invalid_argument(format("endpoint {} not found", endpoint));
+    }
+    return {endpoint, _s3_clients_memory, *found->second.cfg};
+}
+
 bool storage_manager::is_known_endpoint(sstring endpoint) const {
     return _s3_endpoints.contains(endpoint);
 }

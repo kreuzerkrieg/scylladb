@@ -410,7 +410,8 @@ class UnitTestSuite(TestSuite):
 
         # Default seastar arguments, if not provided in custom test options,
         # are two cores and 2G of RAM
-        args = self.custom_args.get(shortname, ["-c2 -m2G"])
+        args = self.custom_args.get(shortname, ["-c14 -m28G"])
+        print (f"FOOO: {shortname}, {args}")
         args = merge_cmdline_options(args, self.options.extra_scylla_cmdline_options)
         for a in args:
             await self.create_test(shortname, casename, self, a)
@@ -534,7 +535,8 @@ class BoostTestSuite(UnitTestSuite):
 
         # Default seastar arguments, if not provided in custom test options,
         # are two cores and 2G of RAM
-        args = self.custom_args.get(shortname, ["-c2 -m2G"])
+        args = self.custom_args.get(shortname, ["-c14 -m28G"])
+        print (f"FOOO: {shortname}, {args}")
         args = merge_cmdline_options(args, self.options.extra_scylla_cmdline_options)
         for a in args:
             await self.create_test(shortname, casename, self, a)
@@ -615,6 +617,7 @@ class PythonTestSuite(TestSuite):
                              self.cfg.get("extra_scylla_config_options", {}) | \
                              create_cfg.config_from_test
 
+            print(f"BOOOO: {cmdline_options}, {config_options}")
             server = ScyllaServer(
                 mode=self.mode,
                 exe=self.scylla_exe,

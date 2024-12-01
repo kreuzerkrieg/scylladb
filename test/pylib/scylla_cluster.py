@@ -147,8 +147,8 @@ def make_scylla_conf(mode: str, workdir: pathlib.Path, host_addr: str, seed_addr
 # it easier to restart. Sic: if you make a typo on the command line,
 # Scylla refuses to boot.
 SCYLLA_CMDLINE_OPTIONS = [
-    '--smp', '2',
-    '-m', '1G',
+    '--smp', '14',
+    '-m', '28G',
     '--collectd', '0',
     '--overprovisioned',
     '--max-networking-io-control-blocks', '1000',
