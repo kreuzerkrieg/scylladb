@@ -40,17 +40,8 @@ future<> instance_profile_credentials_provider::reload() {
 future<> instance_profile_credentials_provider::update_credentials() {
     auto factory = std::make_unique<utils::http::dns_connection_factory>(ec2_metadata_ip, port, false, ec2_md_logger);
     http::experimental::client http_client(std::move(factory), 1, http::experimental::client::retry_requests::yes);
-    std::string role;
-    auto req = http::request::make("GET", ec2_metadata_ip, "/latest/meta-data/iam/security-credentials/");
-    co_await http_client.make_request(
-        std::move(req),
-        [&role](const http::reply&, input_stream<char>&& in) -> future<> {
-            auto input = std::move(in);
-            role = co_await util::read_entire_stream_contiguous(input);
-        },
-        http::reply::status_type::ok);
 
-    req = http::request::make("PUT", ec2_metadata_ip, "/latest/api/token");
+    auto req = http::request::make("PUT", ec2_metadata_ip, "/latest/api/token");
     req._headers["x-aws-ec2-metadata-token-ttl-seconds"] = format("{}", session_duration);
 
     std::string token;
@@ -61,6 +52,18 @@ future<> instance_profile_credentials_provider::update_credentials() {
             token = co_await util::read_entire_stream_contiguous(input);
         },
         http::reply::status_type::ok);
+
+    std::string role;
+    req = http::request::make("GET", ec2_metadata_ip, "/latest/meta-data/iam/security-credentials/");
+    req._headers["x-aws-ec2-metadata-token"] = token;
+    co_await http_client.make_request(
+        std::move(req),
+        [&role](const http::reply&, input_stream<char>&& in) -> future<> {
+            auto input = std::move(in);
+            role = co_await util::read_entire_stream_contiguous(input);
+        },
+        http::reply::status_type::ok);
+
     req = http::request::make("GET", ec2_metadata_ip, seastar::format("/latest/meta-data/iam/security-credentials/{}", role));
     req._headers["x-aws-ec2-metadata-token"] = token;
     co_await http_client.make_request(
