@@ -31,7 +31,7 @@ private:
     std::string ec2_metadata_ip{"169.254.169.254"};
     s3::aws_credentials creds;
     unsigned port{80};
-    static constexpr unsigned session_duration{43200};
+    static constexpr unsigned session_duration{21600};
 };
 
 } // namespace aws
