@@ -61,15 +61,21 @@ future<> instance_profile_credentials_provider::update_credentials() {
 
     req = http::request::make("GET", ec2_metadata_ip, seastar::format("/latest/meta-data/iam/security-credentials/{}", role));
     req._headers["x-aws-ec2-metadata-token"] = token;
-    co_await http_client.make_request(
-        std::move(req),
-        [this](const http::reply&, input_stream<char>&& in) -> future<> {
-            auto input = std::move(in);
-            auto creds_response = co_await util::read_entire_stream_contiguous(input);
-            creds = parse_creds(creds_response);
-        },
-        http::reply::status_type::ok);
-    ec2_md_logger.info("Retrieved temporary credentials for IAM role: {}", role);
+    try {
+        co_await http_client.make_request(
+            std::move(req),
+            [this](const http::reply&, input_stream<char>&& in) -> future<> {
+                auto input = std::move(in);
+                auto creds_response = co_await util::read_entire_stream_contiguous(input);
+                creds = parse_creds(creds_response);
+            },
+            http::reply::status_type::ok);
+        ec2_md_logger.info("Retrieved temporary credentials for IAM role: {}", role);
+    }
+    catch (...) {
+        ec2_md_logger.error("{} credentials retrieve failed. Reason: {}", get_name(), std::current_exception());
+    }
+    co_await http_client.close();
 }
 
 s3::aws_credentials instance_profile_credentials_provider::parse_creds(const sstring& creds_response) {

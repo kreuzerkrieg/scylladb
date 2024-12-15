@@ -49,14 +49,20 @@ future<> sts_assume_role_credentials_provider::update_credentials() {
     req.query_parameters["RoleArn"] = role_arn;
     auto factory = std::make_unique<utils::http::dns_connection_factory>(sts_host, port, is_secured, sts_logger);
     retryable_http_client http_client(std::move(factory), 1, [](std::exception_ptr) {}, http::experimental::client::retry_requests::yes, retry_strategy);
-    co_await http_client.make_request(
-        std::move(req),
-        [this](const http::reply&, input_stream<char>&& in) -> future<> {
-            auto input = std::move(in);
-            auto body = co_await util::read_entire_stream_contiguous(input);
-            creds = parse_creds(body);
-        },
-        http::reply::status_type::ok);
+    try {
+        co_await http_client.make_request(
+            std::move(req),
+            [this](const http::reply&, input_stream<char>&& in) -> future<> {
+                auto input = std::move(in);
+                auto body = co_await util::read_entire_stream_contiguous(input);
+                creds = parse_creds(body);
+            },
+            http::reply::status_type::ok);
+    }
+    catch (...) {
+        sts_logger.error("{} credentials retrieve failed. Reason: {}", get_name(), std::current_exception());
+    }
+    co_await http_client.close();
 }
 
 s3::aws_credentials sts_assume_role_credentials_provider::parse_creds(sstring& body) {
