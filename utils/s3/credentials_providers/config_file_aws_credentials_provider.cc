@@ -59,7 +59,7 @@ future<> config_file_aws_credentials_provider::reload() {
             break;
         }
     }
-    creds.expires_at = std::chrono::system_clock::time_point::max();
+    creds.expires_at = std::chrono::steady_clock::time_point::max();
 }
 
 } // namespace aws

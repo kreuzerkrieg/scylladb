@@ -49,6 +49,7 @@
 #include "db_clock.hh"
 #include "utils/log.hh"
 
+using namespace std::chrono_literals;
 template <>
 struct fmt::formatter<s3::tag> {
     constexpr auto parse(format_parse_context& ctx) { return ctx.begin(); }
@@ -89,6 +90,19 @@ future<> ignore_reply(const http::reply& rep, input_stream<char>&& in_) {
 client::client(std::string host, endpoint_config_ptr cfg, semaphore& mem, global_factory gf, private_tag, std::unique_ptr<aws::retry_strategy> rs)
         : _host(std::move(host))
         , _cfg(std::move(cfg))
+        , _creds_invalidation_timer([this] {
+            s3l.info("Invalidating creds");
+            _credentials = {};
+        })
+        , _creds_update_timer([this] {
+            (void)[this]->future<> {
+                s3l.info("Update creds in the background");
+                _credentials = co_await _creds_provider_chain.get_aws_credentials();
+                _creds_invalidation_timer.rearm(_credentials.expires_at);
+                _creds_update_timer.arm(_credentials.expires_at - 1h);
+            }();
+        })
+        , _creds_sem(1)
         , _gf(std::move(gf))
         , _memory(mem)
         , _retry_strategy(std::move(rs)) {
@@ -97,6 +111,9 @@ client::client(std::string host, endpoint_config_ptr cfg, semaphore& mem, global
         .add_credentials_provider(std::make_unique<aws::environment_aws_credentials_provider>())
         .add_credentials_provider(std::make_unique<aws::sts_assume_role_credentials_provider>(_cfg->region, _cfg->role_arn.value_or("")))
         .add_credentials_provider(std::make_unique<aws::instance_profile_credentials_provider>());
+
+    _creds_update_timer.arm(std::chrono::steady_clock::now());
+    _creds_invalidation_timer.arm(std::chrono::steady_clock::now() + 1h);
 }
 
 void client::update_config(endpoint_config_ptr cfg) {
@@ -112,8 +129,13 @@ shared_ptr<client> client::make(std::string endpoint, endpoint_config_ptr cfg, s
 }
 
 future<> client::authorize(http::request& req) {
-    if (!_credentials || std::chrono::system_clock::now() >= _credentials.expires_at) {
-        _credentials = co_await _creds_provider_chain.get_aws_credentials();
+    if (!_credentials) {
+        co_await _creds_sem.wait();
+        if (!_credentials) {
+            s3l.info("Update creds synchronously");
+            _credentials = co_await _creds_provider_chain.get_aws_credentials();
+        }
+        _creds_sem.signal();
     }
 
     auto time_point_str = utils::aws::format_time_point(db_clock::now());

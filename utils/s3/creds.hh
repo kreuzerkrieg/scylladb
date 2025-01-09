@@ -22,7 +22,7 @@ struct aws_credentials {
     // the security token, only for session credentials
     std::string session_token;
     // session token expiration
-    std::chrono::system_clock::time_point expires_at{std::chrono::system_clock::time_point::min()};
+    std::chrono::steady_clock::time_point expires_at{std::chrono::steady_clock::time_point::min()};
     operator bool() const { return !access_key_id.empty() && !secret_access_key.empty(); }
     std::strong_ordering operator<=>(const aws_credentials& o) const = default;
 };

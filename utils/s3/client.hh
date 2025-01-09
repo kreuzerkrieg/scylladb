@@ -56,7 +56,10 @@ class client : public enable_shared_from_this<client> {
     class readable_file;
     std::string _host;
     endpoint_config_ptr _cfg;
+    timer<> _creds_invalidation_timer;
+    timer<> _creds_update_timer;
     aws_credentials _credentials;
+    semaphore _creds_sem;
     aws::aws_credentials_provider_chain _creds_provider_chain;
 
     struct io_stats {

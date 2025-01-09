@@ -28,7 +28,7 @@ future<s3::aws_credentials> instance_profile_credentials_provider::get_aws_crede
 }
 
 bool instance_profile_credentials_provider::is_time_to_refresh() const {
-    return std::chrono::system_clock::now() >= creds.expires_at;
+    return std::chrono::steady_clock::now() >= creds.expires_at;
 }
 
 future<> instance_profile_credentials_provider::reload() {
@@ -91,7 +91,7 @@ s3::aws_credentials instance_profile_credentials_provider::parse_creds(const sst
             .secret_access_key = document["SecretAccessKey"].GetString(),
             .session_token = document["Token"].GetString(),
             // Set the expiration to one minute earlier to ensure credentials are renewed slightly before they expire
-            .expires_at = std::chrono::system_clock::now() + std::chrono::seconds(session_duration - 60)};
+            .expires_at = std::chrono::steady_clock::now() + std::chrono::seconds(session_duration - 60)};
 }
 
 } // namespace aws
