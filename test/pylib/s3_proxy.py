@@ -111,7 +111,7 @@ class InjectingHandler(BaseHTTPRequestHandler):
         return query_components
 
     def get_policy(self):
-        policy = self.policies.get(self.path)
+        policy = self.policies.get(f"{self.command}_{self.path}")
         if policy is None:
             policy = Policy(self.max_retries)
             policy.should_forward = true_or_false()
@@ -119,7 +119,7 @@ class InjectingHandler(BaseHTTPRequestHandler):
                 policy.should_fail = true_or_false()
             else:
                 policy.should_fail = True
-            self.policies.put(self.path, policy)
+            self.policies.put(f"{self.command}_{self.path}", policy)
 
         # Unfortunately MPU completion retry on already completed upload would introduce flakiness to unit tests, for example `s3_test`
         if self.command == "POST" and "uploadId" in self.parsed_qs():
