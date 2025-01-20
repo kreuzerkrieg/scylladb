@@ -12,7 +12,7 @@ async def run():
     parser = argparse.ArgumentParser(description="Start S3 proxy server")
     parser.add_argument('--host', default='127.0.0.1')
     parser.add_argument('--port', type=int, default=9002)
-    parser.add_argument('--log-level', default=logging.WARNING,
+    parser.add_argument('--log-level', default=logging.WARN,
                         choices=logging.getLevelNamesMapping().keys(),
                         help="Set log level")
     parser.add_argument('--minio-uri', default="http://127.0.0.1:9000")
