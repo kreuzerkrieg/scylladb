@@ -202,7 +202,7 @@ class InjectingHandler(BaseHTTPRequestHandler):
         # Parameters for the RST packet
         src_ip, src_port = self.server.socket.getsockname()
         dst_ip, dst_port = self.wfile._sock.getpeername()
-        print (f"src ip: {src_ip}, src port: {src_port}, dst ip: {dst_ip}, dst port: {dst_port}")
+        print(f"src ip: {src_ip}, src port: {src_port}, dst ip: {dst_ip}, dst port: {dst_port}")
         seq = 1000
 
         # Create the packet
@@ -234,8 +234,8 @@ class InjectingHandler(BaseHTTPRequestHandler):
         self.send_header('Content-Length', str(len(response)))
         self.end_headers()
         self.wfile.write(response)
-        if reset_connection:
-            self.reset_server_connection()
+        # if reset_connection:
+            # self.reset_server_connection()
             # self.server.shutdown_request(self.request)
             # packet, _socket = self.request.get_request()
             # self.wfile._sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack('ii', 1, 0))
@@ -248,6 +248,28 @@ class InjectingHandler(BaseHTTPRequestHandler):
             # self.server.socket.shutdown(2)
             # self.server.shutdown_request(self.request)
             # self.send_error(HTTPStatus.INTERNAL_SERVER_ERROR, "Partial write.")
+
+    def handle_one_request(self):
+        print("Handling request")
+        # super().handle_one_request()
+        self.raw_requestline = self.rfile.readline(65537)
+        self.parse_request()
+        if self.command=="GET":
+            self.do_GET()
+        elif self.command=="POST":
+            self.do_POST()
+        elif self.command=="PUT":
+            self.do_PUT()
+        elif self.command=="DELETE":
+            self.do_DELETE()
+        elif self.command=="HEAD":
+            self.do_HEAD()
+        # self.wfile.flush()
+        # self.close_connection = True
+        # self.wfile._sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack('ii', 1, 0))
+        self.wfile._sock.shutdown(socket.SHUT_RDWR)
+        self.wfile._sock.close()
+        # self.wfile.close()
 
     def process_request(self):
         try:
