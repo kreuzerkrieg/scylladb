@@ -7,29 +7,30 @@
  */
 
 
-#include <unordered_set>
-#include <boost/test/unit_test.hpp>
-#include <boost/algorithm/string/split.hpp>
-#include <boost/algorithm/string/classification.hpp>
-#include <seastar/core/thread.hh>
-#include <seastar/core/reactor.hh>
-#include <seastar/core/file.hh>
-#include <seastar/core/fstream.hh>
-#include <seastar/http/exception.hh>
-#include <seastar/util/closeable.hh>
-#include <seastar/util/short_streams.hh>
-#include <seastar/core/units.hh>
-#include "test/lib/scylla_test_case.hh"
+#include "gc_clock.hh"
+#include "seastar/http/request.hh"
+#include "sstables/checksum_utils.hh"
 #include "test/lib/log.hh"
 #include "test/lib/random_utils.hh"
+#include "test/lib/scylla_test_case.hh"
 #include "test/lib/test_utils.hh"
 #include "test/lib/tmpdir.hh"
 #include "utils/assert.hh"
+#include "utils/exceptions.hh"
 #include "utils/s3/client.hh"
 #include "utils/s3/creds.hh"
-#include "utils/exceptions.hh"
-#include "sstables/checksum_utils.hh"
-#include "gc_clock.hh"
+#include <boost/algorithm/string/classification.hpp>
+#include <boost/algorithm/string/split.hpp>
+#include <boost/test/unit_test.hpp>
+#include <seastar/core/file.hh>
+#include <seastar/core/fstream.hh>
+#include <seastar/core/reactor.hh>
+#include <seastar/core/thread.hh>
+#include <seastar/core/units.hh>
+#include <seastar/http/exception.hh>
+#include <seastar/util/closeable.hh>
+#include <seastar/util/short_streams.hh>
+#include <unordered_set>
 
 using namespace std::string_view_literals;
 
@@ -47,7 +48,7 @@ using namespace std::string_view_literals;
 
 static shared_ptr<s3::client> make_proxy_client(semaphore& mem) {
     s3::endpoint_config cfg = {
-        .port = std::stoul(tests::getenv_safe("PROXY_S3_SERVER_PORT")),
+        .port = 8080,
         .use_https = false,
         .aws = {{
             .access_key_id = tests::getenv_safe("AWS_ACCESS_KEY_ID"),
@@ -56,7 +57,7 @@ static shared_ptr<s3::client> make_proxy_client(semaphore& mem) {
             .region = ::getenv("AWS_DEFAULT_REGION") ? : "local",
         }},
     };
-    return s3::client::make(tests::getenv_safe("PROXY_S3_SERVER_HOST"), make_lw_shared<s3::endpoint_config>(std::move(cfg)), mem);
+    return s3::client::make("localhost", make_lw_shared<s3::endpoint_config>(std::move(cfg)), mem);
 }
 
 static shared_ptr<s3::client> make_minio_client(semaphore& mem) {
@@ -629,4 +630,17 @@ SEASTAR_THREAD_TEST_CASE(test_object_reupload) {
             BOOST_REQUIRE_EQUAL(st.size, object_size);
         }
     }
+}
+
+SEASTAR_THREAD_TEST_CASE(test_reset) {
+    semaphore mem(16 << 20);
+    auto cln = make_proxy_client(mem);
+    auto req = http::request::make("GET", cln->_host, "/");
+    auto close_client = deferred_close(*cln);
+    cln->make_request(std::move(req),
+                      [](const http::reply& reply, input_stream<char>&& in) mutable -> future<> {
+                          auto input = std::move(in);
+                          std::cout << co_await util::read_entire_stream_contiguous(input) << std::endl;
+                      })
+        .get();
 }

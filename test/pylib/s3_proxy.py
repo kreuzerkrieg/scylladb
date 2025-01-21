@@ -14,6 +14,7 @@ import sys
 import socket
 import asyncio
 import struct
+import time
 
 import requests
 import threading
@@ -26,69 +27,6 @@ from requests import Response
 from typing_extensions import Optional
 
 sys.path.insert(0, os.path.dirname(__file__))
-
-
-def checksum(msg):
-    s = 0
-    for i in range(0, len(msg), 2):
-        w = (msg[i] << 8) + (msg[i + 1])
-        s = s + w
-
-    s = (s >> 16) + (s & 0xffff)
-    s = ~s & 0xffff
-    return s
-
-
-def create_rst_packet(src_ip, dst_ip, src_port, dst_port, seq):
-    # IP header fields
-    ip_ihl = 5
-    ip_ver = 4
-    ip_tos = 0
-    ip_tot_len = 20 + 20  # IP header + TCP header
-    ip_id = 54321
-    ip_frag_off = 0
-    ip_ttl = 255
-    ip_proto = socket.IPPROTO_TCP
-    ip_check = 0
-    ip_saddr = socket.inet_aton(src_ip)
-    ip_daddr = socket.inet_aton(dst_ip)
-
-    ip_ihl_ver = (ip_ver << 4) + ip_ihl
-
-    ip_header = struct.pack('!BBHHHBBH4s4s',
-                            ip_ihl_ver, ip_tos, ip_tot_len, ip_id, ip_frag_off, ip_ttl, ip_proto, ip_check, ip_saddr,
-                            ip_daddr)
-
-    # TCP header fields
-    tcp_seq = seq
-    tcp_ack_seq = 0
-    tcp_doff = 5
-    tcp_flags = 0x04  # RST flag
-    tcp_window = socket.htons(5840)
-    tcp_check = 0
-    tcp_urg_ptr = 0
-
-    tcp_offset_res = (tcp_doff << 4) + 0
-    tcp_header = struct.pack('!HHLLBBHHH', src_port, dst_port, tcp_seq, tcp_ack_seq, tcp_offset_res, tcp_flags,
-                             tcp_window, tcp_check, tcp_urg_ptr)
-
-    # Pseudo header fields for checksum calculation
-    src_addr = socket.inet_aton(src_ip)
-    dest_addr = socket.inet_aton(dst_ip)
-    placeholder = 0
-    protocol = socket.IPPROTO_TCP
-    tcp_length = len(tcp_header)
-
-    psh = struct.pack('!4s4sBBH', src_addr, dest_addr, placeholder, protocol, tcp_length)
-    psh = psh + tcp_header
-
-    tcp_check = checksum(psh)
-    tcp_header = struct.pack('!HHLLBBH',
-                             src_port, dst_port, tcp_seq, tcp_ack_seq, tcp_offset_res, tcp_flags,
-                             tcp_window) + struct.pack('H', tcp_check) + struct.pack('!H', tcp_urg_ptr)
-
-    packet = ip_header + tcp_header
-    return packet
 
 
 class Policy:
@@ -150,12 +88,14 @@ class InjectingHandler(BaseHTTPRequestHandler):
                         "RequestTimeTooSkewed",
                         "RequestTimeoutException",
                         "RequestTimeout"))
+    socket_buffer: bytes
 
     def __init__(self, policies, logger, minio_uri, max_retries, *args, **kwargs):
         self.minio_uri = minio_uri
         self.policies = policies
         self.logger = logger
         self.max_retries = max_retries
+        self.socket_buffer = b""
         super().__init__(*args, **kwargs)
         self.close_connection = False
 
@@ -198,26 +138,7 @@ class InjectingHandler(BaseHTTPRequestHandler):
     def get_retryable_http_codes(self):
         return random.choice(self.retryable_codes), random.choice(self.error_names)
 
-    def reset_server_connection(self):
-        # Parameters for the RST packet
-        src_ip, src_port = self.server.socket.getsockname()
-        dst_ip, dst_port = self.wfile._sock.getpeername()
-        print(f"src ip: {src_ip}, src port: {src_port}, dst ip: {dst_ip}, dst port: {dst_port}")
-        seq = 1000
-
-        # Create the packet
-        rst_packet = create_rst_packet(src_ip, dst_ip, src_port, dst_port, seq)
-        self.wfile._sock.sendto(rst_packet, (dst_ip, dst_port))
-
     def respond_with_error(self, reset_connection: bool):
-        # if reset_connection:
-        #     try:
-        #         # Forcefully close the connection to simulate a connection reset
-        #         self.request.shutdown_request()
-        #     except OSError:
-        #         pass
-        #     finally:
-        #         return
         code, error_name = self.get_retryable_http_codes()
         self.send_response(code)
         self.send_header('Content-Type', 'text/plain; charset=utf-8')
@@ -232,44 +153,44 @@ class InjectingHandler(BaseHTTPRequestHandler):
                                     <HostId>Uuag1LuByRx9e6j5Onimru9pO4ZVKnJ2Qz7/C1NPcfTWAtRPfTaOFg==</HostId>
                                 </Error>""".encode('utf-8')
         self.send_header('Content-Length', str(len(response)))
-        self.end_headers()
-        self.wfile.write(response)
-        # if reset_connection:
-            # self.reset_server_connection()
-            # self.server.shutdown_request(self.request)
-            # packet, _socket = self.request.get_request()
-            # self.wfile._sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack('ii', 1, 0))
-            # self.wfile._sock.close()
-            # self.server.socket.send()
-            # self.server.socket = socket.socket(self.server.address_family,
-            #                                    self.server.socket_type)
-            # self.server.server_bind()
 
-            # self.server.socket.shutdown(2)
-            # self.server.shutdown_request(self.request)
-            # self.send_error(HTTPStatus.INTERNAL_SERVER_ERROR, "Partial write.")
+        self.end_headers()
+        self.write_body(response)
+        # self.connection.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack('ii', 1, 0))
+        self.connection.send(self.socket_buffer)
+        self.connection.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack('ii', 1, 0))
+        self.connection.close()
+
+    def end_headers(self):
+        self.socket_buffer += b"".join(self._headers_buffer)
+        self.socket_buffer += b"\r\n"
+
+    def write_body(self, data: bytes):
+        self.socket_buffer += data
 
     def handle_one_request(self):
-        print("Handling request")
+        # print("Handling request")
         # super().handle_one_request()
         self.raw_requestline = self.rfile.readline(65537)
         self.parse_request()
-        if self.command=="GET":
+        if self.command == "GET":
             self.do_GET()
-        elif self.command=="POST":
+        elif self.command == "POST":
             self.do_POST()
-        elif self.command=="PUT":
+        elif self.command == "PUT":
             self.do_PUT()
-        elif self.command=="DELETE":
+        elif self.command == "DELETE":
             self.do_DELETE()
-        elif self.command=="HEAD":
+        elif self.command == "HEAD":
             self.do_HEAD()
-        # self.wfile.flush()
-        # self.close_connection = True
-        # self.wfile._sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack('ii', 1, 0))
-        self.wfile._sock.shutdown(socket.SHUT_RDWR)
-        self.wfile._sock.close()
-        # self.wfile.close()
+        # Flush the output stream to ensure the body is sent
+
+        # Add a brief delay to ensure the response body is sent
+        # time.sleep(0.1)
+
+        # Forcefully close the socket before fully sending
+        # self.connection.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack('ii', 1, 0))
+        # self.connection.close()
 
     def process_request(self):
         try:
@@ -306,7 +227,9 @@ class InjectingHandler(BaseHTTPRequestHandler):
                 else:
                     self.send_header("Content-Length", str(len(response.content)))
                 self.end_headers()
-                self.wfile.write(response.content)
+                self.write_body(response.content)
+                self.connection.sendall(self.socket_buffer)
+                self.connection.close()
         except Exception as e:
             self.logger.error("%s", e)
 

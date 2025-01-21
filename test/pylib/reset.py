@@ -21,21 +21,35 @@ class MyHandler(BaseHTTPRequestHandler):
         self.do_GET()  # or call the appropriate handler based on the command
 
         # Flush the output stream to ensure the body is sent
-        self.wfile.flush()
+        # self.wfile.flush()
+        #
+        # # Add a brief delay to ensure the response body is sent
+        # time.sleep(0.1)
+        #
+        # # Forcefully close the socket before fully sending
+        # self.connection.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack('ii', 1, 0))
+        # self.connection.close()
 
-        # Add a brief delay to ensure the response body is sent
-        time.sleep(0.1)
+    def do_GET(self):
+        print("GET request received")
+        response_headers = (
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: text/html\r\n"
+            "Connection: close\r\n"
+            "\r\n"
+        )
+        response_body = "Hello, world!"
+        response = response_headers + response_body
 
-        # Forcefully close the socket before fully sending
+        # Send the headers and part of the body
+        self.connection.send(response_headers.encode('utf-8'))
+        partial_body = response_body[:5]  # Send only part of the body
+        self.connection.send(partial_body.encode('utf-8'))
+
+        # Forcefully close the socket
         self.connection.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack('ii', 1, 0))
         self.connection.close()
 
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header('Content-type', 'text/html')
-        self.send_header('Connection', 'close')
-        self.end_headers()
-        self.wfile.write(b"Hello, world!")
 
 def run_server():
     server_address = ('', 8080)

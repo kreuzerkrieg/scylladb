@@ -53,8 +53,9 @@ class client : public enable_shared_from_this<client> {
     class upload_jumbo_sink;
     class do_upload_file;
     class readable_file;
-    std::string _host;
-    endpoint_config_ptr _cfg;
+
+public: std::string _host;
+private:    endpoint_config_ptr _cfg;
     struct io_stats {
         uint64_t ops = 0;
         uint64_t bytes = 0;
@@ -86,12 +87,14 @@ class client : public enable_shared_from_this<client> {
 
     void authorize(http::request&);
     group_client& find_or_create_client();
-    future<> make_request(http::request req, http::experimental::client::reply_handler handle = ignore_reply, std::optional<http::reply::status_type> expected = std::nullopt, seastar::abort_source* = nullptr);
-    using reply_handler_ext = noncopyable_function<future<>(group_client&, const http::reply&, input_stream<char>&& body)>;
-    future<> make_request(http::request req, reply_handler_ext handle, std::optional<http::reply::status_type> expected = std::nullopt, seastar::abort_source* = nullptr);
+
     future<> do_retryable_request(group_client& gc, http::request req, http::experimental::client::reply_handler handler, seastar::abort_source* as = nullptr) const;
     future<> get_object_header(sstring object_name, http::experimental::client::reply_handler handler, seastar::abort_source* = nullptr);
 public:
+
+    future<> make_request(http::request req, http::experimental::client::reply_handler handle = ignore_reply, std::optional<http::reply::status_type> expected = std::nullopt, seastar::abort_source* = nullptr);
+    using reply_handler_ext = noncopyable_function<future<>(group_client&, const http::reply&, input_stream<char>&& body)>;
+    future<> make_request(http::request req, reply_handler_ext handle, std::optional<http::reply::status_type> expected = std::nullopt, seastar::abort_source* = nullptr);
 
     client(std::string host, endpoint_config_ptr cfg, semaphore& mem, global_factory gf, private_tag, std::unique_ptr<aws::retry_strategy> rs = std::make_unique<aws::default_retry_strategy>());
     static shared_ptr<client> make(std::string endpoint, endpoint_config_ptr cfg, semaphore& memory, global_factory gf = {});

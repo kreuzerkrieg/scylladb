@@ -267,7 +267,6 @@ future<> client::do_retryable_request(group_client& gc, http::request req, http:
             e = std::current_exception();
             request_ex = ex;
         } catch (const std::system_error& ex) {
-            s3l.warn("System error: {}", ex);
             e = std::current_exception();
             request_ex = aws::aws_exception(aws::aws_error::from_system_error(ex));
         } catch (...) {
@@ -275,9 +274,6 @@ future<> client::do_retryable_request(group_client& gc, http::request req, http:
             request_ex = aws::aws_exception(aws::aws_error{aws::aws_error_type::UNKNOWN, format("{}", e), aws::retryable::no});
         }
 
-        if (request_ex.error().get_error_type() != aws::aws_error_type::OK) {
-            s3l.warn("Request failed: {}", request_ex.error().get_error_message());
-        }
         if (!_retry_strategy->should_retry(request_ex.error(), retries)) {
             break;
         }
