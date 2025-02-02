@@ -13,16 +13,14 @@
 #include "utils/s3/client_fwd.hh"
 #include "tasks/task_manager.hh"
 
-namespace s3{struct endpoint_config;}
 namespace db {
 class snapshot_ctl;
 
 namespace snapshot {
 
-using client_config = std::function<std::tuple<sstring, semaphore&, s3::endpoint_config>()>;
 class backup_task_impl : public tasks::task_manager::task::impl {
     snapshot_ctl& _snap_ctl;
-    client_config _cfg;
+    sstring _endpoint;
     sstring _bucket;
     sstring _prefix;
     std::filesystem::path _snapshot_dir;
@@ -38,7 +36,7 @@ protected:
 public:
     backup_task_impl(tasks::task_manager::module_ptr module,
                      snapshot_ctl& ctl,
-                     client_config cfg,
+                     sstring endpoint,
                      sstring bucket,
                      sstring prefix,
                      sstring ks,
