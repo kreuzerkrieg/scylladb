@@ -20,6 +20,8 @@
 #include "sstables/sstables_manager.hh"
 #include "utils/error_injection.hh"
 
+#include <boost/lockfree/queue.hpp>
+
 extern logging::logger snap_log;
 
 namespace db::snapshot {
@@ -103,50 +105,7 @@ future<> backup_task_impl::upload_component(shared_ptr<s3::client>& client, abor
 
 namespace {
 
-struct shard_files {
-    size_t size{0};
-    std::vector<sstring> files;
-    std::strong_ordering operator<=>(const shard_files& other) const noexcept { return size <=> other.size; }
-};
-
-using sharded_files = std::vector<shard_files>;
-
-sharded_files greedy_partitioning(std::vector<std::tuple<size_t, sstring>>&& files, size_t partitions) {
-    sharded_files result(partitions);
-    std::ranges::sort(files, std::greater());
-    for (auto&& [size, file] : files) {
-        auto& smallest = *std::ranges::min_element(result, std::less());
-        smallest.files.emplace_back(std::move(file));
-        smallest.size += size;
-    }
-    return result;
-}
-
-[[maybe_unused]] sharded_files round_robin_partitioning(std::vector<std::tuple<size_t, sstring>>&& files, size_t partitions) {
-    sharded_files result(partitions);
-    std::ranges::sort(files, std::greater());
-    size_t pos = 0;
-    for (auto&& [size, file] : files) {
-        auto& elem = result[pos++ % partitions];
-        elem.files.emplace_back(std::move(file));
-        elem.size += size;
-    }
-    return result;
-}
-
-sstring print_results(const sharded_files& files) {
-    sstring sizes_table;
-    sizes_table += "\n+-------+----------------------------------------------+\n";
-    sizes_table += "|  Shard  |    Accumulated size    |  Number of files  |\n";
-    sizes_table += "+---------+--------------------------------------------+\n";
-    for (size_t i = 0; i < files.size(); ++i) {
-        sizes_table += std::format("|{:^9}|{:>17} bytes |{:>19}|\n", i, files[i].size, files[i].files.size());
-    }
-    sizes_table += "+---------+------------------------+-------------------+\n";
-    return sizes_table;
-}
-
-future<sharded_files> get_backup_files(const std::filesystem::path& snapshot_dir) {
+future<std::vector<std::tuple<size_t, sstring>>> get_backup_files(const std::filesystem::path& snapshot_dir) {
     std::exception_ptr ex;
     auto snapshot_dir_lister = directory_lister(snapshot_dir, lister::dir_entry_types::of<directory_entry_type::regular>());
     std::vector<std::tuple<size_t, sstring>> backup_files;
@@ -169,7 +128,8 @@ future<sharded_files> get_backup_files(const std::filesystem::path& snapshot_dir
     if (ex)
         co_await coroutine::return_exception_ptr(std::move(ex));
 
-    co_return greedy_partitioning(std::move(backup_files), smp::count);
+    std::ranges::sort(backup_files, std::greater());
+    co_return backup_files;
 }
 } // namespace
 
@@ -178,10 +138,12 @@ future<> backup_task_impl::do_backup() {
         throw std::invalid_argument(fmt::format("snapshot does not exist at {}", _snapshot_dir.native()));
     }
 
-    auto backup_shards = co_await get_backup_files(_snapshot_dir);
-
-    if (snap_log.is_enabled(log_level::trace))
-        snap_log.trace("{}", print_results(backup_shards));
+    auto backup_files = co_await get_backup_files(_snapshot_dir);
+    boost::lockfree::queue<size_t> shared_queue(backup_files.size());
+    size_t counter = 0;
+    for ([[maybe_unused]] const auto& _1 : backup_files) {
+        shared_queue.push(counter++);
+    }
 
     sharded<abort_source> as;
     co_await as.start();
@@ -195,20 +157,20 @@ future<> backup_task_impl::do_backup() {
     });
 
     std::exception_ptr ex;
-    co_await smp::invoke_on_all([this, &ex, &backup_shards, &as] -> future<> {
+    co_await smp::invoke_on_all([this, &ex, &backup_files, &shared_queue, &as] -> future<> {
         try {
             auto shard_id = this_shard_id();
             auto cln = _snap_ctl.storage_manager().container().local().get_endpoint_client(_endpoint);
 
             gate uploads;
-
-            for (const auto& name : backup_shards[shard_id].files) {
+            size_t name_idx;
+            while (shared_queue.pop(name_idx)) {
                 // Pre-upload break point. For testing abort in actual s3 client usage.
                 co_await utils::get_local_injector().inject("backup_task_pre_upload", utils::wait_for_message(std::chrono::minutes(2)));
                 auto gh = uploads.hold();
 
                 try {
-                    co_await upload_component(cln, as.local(), _progress_per_shard[shard_id], name);
+                    co_await upload_component(cln, as.local(), _progress_per_shard[shard_id], std::get<1>(backup_files[name_idx]));
                 } catch (...) {
                     ex = std::current_exception();
                     break;
