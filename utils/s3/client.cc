@@ -1161,7 +1161,7 @@ future<> client::upload_file(std::filesystem::path path,
     do_upload_file do_upload{shared_from_this(),
                              std::move(path),
                              std::move(object_name),
-                             {}, 0, up, as};
+                             {}, 50_MiB, up, as};
     co_await do_upload.upload();
 }
 
