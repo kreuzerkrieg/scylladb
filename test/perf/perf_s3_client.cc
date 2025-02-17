@@ -10,6 +10,7 @@
 #include <seastar/core/app-template.hh>
 #include <seastar/core/sleep.hh>
 #include <seastar/core/memory.hh>
+#include <seastar/core/units.hh>
 #include <seastar/coroutine/parallel_for_each.hh>
 #include "test/lib/test_utils.hh"
 #include "test/lib/random_utils.hh"
@@ -103,7 +104,7 @@ public:
         } while (now() < until);
     }
 
-    future<> run_upload() {
+    future<> run_upload(std::atomic<double>& throughput) {
         plog.info("Uploading");
         auto file_name = fs::path(_object_name);
         auto sz = co_await seastar::file_size(file_name.native());
@@ -113,6 +114,7 @@ public:
         co_await _client->upload_file(file_name, _object_name, {}, _part_size_mb << 20);
         auto time = std::chrono::duration_cast<std::chrono::duration<double>>(now() - start);
         plog.info("Uploaded {}MB in {}s, speed {}MB/s", sz >> 20, time.count(), (sz >> 20) / time.count());
+        throughput += static_cast<double>(sz) / time.count();
     }
 
     future<> stop() {
@@ -151,26 +153,86 @@ int main(int argc, char** argv) {
     return app.run(argc, argv, [&app] () -> future<> {
         auto dur = std::chrono::seconds(app.configuration()["duration"].as<unsigned>());
         auto sks = app.configuration()["sockets"].as<unsigned>();
-        auto part_size = app.configuration()["part_size_mb"].as<unsigned>();
+        // auto part_size = app.configuration()["part_size_mb"].as<unsigned>();
         auto oname = app.configuration()["object_name"].as<sstring>();
         auto osz = app.configuration()["object_size"].as<size_t>();
-        auto upload = app.configuration().contains("upload");
-        sharded<tester> test;
+        // auto upload = app.configuration().contains("upload");
+        /*sharded<tester> test;
         plog.info("Creating");
-        co_await test.start(dur, sks, part_size, oname, osz);
-        plog.info("Starting");
-        co_await test.invoke_on_all(&tester::start);
+        co_await test.start(dur, sks, part_size, oname, osz);*/
+        /*plog.info("Starting");
+        co_await test.invoke_on_all(&tester::start);*/
+
+        auto format_size = [](double bytes) {
+            const char* units[] = {"B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB"};
+            unsigned unitIndex = 0;
+            while (bytes >= 1024 && unitIndex < sizeof(units) / sizeof(units[0]) - 1) {
+                bytes /= 1024;
+                ++unitIndex;
+            }
+            std::ostringstream oss;
+            oss << std::fixed << std::setprecision(2) << bytes << " " << units[unitIndex];
+            return oss.str();
+        };
         try {
             plog.info("Running");
-            if (upload) {
-                co_await test.invoke_on_all(&tester::run_upload);
-            } else {
-                co_await test.invoke_on_all(&tester::run_download);
+            size_t file_size = 1;
+            std::vector<std::tuple<size_t, std::string>> files_to_test;
+            for (; file_size < 10_GiB; file_size <<= 4) {
+                std::string filename = fmt::format("{}_testfile.bin", file_size);
+                try {
+                    auto actual_size=co_await seastar::file_size(fs::path(filename).native());
+                    if (actual_size != file_size) {
+                        throw std::runtime_error(fmt::format("File {} has wrong size: {} instead of {}", filename, actual_size, file_size));
+                    }
+                } catch (...) {
+                    std::cout << "Looks like the file is missing or has a wrong size." << std::endl
+                              << "It is expected that the script will be executed prior to running the test." << std::endl
+                              <<
+                        R"(#!/bin/bash
+
+file_size=1
+max_size=$((10 * 1024 ** 3)) # 10 GiB
+block_size=$((1024 * 1024))  # 1 MiB
+
+while [ $file_size -lt $max_size ]; do
+    filename="${file_size}_testfile.bin"
+    echo "Creating file ${filename}, size ${file_size} bytes"
+
+    if [ $file_size -le $((2 * 1024 ** 3)) ]; then
+        dd if=/dev/urandom of=${filename} bs=${file_size} count=1
+    else
+        count=$((file_size / block_size))
+        dd if=/dev/urandom of=${filename} bs=${block_size} count=${count}
+    fi
+
+    file_size=$((file_size << 4)) # Increase file_size by a factor of 16
+done
+)" << std::endl;
+                }
+                std::cout << fmt::format("Creating file {}, size {}", filename, format_size(file_size)) << std::endl;
+                files_to_test.emplace_back(file_size, std::move(filename));
+            };
+            std::string results = "+-----------+---------------+-----------------+------------------+\n";
+            results += "|    SMP    |    Sockets    |    File size    |    Throughput    |\n";
+            results += "+-----------+---------------+-----------------+------------------+\n";
+            for (sks = 1; sks <= 16; ++sks) {
+                for (const auto& [size, name] : files_to_test) {
+                    sharded<tester> test;
+                    plog.info("Creating");
+                    co_await test.start(dur, sks, 50_MiB, name, osz);
+                    std::atomic<double> combined_throughput;
+                    co_await test.invoke_on_all(&tester::run_upload, std::ref(combined_throughput));
+                    auto throughput = format_size(combined_throughput.load()) + "/s";
+                    results += fmt::format("|{:^11}|{:^15}|{:^17}|{:^18}|\n", smp::count, sks, format_size(size), throughput);
+                    co_await test.stop();
+                }
             }
+            results += "+-----------+---------------+-----------------+------------------+\n";
+            std::cout << results;
         } catch (...) {
             plog.error("Error running: {}", std::current_exception());
         }
         plog.info("Stopping (and printing results)");
-        co_await test.stop();
     });
 }
