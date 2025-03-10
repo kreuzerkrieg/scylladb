@@ -18,6 +18,7 @@
 #include "db/snapshot-ctl.hh"
 #include "db/snapshot/backup_task.hh"
 #include "schema/schema_fwd.hh"
+#include "sstables/exceptions.hh"
 #include "sstables/sstables.hh"
 #include "utils/error_injection.hh"
 
@@ -107,11 +108,23 @@ future<> backup_task_impl::process_snapshot_dir() {
     auto snapshot_dir_lister = directory_lister(_snapshot_dir, lister::dir_entry_types::of<directory_entry_type::regular>());
 
     try {
+        snap_log.debug("backup_task: listing {}", _snapshot_dir.native());
         while (auto component_ent = co_await snapshot_dir_lister.get()) {
-            _files.push_back(component_ent->name);
+            const auto& name = component_ent->name;
+            auto file_path = _snapshot_dir / name;
+            try {
+                auto desc = sstables::parse_path(file_path, "", "");
+                _sstable_comps[desc.generation].emplace_back(name);
+                ++_num_sstable_comps;
+            } catch (const sstables::malformed_sstable_exception&) {
+                _non_sstable_files.emplace_back(name);
+            }
         }
+        snap_log.debug("backup_task: found {} SSTables consisting of {} component files, and {} non-sstable files",
+            _sstable_comps.size(), _num_sstable_comps, _non_sstable_files.size());
     } catch (...) {
         _ex = std::current_exception();
+        snap_log.error("backup_task: listing {} failed: {}", _snapshot_dir.native(), _ex);
     }
 
     co_await snapshot_dir_lister.close();
@@ -135,6 +148,19 @@ future<> backup_task_impl::backup_file(const sstring& name) {
     co_await coroutine::maybe_yield();
 };
 
+future<> backup_task_impl::backup_sstable(sstables::generation_type gen, const comps_vector& comps) {
+    snap_log.debug("Backing up SSTable generation {}", gen);
+    for (auto it = comps.begin(); it != comps.end() && !_ex; ++it) {
+        // Pre-upload break point. For testing abort in actual s3 client usage.
+        co_await utils::get_local_injector().inject("backup_task_pre_upload", utils::wait_for_message(std::chrono::minutes(2)));
+
+        const auto& name = *it;
+        co_await backup_file(name);
+
+        co_await utils::get_local_injector().inject("backup_task_pause", utils::wait_for_message(std::chrono::minutes(2)));
+    }
+};
+
 future<> backup_task_impl::do_backup() {
     if (!co_await file_exists(_snapshot_dir.native())) {
         throw std::invalid_argument(fmt::format("snapshot does not exist at {}", _snapshot_dir.native()));
@@ -142,17 +168,17 @@ future<> backup_task_impl::do_backup() {
 
     co_await process_snapshot_dir();
 
-    for (auto it = _files.begin(); it != _files.end() && !_ex; ++it) {
-        // Pre-upload break point. For testing abort in actual s3 client usage.
-        co_await utils::get_local_injector().inject("backup_task_pre_upload", utils::wait_for_message(std::chrono::minutes(2)));
-
-        co_await backup_file(*it);
-
-        co_await utils::get_local_injector().inject("backup_task_pause", utils::wait_for_message(std::chrono::minutes(2)));
-        if (impl::_as.abort_requested()) {
-            _ex = impl::_as.abort_requested_exception_ptr();
-            break;
+    try {
+        while (!_sstable_comps.empty() && !_ex) {
+            auto ent = _sstable_comps.extract(_sstable_comps.begin());
+            co_await backup_sstable(ent.key(), ent.mapped());
         }
+
+        for (auto it = _non_sstable_files.begin(); it != _non_sstable_files.end() && !_ex; ++it) {
+            co_await backup_file(*it);
+        }
+    } catch (...) {
+        _ex = std::current_exception();
     }
 
     co_await _uploads.close();
