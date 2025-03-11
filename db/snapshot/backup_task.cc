@@ -20,6 +20,9 @@
 #include "schema/schema_fwd.hh"
 #include "sstables/exceptions.hh"
 #include "sstables/sstables.hh"
+#include "sstables/sstable_directory.hh"
+#include "sstables/sstables_manager.hh"
+#include "sstables/component_type.hh"
 #include "utils/error_injection.hh"
 
 extern logging::logger snap_log;
@@ -150,6 +153,7 @@ future<> backup_task_impl::backup_file(const sstring& name) {
     _as.check();
 
     auto gh = _uploads.hold();
+    auto units = co_await _sharded_sstables_manager.local().manager.dir_semaphore().get_units(1);
 
     // okay to drop future since uploads is always closed before exiting the function
     std::ignore = upload_component(name).handle_exception([this] (std::exception_ptr e) {
@@ -157,8 +161,7 @@ future<> backup_task_impl::backup_file(const sstring& name) {
         if (!_ex) {
             _ex = std::move(e);
         }
-    }).finally([gh = std::move(gh)] {});
-    co_await coroutine::maybe_yield();
+    }).finally([gh = std::move(gh), units = std::move(units)] {});
 };
 
 future<> backup_task_impl::backup_sstable(sstables::generation_type gen, const comps_vector& comps) {
