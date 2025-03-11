@@ -120,6 +120,7 @@ future<> backup_task_impl::process_snapshot_dir() {
             try {
                 auto desc = sstables::parse_path(file_path, "", "");
                 _sstable_comps[desc.generation].emplace_back(name);
+                _sstables_in_snapshot.insert(desc.generation);
                 ++_num_sstable_comps;
 
                 if (desc.component == sstables::component_type::Data) {
@@ -177,9 +178,17 @@ future<> backup_task_impl::backup_sstable(sstables::generation_type gen, const c
     }
 };
 
-backup_task_impl::sstables_manager_for_table::sstables_manager_for_table(const replica::database& db, table_id t)
+backup_task_impl::sstables_manager_for_table::sstables_manager_for_table(const replica::database& db, table_id t,
+        std::function<future<>(sstables::generation_type gen, sstables::manager_event_type event)> callback)
     : manager(db.get_sstables_manager(*db.find_schema(t)))
+    , sub(manager.subscribe(callback))
 {
+}
+
+void backup_task_impl::on_unlink(sstables::generation_type gen) {
+    if (_sstable_comps.contains(gen)) {
+        _unlinked_sstables.push_back(gen);
+    }
 }
 
 future<> backup_task_impl::do_backup() {
@@ -189,7 +198,22 @@ future<> backup_task_impl::do_backup() {
 
     co_await process_snapshot_dir();
 
-    co_await _sharded_sstables_manager.start(std::ref(_snap_ctl.db()), _table_id);
+    _backup_shard = this_shard_id();
+    co_await _sharded_sstables_manager.start(std::ref(_snap_ctl.db()), _table_id, [&] (sstables::generation_type gen, sstables::manager_event_type event) -> future<> {
+        switch (event) {
+        case sstables::manager_event_type::add:
+            break;
+        case sstables::manager_event_type::unlink:
+            // Check if generation was included in snapshot
+            // This is safe since this set is immutable
+            if (_sstables_in_snapshot.contains(gen)) {
+                return smp::submit_to(_backup_shard, [this, gen] {
+                    on_unlink(gen);
+                });
+            }
+        }
+        return make_ready_future();
+    });
 
     try {
         while (!_sstable_comps.empty() && !_ex) {
