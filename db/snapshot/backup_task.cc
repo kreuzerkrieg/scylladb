@@ -116,6 +116,17 @@ future<> backup_task_impl::process_snapshot_dir() {
                 auto desc = sstables::parse_path(file_path, "", "");
                 _sstable_comps[desc.generation].emplace_back(name);
                 ++_num_sstable_comps;
+
+                if (desc.component == sstables::component_type::Data) {
+                    // If the sstable is already unlinked after the snapshot was taken
+                    // track its generation in the unlinked_sstables list
+                    // so it can be prioritized for backup
+                    auto st = co_await file_stat(file_path.native());
+                    if (st.number_of_links == 1) {
+                        snap_log.trace("do_backup: sstable with gen={} is already unlinked", desc.generation);
+                        _unlinked_sstables.push_back(desc.generation);
+                    }
+                }
             } catch (const sstables::malformed_sstable_exception&) {
                 _non_sstable_files.emplace_back(name);
             }
@@ -170,7 +181,20 @@ future<> backup_task_impl::do_backup() {
 
     try {
         while (!_sstable_comps.empty() && !_ex) {
-            auto ent = _sstable_comps.extract(_sstable_comps.begin());
+            auto to_backup = _sstable_comps.begin();
+            // Prioritize unlinked sstables to free-up their disk space earlier.
+            // This is particularly important when running backup at high utilization levels (e.g. over 90%)
+            if (!_unlinked_sstables.empty()) {
+                auto gen = _unlinked_sstables.back();
+                _unlinked_sstables.pop_back();
+                if (auto it = _sstable_comps.find(gen); it != _sstable_comps.end()) {
+                    snap_log.debug("Prioritizing unlinked sstable gen={}", gen);
+                    to_backup = it;
+                } else {
+                    snap_log.trace("Unlinked sstable gen={} was not found", gen);
+                }
+            }
+            auto ent = _sstable_comps.extract(to_backup);
             co_await backup_sstable(ent.key(), ent.mapped());
         }
 

@@ -43,6 +43,7 @@ class backup_task_impl : public tasks::task_manager::task::impl {
     comps_map _sstable_comps;
     size_t _num_sstable_comps = 0;
     comps_vector _non_sstable_files;
+    std::vector<sstables::generation_type> _unlinked_sstables;
 
     future<> do_backup();
     future<> upload_component(sstring name);
