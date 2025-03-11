@@ -174,12 +174,19 @@ future<> backup_task_impl::backup_sstable(sstables::generation_type gen, const c
     }
 };
 
+backup_task_impl::sstables_manager_for_table::sstables_manager_for_table(const replica::database& db, table_id t)
+    : manager(db.get_sstables_manager(*db.find_schema(t)))
+{
+}
+
 future<> backup_task_impl::do_backup() {
     if (!co_await file_exists(_snapshot_dir.native())) {
         throw std::invalid_argument(fmt::format("snapshot does not exist at {}", _snapshot_dir.native()));
     }
 
     co_await process_snapshot_dir();
+
+    co_await _sharded_sstables_manager.start(std::ref(_snap_ctl.db()), _table_id);
 
     try {
         while (!_sstable_comps.empty() && !_ex) {
@@ -208,6 +215,7 @@ future<> backup_task_impl::do_backup() {
     }
 
     co_await _uploads.close();
+    co_await _sharded_sstables_manager.stop();
     if (_ex) {
         co_await coroutine::return_exception_ptr(std::move(_ex));
     }

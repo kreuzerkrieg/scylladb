@@ -22,6 +22,10 @@
 #include "sstables/component_type.hh"
 #include "sstables/generation_type.hh"
 
+namespace sstables {
+class sstables_manager;
+}
+
 namespace db {
 class snapshot_ctl;
 
@@ -45,6 +49,13 @@ class backup_task_impl : public tasks::task_manager::task::impl {
     size_t _num_sstable_comps = 0;
     comps_vector _non_sstable_files;
     std::vector<sstables::generation_type> _unlinked_sstables;
+
+    struct sstables_manager_for_table {
+        sstables::sstables_manager& manager;
+    public:
+        sstables_manager_for_table(const replica::database& db, table_id t);
+    };
+    sharded<sstables_manager_for_table> _sharded_sstables_manager;
 
     future<> do_backup();
     future<> upload_component(sstring name);
