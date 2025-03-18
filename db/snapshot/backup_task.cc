@@ -108,7 +108,6 @@ future<> backup_task_impl::do_backup() {
         throw std::invalid_argument(fmt::format("snapshot does not exist at {}", _snapshot_dir.native()));
     }
 
-    gate uploads;
     auto snapshot_dir_lister = directory_lister(_snapshot_dir, lister::dir_entry_types::of<directory_entry_type::regular>());
 
     for (;;) {
@@ -124,7 +123,7 @@ future<> backup_task_impl::do_backup() {
         if (!component_ent.has_value()) {
             break;
         }
-        auto gh = uploads.hold();
+        auto gh = _uploads.hold();
 
         // Pre-upload break point. For testing abort in actual s3 client usage.
         co_await utils::get_local_injector().inject("backup_task_pre_upload", utils::wait_for_message(std::chrono::minutes(2)));
@@ -144,7 +143,7 @@ future<> backup_task_impl::do_backup() {
     }
 
     co_await snapshot_dir_lister.close();
-    co_await uploads.close();
+    co_await _uploads.close();
     if (_ex) {
         co_await coroutine::return_exception_ptr(std::move(_ex));
     }

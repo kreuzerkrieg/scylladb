@@ -12,6 +12,8 @@
 #include <filesystem>
 #include <exception>
 
+#include <seastar/core/gate.hh>
+
 #include "utils/s3/client_fwd.hh"
 #include "tasks/task_manager.hh"
 
@@ -30,6 +32,7 @@ class backup_task_impl : public tasks::task_manager::task::impl {
     s3::upload_progress _progress = {};
 
     std::exception_ptr _ex;
+    gate _uploads;
 
     future<> do_backup();
     future<> upload_component(sstring name);
