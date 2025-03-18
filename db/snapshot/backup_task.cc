@@ -106,20 +106,12 @@ future<> backup_task_impl::upload_component(sstring name) {
 future<> backup_task_impl::process_snapshot_dir() {
     auto snapshot_dir_lister = directory_lister(_snapshot_dir, lister::dir_entry_types::of<directory_entry_type::regular>());
 
-    for (;;) {
-        std::optional<directory_entry> component_ent;
-        try {
-            component_ent = co_await snapshot_dir_lister.get();
-        } catch (...) {
-            if (!_ex) {
-                _ex = std::current_exception();
-                break;
-            }
+    try {
+        while (auto component_ent = co_await snapshot_dir_lister.get()) {
+            _files.push_back(component_ent->name);
         }
-        if (!component_ent.has_value()) {
-            break;
-        }
-        _files.push_back(component_ent->name);
+    } catch (...) {
+        _ex = std::current_exception();
     }
 
     co_await snapshot_dir_lister.close();
