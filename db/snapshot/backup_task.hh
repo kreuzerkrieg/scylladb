@@ -39,6 +39,8 @@ class backup_task_impl : public tasks::task_manager::task::impl {
     future<> do_backup();
     future<> upload_component(sstring name);
     future<> process_snapshot_dir();
+    // Leaves a background task, covered by _uploads gate
+    future<> backup_file(const sstring& name);
 
 protected:
     virtual future<> run() override;

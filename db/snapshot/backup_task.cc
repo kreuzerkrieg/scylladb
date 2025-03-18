@@ -120,6 +120,21 @@ future<> backup_task_impl::process_snapshot_dir() {
     }
 }
 
+future<> backup_task_impl::backup_file(const sstring& name) {
+    _as.check();
+
+    auto gh = _uploads.hold();
+
+    // okay to drop future since uploads is always closed before exiting the function
+    std::ignore = upload_component(name).handle_exception([this] (std::exception_ptr e) {
+        // keep the first exception
+        if (!_ex) {
+            _ex = std::move(e);
+        }
+    }).finally([gh = std::move(gh)] {});
+    co_await coroutine::maybe_yield();
+};
+
 future<> backup_task_impl::do_backup() {
     if (!co_await file_exists(_snapshot_dir.native())) {
         throw std::invalid_argument(fmt::format("snapshot does not exist at {}", _snapshot_dir.native()));
@@ -128,18 +143,11 @@ future<> backup_task_impl::do_backup() {
     co_await process_snapshot_dir();
 
     for (auto it = _files.begin(); it != _files.end() && !_ex; ++it) {
-        auto gh = _uploads.hold();
-
         // Pre-upload break point. For testing abort in actual s3 client usage.
         co_await utils::get_local_injector().inject("backup_task_pre_upload", utils::wait_for_message(std::chrono::minutes(2)));
 
-        std::ignore = upload_component(*it).handle_exception([this] (std::exception_ptr e) {
-            // keep the first exception
-            if (!_ex) {
-                _ex = std::move(e);
-            }
-        }).finally([gh = std::move(gh)] {});
-        co_await coroutine::maybe_yield();
+        co_await backup_file(*it);
+
         co_await utils::get_local_injector().inject("backup_task_pause", utils::wait_for_message(std::chrono::minutes(2)));
         if (impl::_as.abort_requested()) {
             _ex = impl::_as.abort_requested_exception_ptr();
