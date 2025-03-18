@@ -11,6 +11,7 @@
 
 #include <filesystem>
 #include <exception>
+#include <vector>
 
 #include <seastar/core/gate.hh>
 
@@ -33,9 +34,11 @@ class backup_task_impl : public tasks::task_manager::task::impl {
 
     std::exception_ptr _ex;
     gate _uploads;
+    std::vector<sstring> _files;   // FIXME: for now
 
     future<> do_backup();
     future<> upload_component(sstring name);
+    future<> process_snapshot_dir();
 
 protected:
     virtual future<> run() override;
