@@ -10,6 +10,7 @@
 #include <seastar/core/abort_source.hh>
 #include <seastar/core/seastar.hh>
 #include <seastar/coroutine/maybe_yield.hh>
+#include <boost/lockfree/queue.hpp>
 
 #include "utils/lister.hh"
 #include "utils/s3/client.hh"
@@ -215,23 +216,38 @@ future<> backup_task_impl::do_backup() {
         return make_ready_future();
     });
 
-    try {
-        while (!_sstable_comps.empty() && !_ex) {
-            auto to_backup = _sstable_comps.begin();
-            // Prioritize unlinked sstables to free-up their disk space earlier.
-            // This is particularly important when running backup at high utilization levels (e.g. over 90%)
-            if (!_unlinked_sstables.empty()) {
-                auto gen = _unlinked_sstables.back();
-                _unlinked_sstables.pop_back();
-                if (auto it = _sstable_comps.find(gen); it != _sstable_comps.end()) {
-                    snap_log.debug("Prioritizing unlinked sstable gen={}", gen);
-                    to_backup = it;
-                } else {
-                    snap_log.trace("Unlinked sstable gen={} was not found", gen);
-                }
+    using sst_container = std::vector<comps_map::node_type>;
+    sst_container tmp_sstables;
+    tmp_sstables.reserve(_sstable_comps.size());
+    while (!_sstable_comps.empty()) {
+        auto to_backup = _sstable_comps.cbegin();
+        // Prioritize unlinked sstables to free-up their disk space earlier.
+        // This is particularly important when running backup at high utilization levels (e.g. over 90%)
+        if (!_unlinked_sstables.empty()) {
+            auto gen = _unlinked_sstables.back();
+            _unlinked_sstables.pop_back();
+            if (auto it = _sstable_comps.find(gen); it != _sstable_comps.end()) {
+                snap_log.debug("Prioritizing unlinked sstable gen={}", gen);
+                to_backup = it;
+            } else {
+                snap_log.trace("Unlinked sstable gen={} was not found", gen);
             }
-            auto ent = _sstable_comps.extract(to_backup);
-            co_await backup_sstable(ent.key(), ent.mapped());
+        }
+        tmp_sstables.emplace_back(_sstable_comps.extract(to_backup));
+    }
+    boost::lockfree::queue<sst_container::const_iterator> queue(tmp_sstables.size());
+    for (auto it = tmp_sstables.cbegin(); it != tmp_sstables.cend(); ++it) {
+        queue.push(it);
+    }
+
+    try {
+        while (!queue.empty() && !_ex) {
+            sst_container::const_iterator to_backup;
+            if (!queue.pop(to_backup)) {
+                break;
+            }
+
+            co_await backup_sstable(to_backup->key(), to_backup->mapped());
         }
 
         for (auto it = _non_sstable_files.begin(); it != _non_sstable_files.end() && !_ex; ++it) {
