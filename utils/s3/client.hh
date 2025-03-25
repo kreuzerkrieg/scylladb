@@ -17,6 +17,7 @@
 #include <filesystem>
 #include "utils/lister.hh"
 #include "utils/s3/creds.hh"
+#include "utils/s3/utils/client_utils.hh"
 #include "credentials_providers/aws_credentials_provider_chain.hh"
 #include "s3_retry_strategy.hh"
 #include "utils/exceptions.hh"
@@ -29,18 +30,6 @@ class memory_data_sink_buffers;
 namespace s3 {
 
 using s3_clock = std::chrono::steady_clock;
-
-struct range {
-    uint64_t off;
-    size_t len;
-};
-
-struct tag {
-    std::string key;
-    std::string value;
-    auto operator<=>(const tag&) const = default;
-};
-using tag_set = std::vector<tag>;
 
 struct stats {
     uint64_t size;
