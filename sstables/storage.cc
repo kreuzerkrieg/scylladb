@@ -84,6 +84,7 @@ public:
     virtual future<> wipe(const sstable& sst, sync_dir) noexcept override;
     virtual future<file> open_component(const sstable& sst, component_type type, open_flags flags, file_open_options options, bool check_integrity) override;
     virtual future<data_sink> make_data_or_index_sink(sstable& sst, component_type type) override;
+    data_source make_data_or_index_source(sstable& sst, component_type type, uint64_t offset, uint64_t len, file_input_stream_options opt) const override;
     virtual future<data_sink> make_component_sink(sstable& sst, component_type type, open_flags oflags, file_output_stream_options options) override;
     virtual future<> destroy(const sstable& sst) override { return make_ready_future<>(); }
     virtual future<atomic_delete_context> atomic_delete_prepare(const std::vector<shared_sstable>&) const override;
@@ -103,6 +104,11 @@ future<data_sink> filesystem_storage::make_data_or_index_sink(sstable& sst, comp
 
     SCYLLA_ASSERT(type == component_type::Data || type == component_type::Index);
     return make_file_data_sink(type == component_type::Data ? std::move(sst._data_file) : std::move(sst._index_file), options);
+}
+
+data_source filesystem_storage::make_data_or_index_source(sstable& sst, component_type type, uint64_t offset, uint64_t len, file_input_stream_options opt) const {
+    SCYLLA_ASSERT(type == component_type::Data || type == component_type::Index);
+    return make_file_data_source(type == component_type::Data ? std::move(sst._data_file) : std::move(sst._index_file), offset, len, std::move(opt));
 }
 
 future<data_sink> filesystem_storage::make_component_sink(sstable& sst, component_type type, open_flags oflags, file_output_stream_options options) {
@@ -565,6 +571,7 @@ public:
     virtual future<> wipe(const sstable& sst, sync_dir) noexcept override;
     virtual future<file> open_component(const sstable& sst, component_type type, open_flags flags, file_open_options options, bool check_integrity) override;
     virtual future<data_sink> make_data_or_index_sink(sstable& sst, component_type type) override;
+    data_source make_data_or_index_source(sstable& sst, component_type type, uint64_t offset, uint64_t len, file_input_stream_options opt) const override;
     virtual future<data_sink> make_component_sink(sstable& sst, component_type type, open_flags oflags, file_output_stream_options options) override;
     virtual future<> destroy(const sstable& sst) override {
         return make_ready_future<>();
@@ -638,6 +645,11 @@ future<data_sink> s3_storage::make_data_or_index_sink(sstable& sst, component_ty
     SCYLLA_ASSERT(type == component_type::Data || type == component_type::Index);
     // FIXME: if we have file size upper bound upfront, it's better to use make_upload_sink() instead
     return maybe_wrap_sink(sst, type, _client->make_upload_jumbo_sink(make_s3_object_name(sst, type), std::nullopt, _as));
+}
+
+data_source s3_storage::make_data_or_index_source(sstable& sst, component_type type, uint64_t offset, uint64_t len, file_input_stream_options) const {
+    SCYLLA_ASSERT(type == component_type::Data || type == component_type::Index);
+    return _client->make_download_source(make_s3_object_name(sst, type), s3::range{offset, len}, _as);
 }
 
 future<data_sink> s3_storage::make_component_sink(sstable& sst, component_type type, open_flags oflags, file_output_stream_options options) {
