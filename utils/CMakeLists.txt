@@ -62,7 +62,13 @@ target_sources(utils
     s3/credentials_providers/instance_profile_credentials_provider.cc
     s3/credentials_providers/sts_assume_role_credentials_provider.cc
     s3/credentials_providers/aws_credentials_provider_chain.cc
+    s3/client_helpers/copy_s3_object.cc
+    s3/client_helpers/do_upload_file.cc
     s3/client_helpers/multipart_upload.cc
+    s3/client_helpers/readable_file.cc
+    s3/client_helpers/upload_jumbo_sink.cc
+    s3/client_helpers/upload_sink.cc
+    s3/client_helpers/upload_sink_base.cc
     s3/utils/client_utils.cc
     s3/utils/manip_s3.cc)
 target_include_directories(utils

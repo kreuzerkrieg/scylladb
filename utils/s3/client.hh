@@ -38,13 +38,13 @@ future<> ignore_reply(const http::reply& rep, input_stream<char>&& in_);
 [[noreturn]] void map_s3_client_exception(std::exception_ptr ex);
 
 class client : public enable_shared_from_this<client> {
-    class multipart_upload;
-    class copy_s3_object;
-    class upload_sink_base;
-    class upload_sink;
-    class upload_jumbo_sink;
-    class do_upload_file;
-    class readable_file;
+    friend class multipart_upload;
+    friend class copy_s3_object;
+    friend class upload_sink_base;
+    friend class upload_sink;
+    friend class upload_jumbo_sink;
+    friend class do_upload_file;
+    friend class readable_file;
     std::string _host;
     endpoint_config_ptr _cfg;
     semaphore _creds_sem;
