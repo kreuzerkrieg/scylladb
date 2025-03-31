@@ -641,6 +641,24 @@ static future<data_sink> maybe_wrap_sink(const sstable& sst, component_type type
     co_return sink;
 }
 
+static future<data_source> maybe_wrap_source(const sstable& sst, component_type type, data_source source) {
+    if (type != component_type::TOC && type != component_type::TemporaryTOC) {
+        for (auto* ext : sst.manager().config().extensions().sstable_file_io_extensions()) {
+            std::exception_ptr p;
+            try {
+                source = co_await ext->wrap_source(sst, type, std::move(source));
+            } catch (...) {
+                p = std::current_exception();
+            }
+            if (p) {
+                co_await source.close();
+                std::rethrow_exception(std::move(p));
+            }
+        }
+    }
+    co_return source;
+}
+
 future<data_sink> s3_storage::make_data_or_index_sink(sstable& sst, component_type type) {
     SCYLLA_ASSERT(type == component_type::Data || type == component_type::Index);
     // FIXME: if we have file size upper bound upfront, it's better to use make_upload_sink() instead
@@ -649,7 +667,7 @@ future<data_sink> s3_storage::make_data_or_index_sink(sstable& sst, component_ty
 
 future<data_source> s3_storage::make_data_or_index_source(sstable& sst, component_type type, uint64_t, uint64_t, file_input_stream_options) const {
     SCYLLA_ASSERT(type == component_type::Data || type == component_type::Index);
-    co_return _client->make_download_source(make_s3_object_name(sst, type), s3::range{0, std::numeric_limits<size_t>::max()}, _as);
+    return maybe_wrap_source(sst, type, _client->make_download_source(make_s3_object_name(sst, type), s3::range{0, std::numeric_limits<size_t>::max()}, _as));
 }
 
 future<data_sink> s3_storage::make_component_sink(sstable& sst, component_type type, open_flags oflags, file_output_stream_options options) {

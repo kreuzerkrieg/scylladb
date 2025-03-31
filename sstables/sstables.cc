@@ -3630,6 +3630,20 @@ future<data_sink> file_io_extension::wrap_sink(const sstable& sst, component_typ
     co_return co_await make_file_data_sink(std::move(f), file_output_stream_options{});
 }
 
+future<data_source> file_io_extension::wrap_source(const sstable& sst, component_type c, data_source source) {
+    file dummy = create_noop_file();
+    auto f = co_await wrap_file(sst, c, std::move(dummy), open_flags::ro);
+
+    if (!f) {
+        co_return source;
+    }
+    co_await f.close();
+    const auto& storage = sst.get_storage();
+    auto component = co_await storage.open_component(sst, c, open_flags::ro, file_open_options{}, false);
+    size_t source_size = co_await component.size();
+    f = co_await wrap_file(sst, c, create_file_for_source(source_size+16, std::move(source)), open_flags::ro);
+    co_return make_file_data_source(std::move(f), file_input_stream_options{});
+}
 } // namespace sstables
 
 namespace seastar {
