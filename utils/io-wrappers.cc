@@ -7,6 +7,7 @@
  */
 
 #include "io-wrappers.hh"
+#include <numeric>
 #include <seastar/util/internal/iovec_utils.hh>
 
 using namespace seastar;
@@ -165,6 +166,52 @@ file create_file_for_sink(data_sink sink) {
         }
     };
     return file{make_shared<data_sink_file_impl>(std::move(sink))};
+}
+
+file create_file_for_source(size_t source_size, data_source source) {
+    class data_source_file_impl : public noop_file_impl {
+        input_stream<char> _in;
+        size_t _source_size;
+
+    public:
+        data_source_file_impl(size_t source_size, data_source source) : _in(std::move(source)), _source_size(source_size) {
+        }
+
+        future<size_t> read_dma(uint64_t, void* buffer, size_t len, io_intent*) override {
+            auto chunk = co_await _in.read_exactly(len);
+            std::copy_n(chunk.get(), chunk.size(), reinterpret_cast<char*>(buffer));
+            co_return chunk.size();
+        }
+
+        future<size_t> read_dma(uint64_t, std::vector<iovec> iov, io_intent*) override {
+            auto chunk = co_await _in.read_exactly(std::accumulate(iov.cbegin(), iov.cend(), 0, [](size_t sum, const auto& e) { return sum + e.iov_len; }));
+            uint64_t off = 0;
+            for (auto& v : iov) {
+                auto sz = std::min(v.iov_len, chunk.size() - off);
+                if (sz == 0) {
+                    break;
+                }
+                std::copy_n(chunk.get() + off, sz, reinterpret_cast<char*>(v.iov_base));
+                off += sz;
+            }
+            co_return off;
+        }
+
+        future<temporary_buffer<uint8_t>> dma_read_bulk(uint64_t, size_t range_size, io_intent* intent) override {
+            return _in.read_exactly(range_size).then([](auto buff){
+                return temporary_buffer<uint8_t>(reinterpret_cast<uint8_t*>(buff.get_write()), buff.size(), buff.release());
+            });
+        }
+
+        future<uint64_t> size() override {
+           co_return _source_size;
+        }
+
+        future<> close() override {
+            co_await _in.close();
+        }
+    };
+    return file{make_shared<data_source_file_impl>(source_size, std::move(source))};
 }
 
 file create_noop_file() {
