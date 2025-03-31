@@ -2085,7 +2085,7 @@ future<> sstable::generate_summary() {
         auto s = summary_generator(_schema->get_partitioner(), _components->summary, _manager.config().sstable_summary_ratio());
             auto ctx = make_lw_shared<index_consume_entry_context<summary_generator>>(
                     *this, sem.make_tracking_only_permit(_schema, "generate-summary", db::no_timeout, {}), s, trust_promoted_index::yes,
-                    input_stream<char>(_storage->make_data_or_index_source(*this, component_type::Index, 0, index_size, std::move(options))),
+                    input_stream<char>(co_await _storage->make_data_or_index_source(*this, component_type::Index, 0, index_size, std::move(options))),
                     0, index_size, get_column_translation(*_schema), _manager._abort);
 
         try {
@@ -3469,7 +3469,7 @@ std::vector<std::unique_ptr<sstable_stream_source>> create_stream_sources(const 
                 co_return input_stream<char>(data_source(std::make_unique<buffer_data_source_impl>(std::move(bufs))));
             }
             if (_type == component_type::Data || _type == component_type::Index) {
-                co_return input_stream<char>(_sst->get_storage().make_data_or_index_source(*_sst, _type, 0, std::numeric_limits<uint64_t>::max(), options));
+                co_return input_stream<char>(co_await _sst->get_storage().make_data_or_index_source(*_sst, _type, 0, std::numeric_limits<uint64_t>::max(), options));
             }
             co_return make_file_input_stream(_file, options);
         }
