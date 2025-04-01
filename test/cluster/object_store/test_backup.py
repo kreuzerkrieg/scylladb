@@ -257,7 +257,7 @@ async def do_test_simple_backup_and_restore(manager: ManagerClient, s3_server, t
             'system_key_directory': str(d),
             'user_info_encryption': { 'enabled': True, 'key_provider': 'LocalFileSystemKeyProviderFactory' }
         }
-    cmd = ['--logger-log-level', 'sstables_loader=debug:sstable_directory=trace:snapshots=trace:s3=trace:sstable=debug:http=debug']
+    cmd = ['--logger-log-level', 'sstables_loader=debug:sstable_directory=trace:snapshots=trace:s3=trace:sstable=debug:http=debug:encryption=debug']
     server = await manager.server_add(config=cfg, cmdline=cmd)
 
     cql = manager.get_cql()

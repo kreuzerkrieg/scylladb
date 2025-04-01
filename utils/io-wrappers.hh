@@ -34,7 +34,7 @@ seastar::file create_file_for_sink(seastar::data_sink);
  * The resulting file object can do sequential
  * reads only.
  */
-seastar::file create_file_for_source(size_t source_size, seastar::data_source source);
+seastar::file create_file_for_source(file f, seastar::data_source source);
 
 /**
  * Creates a file that can only do flush() and close().

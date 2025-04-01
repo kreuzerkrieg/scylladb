@@ -2085,8 +2085,8 @@ future<> sstable::generate_summary() {
         auto s = summary_generator(_schema->get_partitioner(), _components->summary, _manager.config().sstable_summary_ratio());
             auto ctx = make_lw_shared<index_consume_entry_context<summary_generator>>(
                     *this, sem.make_tracking_only_permit(_schema, "generate-summary", db::no_timeout, {}), s, trust_promoted_index::yes,
-                    input_stream<char>(co_await _storage->make_data_or_index_source(*this, component_type::Index, 0, index_size, std::move(options))),
-                    0, index_size, get_column_translation(*_schema), _manager._abort);
+                    make_file_input_stream(index_file, 0, index_size, std::move(options)), 0, index_size,
+                    get_column_translation(*_schema), _manager._abort);
 
         try {
             co_await ctx->consume_input();
@@ -3468,9 +3468,6 @@ std::vector<std::unique_ptr<sstable_stream_source>> create_stream_sources(const 
                 };
                 co_return input_stream<char>(data_source(std::make_unique<buffer_data_source_impl>(std::move(bufs))));
             }
-            if (_type == component_type::Data || _type == component_type::Index) {
-                co_return input_stream<char>(co_await _sst->get_storage().make_data_or_index_source(*_sst, _type, 0, std::numeric_limits<uint64_t>::max(), options));
-            }
             co_return make_file_input_stream(_file, options);
         }
     };
@@ -3639,10 +3636,7 @@ future<data_source> file_io_extension::wrap_source(const sstable& sst, component
     }
     co_await f.close();
     const auto& storage = sst.get_storage();
-    auto component = co_await storage.open_component(sst, c, open_flags::ro, file_open_options{}, false);
-    size_t source_size = co_await component.size();
-    f = co_await wrap_file(sst, c, create_file_for_source(source_size+16, std::move(source)), open_flags::ro);
-    co_return make_file_data_source(std::move(f), file_input_stream_options{});
+    co_return make_file_data_source(co_await storage.open_component(sst, c, open_flags::ro, file_open_options{}, false), file_input_stream_options{});
 }
 } // namespace sstables
 

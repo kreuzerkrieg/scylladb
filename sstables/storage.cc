@@ -36,6 +36,7 @@
 #include "utils/s3/client.hh"
 #include "utils/exceptions.hh"
 #include "utils/to_string.hh"
+#include "utils/io-wrappers.hh"
 
 #include "utils/checked-file-impl.hh"
 
@@ -108,7 +109,10 @@ future<data_sink> filesystem_storage::make_data_or_index_sink(sstable& sst, comp
 
 future<data_source> filesystem_storage::make_data_or_index_source(sstable& sst, component_type type, uint64_t offset, uint64_t len, file_input_stream_options opt) const {
     SCYLLA_ASSERT(type == component_type::Data || type == component_type::Index);
-    co_return make_file_data_source(type == component_type::Data ? std::move(sst._data_file) : std::move(sst._index_file), offset, len, std::move(opt));
+    // co_return make_file_data_source(type == component_type::Data ? sst._data_file : sst._index_file, offset, len, std::move(opt));
+    return open_component(sst, type, open_flags::ro, file_open_options{}, false).then([offset, len, opt = std::move(opt)] (file f) mutable {
+        return make_file_data_source(std::move(f), offset, len, std::move(opt));
+    });
 }
 
 future<data_sink> filesystem_storage::make_component_sink(sstable& sst, component_type type, open_flags oflags, file_output_stream_options options) {
@@ -620,7 +624,14 @@ void s3_storage::open(sstable& sst) {
 }
 
 future<file> s3_storage::open_component(const sstable& sst, component_type type, open_flags flags, file_open_options options, bool check_integrity) const {
-    return maybe_wrap_file(sst, type, flags, _client->make_readable_file(make_s3_object_name(sst, type), _as));
+    auto readable_file = _client->make_readable_file(make_s3_object_name(sst, type));
+    if (type == component_type::Index || type == component_type::Data) {
+        auto source = create_file_for_source(
+            std::move(readable_file), _client->make_download_source(make_s3_object_name(sst, type), s3::range{0, std::numeric_limits<size_t>::max()}, _as));
+        co_return co_await maybe_wrap_file(sst, type, flags, source);
+    }
+
+    co_return co_await maybe_wrap_file(sst, type, flags, std::move(readable_file));
 }
 
 static future<data_sink> maybe_wrap_sink(const sstable& sst, component_type type, data_sink sink) {

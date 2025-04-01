@@ -1,6 +1,6 @@
 type: boost
 extra_scylla_cmdline_options:
-    - '--reactor-backend linux-aio'
+    - '--reactor-backend linux-aio --default-log-level=debug'
 # A list of long tests, which should be started early
 run_first:
     - index_with_paging_test
