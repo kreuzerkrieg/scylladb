@@ -701,5 +701,82 @@ std::unique_ptr<data_sink_impl> make_encrypted_sink(data_sink sink, shared_ptr<s
     return std::make_unique<encrypted_data_sink>(std::move(sink), std::move(k));
 }
 
+class encrypted_data_source : public data_source_impl, public block_encryption_base {
+    data_source _source;
+    std::vector<char> _buffer;
+    size_t current_position = 0;
+
+public:
+    encrypted_data_source(data_source source, shared_ptr<symmetric_key> k) : block_encryption_base(std::move(k)), _source(std::move(source)) {
+        _buffer.reserve(block_size * 2);
+    }
+
+    future<temporary_buffer<char>> get() override {
+        while (_buffer.size() < block_size) {
+            auto buf = co_await _source.get();
+            if (buf.empty()) {
+                break;
+            }
+            std::move(std::make_move_iterator(buf.get_write()), std::make_move_iterator(buf.get_write() + buf.size()), std::back_inserter(_buffer));
+        }
+
+        const size_t key_block_size = _key->block_size();
+        const size_t bytes_to_consume = _buffer.size() < block_size ? align_down(_buffer.size(), key_block_size) : align_down(_buffer.size(), block_size);
+        temporary_buffer<char> output(bytes_to_consume);
+        size_t decrypted_bytes = 0;
+
+        for (size_t offset = 0; offset < bytes_to_consume; offset += block_size) {
+            auto iv = iv_for(current_position + offset);
+            // Determine how many bytes remain in this block
+            const size_t remaining = std::min<uint64_t>(block_size, bytes_to_consume - offset);
+
+            // If the remaining bytes form a partial block, align down to a whole block size
+            size_t bytes_to_decrypt = (remaining < block_size) ? align_down(remaining, key_block_size) : block_size;
+
+            _key->transform_unpadded(mode::decrypt, _buffer.data() + offset, bytes_to_decrypt, output.get_write() + offset, iv.data());
+            decrypted_bytes += bytes_to_decrypt;
+
+            // If we've processed a partial (last) block, exit the loop
+            if (remaining < block_size) {
+                break;
+            }
+        }
+
+        // Adjust the buffer size to the actual decrypted data length
+        output.trim(decrypted_bytes);
+        current_position += decrypted_bytes;
+        auto remaining_bytes = _buffer.size() - decrypted_bytes;
+        if (remaining_bytes > 0) {
+            // Move the remaining bytes to the front of the buffer
+            std::move(_buffer.begin() + decrypted_bytes, _buffer.end(), _buffer.begin());
+            _buffer.resize(remaining_bytes);
+        } else {
+            _buffer.clear();
+        }
+        co_return output;
+    }
+
+    future<temporary_buffer<char>> skip(uint64_t n) override {
+        auto aligned_position = align_down(current_position + n, block_size);
+        auto bytes_to_skip = aligned_position > current_position ? aligned_position - current_position : 0;
+        current_position = aligned_position;
+        // Remove "skipped" bytes from the buffer
+        if (!_buffer.empty()) {
+            if (bytes_to_skip >= _buffer.size()) {
+                _buffer.clear();
+            } else {
+                std::move(_buffer.begin() + bytes_to_skip, _buffer.end(), _buffer.begin());
+            }
+        }
+        return _source.skip(bytes_to_skip);
+    }
+
+    future<> close() override { return _source.close(); }
+};
+
+
+std::unique_ptr<data_source_impl> make_encrypted_source(data_source source, shared_ptr<symmetric_key> k) {
+    return std::make_unique<encrypted_data_source>(std::move(source), std::move(k));
+}
 }
 
