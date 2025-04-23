@@ -10,3 +10,8 @@
 #include "utils.hh"
 
 // TODO: move shared things/helpers from encryption.cc to here (?)
+namespace encryption {
+bool is_aligned(size_t n, size_t a) {
+    return (n & (a - 1)) == 0;
+}
+} // namespace encryption

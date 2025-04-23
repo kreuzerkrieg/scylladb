@@ -13,4 +13,5 @@ namespace encryption {
 
 using httpclient = rest::httpclient;
 
+bool is_aligned(size_t n, size_t a);
 }

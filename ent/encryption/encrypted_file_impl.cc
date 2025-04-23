@@ -14,6 +14,7 @@
 #include <seastar/core/iostream.hh>
 
 #include "symmetric_key.hh"
+#include "utils.hh"
 #include "encryption.hh"
 #include "utils/serialization.hh"
 #include "encrypted_file_impl.hh"
@@ -21,10 +22,6 @@
 namespace encryption {
 
 using namespace seastar;
-
-static inline bool is_aligned(size_t n, size_t a) {
-    return (n & (a - 1)) == 0;
-}
 
 /**
  * Very simple block-encrypting file wrapper.
