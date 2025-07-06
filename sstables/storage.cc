@@ -671,6 +671,7 @@ future<data_sink> s3_storage::make_data_or_index_sink(sstable& sst, component_ty
 
 future<data_source>
 s3_storage::make_data_or_index_source(sstable& sst, component_type type, file f, uint64_t offset, uint64_t len, file_input_stream_options options) const {
+    sstlog.info("ZOOOOO, offset: {}, length: {}, for file size: {}", offset, len, co_await f.size());
     if (offset == 0) {
         co_return co_await maybe_wrap_source(
             sst,

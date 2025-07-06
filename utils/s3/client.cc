@@ -1255,7 +1255,7 @@ public:
                 if (_buffers_size < _max_buffers_size * _buffers_low_watermark) {
                     _bg_fiber_cv.signal();
                 }
-                s3l.trace("get() for object '{}' popped buffer of {} bytes", _object_name, claimed_buff._buffer.size());
+                s3l.info("get() for object '{}' popped buffer of {} bytes", _object_name, claimed_buff._buffer.size());
                 co_return std::move(claimed_buff._buffer);
             }
             _bg_fiber_cv.signal();
