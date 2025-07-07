@@ -1219,8 +1219,14 @@ class client::chunked_download_source final : public seastar::data_source_impl {
                                 std::rethrow_exception(ex);
                             } catch (const aws::aws_exception& aws_ex) {
                                 if (aws_ex.error().is_retryable()) {
+                                    s3l.warn("Fiber for object '{}' rethrowing filler aws_exception {}", std::current_exception());
                                     throw filler_exception(format("{}", std::current_exception()).c_str());
                                 }
+                                s3l.warn("Fiber for object '{}' rethrowing non-filler aws_exception {}", std::current_exception());
+                                throw;
+                            }
+                            catch (...) {
+                                s3l.warn("Fiber for object '{}' rethrowing exception {}", std::current_exception());
                                 throw;
                             }
                         }
@@ -1231,7 +1237,7 @@ class client::chunked_download_source final : public seastar::data_source_impl {
             } catch (const filler_exception& ex) {
                 s3l.warn("Fiber for object '{}' experienced an error in buffer filling loop. Reason: {}. Re-issuing the request", _object_name, ex);
             } catch (...) {
-                s3l.trace("Fiber for object '{}' failed: {}, exiting", _object_name, std::current_exception());
+                s3l.warn("Fiber for object '{}' failed: {}, exiting", _object_name, std::current_exception());
                 _get_cv.broken(std::current_exception());
                 co_return;
             }
