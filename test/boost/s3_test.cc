@@ -7,36 +7,38 @@
  */
 
 
-#include <unordered_set>
-#include <boost/test/unit_test.hpp>
-#include <boost/algorithm/string/split.hpp>
-#include <boost/algorithm/string/classification.hpp>
-#include <seastar/core/thread.hh>
-#include <seastar/core/reactor.hh>
-#include <seastar/core/file.hh>
-#include <seastar/core/fstream.hh>
-#include <seastar/core/sleep.hh>
-#include <seastar/http/exception.hh>
-#include <seastar/util/closeable.hh>
-#include <seastar/util/short_streams.hh>
-#include <seastar/core/units.hh>
-#include "test/lib/scylla_test_case.hh"
+#include "gc_clock.hh"
+#include "sstables/checksum_utils.hh"
 #include "test/lib/log.hh"
 #include "test/lib/random_utils.hh"
+#include "test/lib/scylla_test_case.hh"
+#include "test/lib/sstable_utils.hh"
 #include "test/lib/test_utils.hh"
 #include "test/lib/tmpdir.hh"
 #include "utils/assert.hh"
 #include "utils/error_injection.hh"
+#include "utils/exceptions.hh"
 #include "utils/s3/aws_error.hh"
 #include "utils/s3/client.hh"
-#include "utils/s3/creds.hh"
-#include "utils/s3/utils/manip_s3.hh"
-#include "utils/exceptions.hh"
 #include "utils/s3/credentials_providers/aws_credentials_provider_chain.hh"
 #include "utils/s3/credentials_providers/instance_profile_credentials_provider.hh"
 #include "utils/s3/credentials_providers/sts_assume_role_credentials_provider.hh"
-#include "sstables/checksum_utils.hh"
-#include "gc_clock.hh"
+#include "utils/s3/creds.hh"
+#include "utils/s3/utils/clocks.hh"
+#include "utils/s3/utils/manip_s3.hh"
+#include <boost/algorithm/string/classification.hpp>
+#include <boost/algorithm/string/split.hpp>
+#include <boost/test/unit_test.hpp>
+#include <seastar/core/file.hh>
+#include <seastar/core/fstream.hh>
+#include <seastar/core/reactor.hh>
+#include <seastar/core/sleep.hh>
+#include <seastar/core/thread.hh>
+#include <seastar/core/units.hh>
+#include <seastar/http/exception.hh>
+#include <seastar/util/closeable.hh>
+#include <seastar/util/short_streams.hh>
+#include <unordered_set>
 
 using namespace std::string_view_literals;
 using namespace std::chrono_literals;
@@ -829,12 +831,17 @@ SEASTAR_THREAD_TEST_CASE(test_creds) {
     BOOST_REQUIRE_EQUAL(creds.access_key_id, "STS_EXAMPLE_ACCESS_KEY_ID");
     BOOST_REQUIRE_EQUAL(creds.secret_access_key, "STS_EXAMPLE_SECRET_ACCESS_KEY");
     BOOST_REQUIRE_EQUAL(creds.session_token.contains("STS_SESSIONTOKEN"), true);
+    auto diff =
+        std::chrono::duration_cast<std::chrono::seconds>(iso8601ts_to_timepoint<seastar::lowres_clock>("2019-11-09T13:34:41Z") - creds.expires_at).count();
+    BOOST_REQUIRE(diff >= 60 && diff <= 65);
 
     auto md_provider = std::make_unique<aws::instance_profile_credentials_provider>(host, port);
     creds = md_provider->get_aws_credentials().get();
     BOOST_REQUIRE_EQUAL(creds.access_key_id, "INSTANCE_FROFILE_EXAMPLE_ACCESS_KEY_ID");
     BOOST_REQUIRE_EQUAL(creds.secret_access_key, "INSTANCE_FROFILE_EXAMPLE_SECRET_ACCESS_KEY");
     BOOST_REQUIRE_EQUAL(creds.session_token.contains("INSTANCE_FROFILE_SESSIONTOKEN"), true);
+    diff = std::chrono::duration_cast<std::chrono::seconds>(iso8601ts_to_timepoint<seastar::lowres_clock>("2017-05-17T15:09:54Z") - creds.expires_at).count();
+    BOOST_REQUIRE(diff >= 60 && diff <= 65);
 
     aws::aws_credentials_provider_chain provider_chain;
     provider_chain.add_credentials_provider(std::make_unique<aws::sts_assume_role_credentials_provider>(host, port, false))
@@ -907,4 +914,77 @@ BOOST_AUTO_TEST_CASE(s3_fqn_manipulation) {
     BOOST_REQUIRE_EQUAL(s3::s3fqn_to_parts("s3://bucket///prefix1/prefix2//foo.bar", bucket_name, object_name), true);
     BOOST_REQUIRE_EQUAL(bucket_name, "bucket");
     BOOST_REQUIRE_EQUAL(object_name, "prefix1/prefix2/foo.bar");
+}
+
+
+SEASTAR_THREAD_TEST_CASE(test_creds_expiration) {
+    const sstring name(fmt::format("/{}/testobject-{}", tests::getenv_safe("S3_BUCKET_FOR_TEST"), ::getpid()));
+    semaphore mem(16 << 20);
+
+    {
+        auto cln = make_minio_client(mem);
+        temporary_buffer<char> data = sstring("1234567890").release();
+        cln->put_object(name, std::move(data)).get();
+        cln->close().get();
+    }
+
+    s3::endpoint_config cfg = {
+        .port = std::stoul(tests::getenv_safe("S3_SERVER_PORT_FOR_TEST")),
+        .use_https = ::getenv("AWS_DEFAULT_REGION") != nullptr,
+        .region = ::getenv("AWS_DEFAULT_REGION") ?: "local",
+    };
+    struct test_creds_provider final : aws::aws_credentials_provider {
+        test_creds_provider() {
+            creds = {
+                .access_key_id = "FOO",
+                .secret_access_key = "BAR",
+                .session_token = "BAZ",
+                .expires_at = seastar::lowres_clock::now() + 61min, // Set expiration to 61 minutes in the future
+            };
+            testlog.info("test_creds_provider constructor called");
+        }
+        [[nodiscard]] const char* get_name() const override { return "test_creds_provider"; }
+
+    protected:
+        seastar::future<> reload() override {
+            testlog.info("Check if reload needed, {}. Reload count: {}", (seastar::lowres_clock::time_point::min() == creds.expires_at), count);
+            ++count;
+            if (seastar::lowres_clock::now() >= creds.expires_at /* this is how xxx_credentials_provider::is_time_to_refresh() implemneted*/ && count > 0) {
+                testlog.info("Reloading");
+                creds = {
+                    .access_key_id = std::getenv("AWS_ACCESS_KEY_ID") ?: "",
+                    .secret_access_key = std::getenv("AWS_SECRET_ACCESS_KEY") ?: "",
+                    .session_token = std::getenv("AWS_SESSION_TOKEN") ?: "",
+                    .expires_at = seastar::lowres_clock::now() + 61min, // Set expiration to 61 minutes in the future
+                };
+            }
+            else {
+                creds = {
+                    .access_key_id = "FOO",
+                    .secret_access_key = "BAR",
+                    .session_token = "BAZ",
+                    .expires_at = seastar::lowres_clock::now() + 61min, // Set expiration to 61 minutes in the future
+                };
+            }
+            co_return;
+        }
+    private:
+        size_t count{0};
+    };
+
+    testlog.info("Test starts");
+    auto test_chain = std::make_unique<aws::aws_credentials_provider_chain>();
+    test_chain->add_credentials_provider(std::make_unique<test_creds_provider>());
+    auto test_cln = s3::client::make(
+        tests::getenv_safe("S3_SERVER_ADDRESS_FOR_TEST"), make_lw_shared<s3::endpoint_config>(std::move(cfg)), mem, {}, nullptr, std::move(test_chain));
+    auto close_test_client = deferred_close(*test_cln);
+
+    BOOST_REQUIRE_EXCEPTION(test_cln->get_object_size(name).get(), storage_io_error, [](const storage_io_error& e) {
+        testlog.info("Error code: {}, message: {}", e.code().value(), e.what());
+        return e.code().value() == EACCES && e.what() == "S3 request failed. Code: 116. Reason:  HTTP code: 403 Forbidden"sv;
+    });
+
+    seastar::sleep(61s).get(); // Wait for the credentials to "expire"
+    auto size = test_cln->get_object_size(name).get();
+    BOOST_REQUIRE_EQUAL(size, 10);
 }

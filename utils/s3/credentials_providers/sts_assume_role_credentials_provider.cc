@@ -11,6 +11,8 @@
 #include "utils/UUID.hh"
 #include "utils/http.hh"
 #include "utils/s3/client.hh"
+#include "utils/s3/utils/clocks.hh"
+
 #include <rapidxml.h>
 #include <seastar/core/coroutine.hh>
 #include <seastar/http/request.hh>
@@ -18,6 +20,7 @@
 
 namespace aws {
 
+using namespace std::chrono_literals;
 static logging::logger sts_logger("sts");
 
 sts_assume_role_credentials_provider::sts_assume_role_credentials_provider(const std::string& _host, unsigned _port, bool _is_secured)
@@ -48,7 +51,8 @@ future<> sts_assume_role_credentials_provider::update_credentials() {
     req.query_parameters["RoleSessionName"] = format("{}", utils::make_random_uuid());
     req.query_parameters["RoleArn"] = role_arn;
     auto factory = std::make_unique<utils::http::dns_connection_factory>(sts_host, port, is_secured, sts_logger);
-    retryable_http_client http_client(std::move(factory), 1, retryable_http_client::ignore_exception, http::experimental::client::retry_requests::yes, retry_strategy);
+    retryable_http_client http_client(
+        std::move(factory), 1, retryable_http_client::ignore_exception, http::experimental::client::retry_requests::yes, retry_strategy);
     co_await http_client.make_request(
         std::move(req),
         [this](const http::reply&, input_stream<char>&& in) -> future<> {
@@ -87,8 +91,8 @@ s3::aws_credentials sts_assume_role_credentials_provider::parse_creds(sstring& b
     return {.access_key_id = get_node_safe(credentials, "AccessKeyId")->value(),
             .secret_access_key = get_node_safe(credentials, "SecretAccessKey")->value(),
             .session_token = get_node_safe(credentials, "SessionToken")->value(),
-            // Set the expiration to one minute earlier to ensure credentials are renewed slightly before they expire
-            .expires_at = seastar::lowres_clock::now() + std::chrono::seconds(session_duration - 60)};
+            // Expire 60 seconds before the actual expiration time to avoid issues with clock skew
+            .expires_at = iso8601ts_to_timepoint<seastar::lowres_clock>(get_node_safe(credentials, "Expiration")->value()) - 60s};
 }
 
 } // namespace aws

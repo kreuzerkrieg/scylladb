@@ -9,6 +9,7 @@
 #include "instance_profile_credentials_provider.hh"
 #include "utils/http.hh"
 #include "utils/s3/client.hh"
+#include "utils/s3/utils/clocks.hh"
 #include <rapidjson/document.h>
 #include <rapidjson/error/en.h>
 #include <seastar/http/request.hh>
@@ -16,7 +17,7 @@
 
 
 namespace aws {
-
+using namespace std::chrono_literals;
 static logging::logger ec2_md_logger("ec2_metadata");
 
 instance_profile_credentials_provider::instance_profile_credentials_provider(const std::string& _host, unsigned _port) : ec2_metadata_ip(_host), port(_port) {
@@ -36,7 +37,8 @@ static constexpr auto EC2_SECURITY_CREDENTIALS_RESOURCE = "/latest/meta-data/iam
 
 future<> instance_profile_credentials_provider::update_credentials() {
     auto factory = std::make_unique<utils::http::dns_connection_factory>(ec2_metadata_ip, port, false, ec2_md_logger);
-    retryable_http_client http_client(std::move(factory), 1, retryable_http_client::ignore_exception, http::experimental::client::retry_requests::yes, retry_strategy);
+    retryable_http_client http_client(
+        std::move(factory), 1, retryable_http_client::ignore_exception, http::experimental::client::retry_requests::yes, retry_strategy);
 
     auto req = http::request::make("PUT", ec2_metadata_ip, "/latest/api/token");
     req._headers["x-aws-ec2-metadata-token-ttl-seconds"] = format("{}", session_duration);
@@ -83,12 +85,11 @@ s3::aws_credentials instance_profile_credentials_provider::parse_creds(const sst
             format("Failed to parse EC2 Metadata credentials. Reason: {} (offset: {})", GetParseError_En(document.GetParseError()), document.GetErrorOffset()));
     }
 
-    // Retrieve credentials
     return {.access_key_id = document["AccessKeyId"].GetString(),
             .secret_access_key = document["SecretAccessKey"].GetString(),
             .session_token = document["Token"].GetString(),
-            // Set the expiration to one minute earlier to ensure credentials are renewed slightly before they expire
-            .expires_at = seastar::lowres_clock::now() + std::chrono::seconds(session_duration - 60)};
+            // Expire 60 seconds before the actual expiration time to avoid issues with clock skew
+            .expires_at = iso8601ts_to_timepoint<seastar::lowres_clock>(document["Expiration"].GetString()) - 60s};
 }
 
 } // namespace aws
