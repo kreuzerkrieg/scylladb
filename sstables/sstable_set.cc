@@ -998,6 +998,7 @@ sstable_set_impl::create_single_key_sstable_reader(
     auto readers = filter_sstable_for_reader_by_ck(std::move(selected_sstables), *cf, schema, slice)
         | std::views::transform([&] (const shared_sstable& sstable) {
             tracing::trace(trace_state, "Reading key {} from sstable {}", pos, seastar::value_of([&sstable] { return sstable->get_filename(); }));
+            sstlog.info("creating reader in create_single_key_sstable_reader");
             return sstable->make_reader(schema, permit, pr, slice, trace_state, fwd);
           })
         | std::ranges::to<std::vector<mutation_reader>>();

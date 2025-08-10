@@ -107,10 +107,13 @@ table::make_sstable_reader(schema_ptr s,
     // we want to optimize and read exactly this partition. As a
     // consequence, fast_forward_to() will *NOT* work on the result,
     // regardless of what the fwd_mr parameter says.
+
     if (pr.is_singular() && pr.start()->value().has_key()) {
+        tlogger.info("Coming to create_single_key_sstable_reader");
         return sstables->create_single_key_sstable_reader(const_cast<column_family*>(this), std::move(s), std::move(permit),
                 _stats.estimated_sstable_per_read, pr, slice, std::move(trace_state), fwd, fwd_mr, predicate);
     } else {
+        tlogger.info("Coming to table::make_local_shard_sstable_reader");
         return sstables->make_local_shard_sstable_reader(std::move(s), std::move(permit), pr, slice,
                 std::move(trace_state), fwd, fwd_mr, sstables::default_read_monitor_generator(), predicate);
     }
@@ -302,6 +305,7 @@ table::make_streaming_reader(schema_ptr s, reader_permit permit,
         add_memtables_to_reader_list(readers, s, permit, range, slice, trace_state, fwd, fwd_mr, [&] (size_t memtable_count) {
             readers.reserve(memtable_count + 1);
         });
+        tlogger.info("Coming from table::make_streaming_reader");
         readers.emplace_back(make_sstable_reader(s, permit, _sstables, range, slice, std::move(trace_state), fwd, fwd_mr));
         return make_combined_reader(s, std::move(permit), std::move(readers), fwd, fwd_mr);
     });

@@ -200,7 +200,7 @@ future<> client::authorize(http::request& req) {
 }
 
 future<semaphore_units<>> client::claim_memory(size_t size) {
-    return get_units(_memory, size);
+    return get_units(_memory, size, 30s);
 }
 
 client::group_client::group_client(std::unique_ptr<http::experimental::connection_factory> f, unsigned max_conn, const aws::retry_strategy& retry_strategy)
@@ -1107,11 +1107,12 @@ class client::chunked_download_source final : public seastar::data_source_impl {
         uint64_t end;
         uint64_t total;
     };
+    inline static thread_local size_t chunked_sources_count{0};
     shared_ptr<client> _client;
     sstring _object_name;
     seastar::abort_source* _as;
     range _range;
-    static constexpr size_t _max_buffers_size = 5_MiB;
+    size_t _max_buffers_size = 1_MiB;
     static constexpr double _buffers_low_watermark = 0.5;
     static constexpr double _buffers_high_watermark = 0.9;
     std::deque<claimed_buffer> _buffers;
@@ -1133,7 +1134,13 @@ class client::chunked_download_source final : public seastar::data_source_impl {
     }
 
     future<> make_filling_fiber() {
-        s3l.trace("Fiber starts cycle for object '{}'", _object_name);
+        co_await _bg_fiber_cv.when();
+        _max_buffers_size = std::clamp<size_t>(memory::stats().total_memory() * 0.01, 10 << 20, 100 << 20) / chunked_sources_count;
+        s3l.info("Fiber starts cycle for object '{}', prefetching amount is set to {} bytes, since we have {} sources in flight for shard {}",
+                 _object_name,
+                 _max_buffers_size,
+                 chunked_sources_count,
+                 this_shard_id());
         while (!_is_finished) {
             try {
                 if (_buffers_size >= _max_buffers_size * _buffers_low_watermark) {
@@ -1249,11 +1256,16 @@ class client::chunked_download_source final : public seastar::data_source_impl {
 public:
     chunked_download_source(shared_ptr<client> cln, sstring object_name, range range, seastar::abort_source* as)
         : _client(std::move(cln)), _object_name(std::move(object_name)), _as(as), _range(range) {
-        s3l.trace("Constructing chunked_download_source for object '{}'", _object_name);
+        ++chunked_sources_count;
+        s3l.info("Constructing {}th chunked_download_source for object '{}'", chunked_sources_count, _object_name);
         _filling_fiber = make_filling_fiber();
     }
-
+    ~chunked_download_source() override {
+        --chunked_sources_count;
+    }
     future<temporary_buffer<char>> get() override {
+        s3l.info("ZOOOOOOOO \n{}", current_backtrace());
+        std::terminate();
         while (true) {
             if (!_buffers.empty()) {
                 auto claimed_buff = std::move(_buffers.front());

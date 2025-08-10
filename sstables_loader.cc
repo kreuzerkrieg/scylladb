@@ -394,6 +394,7 @@ future<> sstable_streamer::stream_sstables(const dht::partition_range& pr, std::
 
     while (!sstables.empty()) {
         const size_t batch_sst_nr = std::min(16uz, sstables.size());
+        llog.info("FOOOOOO Batch size: {}", batch_sst_nr);
         auto sst_processed = sstables
             | std::views::reverse
             | std::views::take(batch_sst_nr)

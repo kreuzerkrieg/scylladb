@@ -391,6 +391,8 @@ future<> mutation_reader_merger::prepare_next() {
 
 future<mutation_reader_merger::needs_merge> mutation_reader_merger::prepare_one(
         reader_and_last_fragment_kind rk, reader_galloping reader_galloping) {
+
+    mrlog.info("");
     return (*rk.reader)().then([this, rk, reader_galloping] (mutation_fragment_v2_opt mfo) {
         if (mfo) {
             if (mfo->is_partition_start()) {

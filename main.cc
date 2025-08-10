@@ -1195,6 +1195,19 @@ sharded<locator::shared_token_metadata> token_metadata;
             checkpoint(stop_signal, "starting storage manager");
             sstables::storage_manager::config stm_cfg;
             stm_cfg.s3_clients_memory = std::clamp<size_t>(memory::stats().total_memory() * 0.01, 10 << 20, 100 << 20);
+            auto format_bytes = [](uint64_t bytes) {
+                constexpr const char* suffixes[] = {"B", "KiB", "MiB", "GiB", "TiB", "PiB"};
+                size_t i = 0;
+                double count = static_cast<double>(bytes);
+
+                while (count >= 1024 && i < std::size(suffixes) - 1) {
+                    count /= 1024;
+                    ++i;
+                }
+
+                return format("{:.2f} {}", count, suffixes[i]);
+            };
+            startlog.info("S3 client memory is set to  {}", format_bytes(stm_cfg.s3_clients_memory));
             sstm.start(std::ref(*cfg), stm_cfg).get();
             auto stop_sstm = defer_verbose_shutdown("sstables storage manager", [&sstm] {
                 sstm.stop().get();

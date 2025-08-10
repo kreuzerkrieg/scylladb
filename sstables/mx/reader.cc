@@ -1585,19 +1585,23 @@ private:
                 if (_integrity) {
                     on_internal_error(sstlog, "mx reader: integrity checking not supported for single-partition reversed reads");
                 }
+                sstlog.info ("FOOOOO data_consume_reversed_partition<DataConsumeRowsContext>");
                 auto reversed_context = data_consume_reversed_partition<DataConsumeRowsContext>(
                         *_schema, _sst, *_index_reader, _consumer, { begin, *end });
                 _context = std::move(reversed_context.the_context);
                 _reversed_read_sstable_position = &reversed_context.current_position_in_sstable;
             } else {
+                sstlog.info ("FOOOOO data_consume_single_partition<DataConsumeRowsContext>");
                 _context = co_await data_consume_single_partition<DataConsumeRowsContext>(*_schema, _sst, _consumer, { begin, *end }, _integrity);
             }
         } else {
             sstable::disk_read_range drr{begin, *end};
             auto last_end = _fwd_mr ? _sst->data_size() : drr.end;
             _read_enabled = bool(drr);
+            sstlog.info ("FOOOOO data_consume_rows<DataConsumeRowsContext>");
             _context = co_await data_consume_rows<DataConsumeRowsContext>(*_schema, _sst, _consumer, std::move(drr), last_end, _integrity);
         }
+
 
         _monitor.on_read_started(_context->reader_position());
         _index_in_current_partition = true;
