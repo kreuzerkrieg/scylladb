@@ -126,9 +126,7 @@ class client : public enable_shared_from_this<client> {
         io_stats read_stats;
         io_stats write_stats;
         seastar::metrics::metric_groups metrics;
-        group_client(std::unique_ptr<http::experimental::connection_factory> f,
-                     unsigned max_conn,
-                     std::unique_ptr<seastar::http::experimental::retry_strategy> retry_strategy);
+        group_client(std::unique_ptr<http::experimental::connection_factory> f, unsigned max_conn);
         void register_metrics(std::string class_name, std::string host);
     };
     std::unordered_map<seastar::scheduling_group, group_client> _https;
@@ -143,11 +141,19 @@ class client : public enable_shared_from_this<client> {
 
     future<> update_credentials_and_rearm();
     future<> authorize(http::request&);
-    group_client& find_or_create_client(std::unique_ptr<seastar::http::experimental::retry_strategy> rs);
+    group_client& find_or_create_client();
+    future<http::experimental::client::reply_handler>
+    prepare_request(http::request& req, http::experimental::client::reply_handler handle, std::optional<http::reply::status_type> expected);
     future<> make_request(http::request req, http::experimental::client::reply_handler handle = ignore_reply, std::optional<http::reply::status_type> expected = std::nullopt, seastar::abort_source* = nullptr);
     using reply_handler_ext = noncopyable_function<future<>(group_client&, const http::reply&, input_stream<char>&& body)>;
+    using error_handler = std::function<void(std::exception_ptr)>;
     future<> make_request(http::request req, reply_handler_ext handle, std::optional<http::reply::status_type> expected = std::nullopt, seastar::abort_source* = nullptr);
-    future<> make_request(http::request req, reply_handler_ext handle, const seastar::http::experimental::retry_strategy& rs, std::optional<http::reply::status_type> expected = std::nullopt, seastar::abort_source* = nullptr);
+    future<> make_request(http::request req,
+                          reply_handler_ext handle,
+                          const seastar::http::experimental::retry_strategy& rs,
+                          error_handler err_handler,
+                          std::optional<http::reply::status_type> expected = std::nullopt,
+                          seastar::abort_source* = nullptr);
     future<> get_object_header(sstring object_name, http::experimental::client::reply_handler handler, seastar::abort_source* = nullptr);
 public:
 
