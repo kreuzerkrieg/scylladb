@@ -78,6 +78,7 @@ endforeach()
 
 add_custom_target(idl-sources
   DEPENDS ${idl_sources})
+set_target_properties(idl-sources PROPERTIES UNITY_BUILD OFF)
 add_library(idl INTERFACE)
 add_dependencies(idl idl-sources)
 target_include_directories(idl

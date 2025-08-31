@@ -9,8 +9,9 @@
 #include "instance_profile_credentials_provider.hh"
 #include "utils/http.hh"
 #include "utils/s3/client.hh"
-#include <rapidjson/document.h>
-#include <rapidjson/error/en.h>
+// #include <rapidjson/document.h>
+// #include <rapidjson/error/en.h>
+#include "utils/rjson.hh"
 #include <seastar/http/request.hh>
 #include <seastar/util/short_streams.hh>
 

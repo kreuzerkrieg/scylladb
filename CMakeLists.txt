@@ -163,31 +163,31 @@ file(MAKE_DIRECTORY "${scylla_gen_build_dir}")
 include(add_version_library)
 generate_scylla_version()
 
-option(Scylla_USE_PRECOMPILED_HEADER "Use precompiled header for Scylla" ON)
-add_library(scylla-precompiled-header INTERFACE)
-target_link_libraries(scylla-precompiled-header INTERFACE
-    absl::headers
-    absl::btree
-    absl::hash
-    absl::raw_hash_set
-    Seastar::seastar
-    Snappy::snappy
-    systemd
-    ZLIB::ZLIB
-    lz4::lz4_static
-    zstd::zstd_static)
-add_library(scylla-precompiled-header-impl STATIC exported_templates.cc)
-target_link_libraries(scylla-precompiled-header-impl PRIVATE scylla-precompiled-header
-    absl::headers
-    absl::btree
-    absl::hash
-    absl::raw_hash_set
-    Seastar::seastar
-    Snappy::snappy
-    systemd
-    ZLIB::ZLIB
-    lz4::lz4_static
-    zstd::zstd_static)
+option(Scylla_USE_PRECOMPILED_HEADER "Use precompiled header for Scylla" OFF)
+#add_library(scylla-precompiled-header INTERFACE)
+#target_link_libraries(scylla-precompiled-header INTERFACE
+#    absl::headers
+#    absl::btree
+#    absl::hash
+#    absl::raw_hash_set
+#    Seastar::seastar
+#    Snappy::snappy
+#    systemd
+#    ZLIB::ZLIB
+#    lz4::lz4_static
+#    zstd::zstd_static)
+#add_library(scylla-precompiled-header-impl STATIC exported_templates.cc)
+#target_link_libraries(scylla-precompiled-header-impl PRIVATE scylla-precompiled-header
+#    absl::headers
+#    absl::btree
+#    absl::hash
+#    absl::raw_hash_set
+#    Seastar::seastar
+#    Snappy::snappy
+#    systemd
+#    ZLIB::ZLIB
+#    lz4::lz4_static
+#    zstd::zstd_static)
 if (Scylla_USE_PRECOMPILED_HEADER)
   set(Scylla_USE_PRECOMPILED_HEADER_USE ON)
   find_program(DISTCC_EXEC NAMES distcc OPTIONAL)
@@ -414,3 +414,5 @@ endif()
 
 add_executable(patchelf
   tools/patchelf.cc)
+
+include(dont_unite)

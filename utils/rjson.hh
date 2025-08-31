@@ -69,6 +69,7 @@ public:
 #include <rapidjson/stringbuffer.h>
 #include <rapidjson/allocators.h>
 #include <rapidjson/ostreamwrapper.h>
+#include <rapidjson/error/en.h>
 #include <seastar/core/sstring.hh>
 #include "seastarx.hh"
 

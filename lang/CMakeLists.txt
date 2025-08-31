@@ -23,3 +23,21 @@ target_link_libraries(lang
 
 check_headers(check-headers lang
   GLOB_RECURSE ${CMAKE_CURRENT_SOURCE_DIR}/*.hh)
+
+set_source_files_properties(wasm.cc PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON)
+set_source_files_properties(wasm_instance_cache.cc PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON)
+#
+#set_target_properties()
+#get_property(all_targets DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} PROPERTY BUILDSYSTEM_TARGETS)
+#
+#foreach(tgt IN LISTS all_targets)
+#    message(STATUS "Target: ${tgt}")
+#    get_target_property(srcs ${tgt} SOURCES)
+#    if(srcs)
+#        foreach(src IN LISTS srcs)
+#            message(STATUS "  Source: ${src}")
+#        endforeach()
+#    else()
+#        message(STATUS "  No sources found.")
+#    endif()
+#endforeach()
