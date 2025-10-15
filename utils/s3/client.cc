@@ -324,6 +324,7 @@ future<> client::make_request(http::request req,
                     continue;
                 }
                 if (ex.error().get_error_type() == aws::aws_error_type::EXPIRED_TOKEN) {
+                    s3l.warn("Request failed with EXPIRED_TOKEN. Resetting credentials");
                     ++attempts;
                     _credentials = {};
                     continue;
