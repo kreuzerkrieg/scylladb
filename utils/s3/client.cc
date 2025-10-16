@@ -333,7 +333,10 @@ future<> client::make_request(http::request req,
             map_s3_client_exception(std::current_exception());
         } catch (const storage_io_error&) {
             throw;
-        } catch (...) {
+        } catch (const abort_requested_exception&) {
+            throw;
+        }
+        catch (...) {
             map_s3_client_exception(std::current_exception());
         }
     }
