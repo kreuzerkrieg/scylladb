@@ -354,6 +354,18 @@ future<> tablet_sstable_streamer::stream(shared_ptr<stream_progress> progress) {
     // sstables are sorted by first key in reverse order.
     auto sstable_it = _sstables.rbegin();
 
+    // llog.info("FOOBAR Tablet map {}, tablet map after filtering {}",
+    //           fmt::join(_tablet_map.tablet_ids(), ", "),
+    //           fmt::join(_tablet_map.tablet_ids() | std::views::filter([this](auto tid) { return tablet_in_scope(tid); }), ", "));
+
+    for (auto beg = _sstables.crbegin(); beg != _sstables.crend(); ++beg) {
+        llog.info("FOOBAR SSTable: {}, token_range: {}",
+                  (*beg)->get_filename(),
+                  dht::token_range((*beg)->get_first_decorated_key().token(), (*beg)->get_last_decorated_key().token()));
+    }
+    for (auto tablet_id : _tablet_map.tablet_ids() | std::views::filter([this](auto tid) { return tablet_in_scope(tid); })) {
+        llog.info("FOOBAR Tablet: {}, token_range: {}", tablet_id, _tablet_map.get_token_range(tablet_id));
+    }
     for (auto tablet_id : _tablet_map.tablet_ids() | std::views::filter([this] (auto tid) { return tablet_in_scope(tid); })) {
         auto tablet_range = _tablet_map.get_token_range(tablet_id);
 
@@ -377,22 +389,35 @@ future<> tablet_sstable_streamer::stream(shared_ptr<stream_progress> progress) {
             auto sst_token_range = sstable_token_range(*sst_it);
             // sstables are sorted by first key, so we're done with current tablet when
             // the next sstable doesn't overlap with its owned token range.
-            if (!tablet_range.overlaps(sst_token_range, dht::token_comparator{})) {
+            SCYLLA_ASSERT(sst_token_range.start().has_value());
+            if (tablet_range.after(sst_token_range.start()->value(), dht::token_comparator{})) {
                 break;
             }
-
+            /*if (!tablet_range.overlaps(sst_token_range, dht::token_comparator{})) {
+                llog.info("FOOBAR SSTable: {}, breaking out of loop for SST range {} being overlapped by tablet range {}",
+                          (*sst_it)->get_filename(),
+                          sst_token_range,
+                          tablet_range);
+                continue;
+            }
+            llog.info("FOOBAR SSTable: {}, processing SST range {} being overlapped by tablet range {}",
+                          (*sst_it)->get_filename(),
+                          sst_token_range,
+                          tablet_range);*/
             if (tablet_range.contains(sst_token_range, dht::token_comparator{})) {
                 sstables_fully_contained.push_back(*sst_it);
             } else {
                 sstables_partially_contained.push_back(*sst_it);
             }
             co_await coroutine::maybe_yield();
+
         }
 
         auto per_tablet_progress = make_shared<per_tablet_stream_progress>(
             progress,
             sstables_fully_contained.size() + sstables_partially_contained.size());
         auto tablet_pr = dht::to_partition_range(tablet_range);
+
         co_await stream_sstables(tablet_pr, std::move(sstables_partially_contained), per_tablet_progress);
         co_await stream_fully_contained_sstables(tablet_pr, std::move(sstables_fully_contained), per_tablet_progress);
     }
@@ -424,6 +449,7 @@ future<> sstable_streamer::stream_sstables(const dht::partition_range& pr, std::
 
 future<> sstable_streamer::stream_sstable_mutations(streaming::plan_id ops_uuid, const dht::partition_range& pr, std::vector<sstables::shared_sstable> sstables) {
     const auto token_range = pr.transform(std::mem_fn(&dht::ring_position::token));
+    // llog.info("FOOBAR partition range: {}, token range: {}", pr, token_range);
     auto s = _table.schema();
     const auto cf_id = s->id();
     const auto reason = streaming::stream_reason::repair;
@@ -434,6 +460,9 @@ future<> sstable_streamer::stream_sstable_mutations(streaming::plan_id ops_uuid,
         estimated_partitions += co_await sst->estimated_keys_for_range(token_range);
         sst_set->insert(sst);
     }
+    sst_set->for_each_sstable([&](const auto & sst) {
+        // llog.info("FOOBAR sst: {}", sst->toc_filename());
+    });
 
     auto start_time = std::chrono::steady_clock::now();
     host_id_vector_replica_set current_targets;
@@ -454,6 +483,9 @@ future<> sstable_streamer::stream_sstable_mutations(streaming::plan_id ops_uuid,
                 const auto& current_dk = start.key();
 
                 current_targets = get_endpoints(current_dk.token());
+                if (current_targets.empty()) {
+                    // llog.info("FOOBAR load_and_stream: got empty targets node for token {}", current_dk.token());
+                }
                 llog.trace("load_and_stream: ops_uuid={}, current_dk={}, current_targets={}", ops_uuid,
                         current_dk.token(), current_targets);
                 for (auto& node : current_targets) {
@@ -464,11 +496,29 @@ future<> sstable_streamer::stream_sstable_mutations(streaming::plan_id ops_uuid,
                         metas.emplace(node, send_meta_data(_db, node, std::move(sink), std::move(source)));
                         metas.at(node).receive();
                     }
+                    else {
+                        // llog.info("FOOBAR load_and_stream: target node {} not found, metas {}", node, fmt::join(std::views::keys(metas),","));
+                    }
                 }
+            }
+            else {
+                // llog.info("FOOBARBAZ load_and_stream: Not a partition start");
+            }
+            if (metas.empty()) {
+                    // llog.info("FOOBAR load_and_stream: got empty metas");
+            }
+
+            if (mf && (mf->mutation_fragment_kind() == mutation_fragment::kind::static_row ||
+                       mf->mutation_fragment_kind() == mutation_fragment::kind::clustering_row)) {
+                // llog.info("PREPARING TO SEND MUTATION FRAGMENT {}", mf->mutation_fragment_kind());
             }
             frozen_mutation_fragment fmf = freeze(*s, *mf);
             num_bytes_read += fmf.representation().size();
-            co_await coroutine::parallel_for_each(current_targets, [&metas, &fmf, is_partition_start] (const locator::host_id& node) {
+            co_await coroutine::parallel_for_each(current_targets, [&metas, &fmf, &mf, is_partition_start](const locator::host_id& node) {
+                if (mf && (mf->mutation_fragment_kind() == mutation_fragment::kind::static_row ||
+                           mf->mutation_fragment_kind() == mutation_fragment::kind::clustering_row)) {
+                    // llog.info("SENDING MUTATION FRAGMENT {}", mf->mutation_fragment_kind());
+                }
                 return metas.at(node).send(fmf, is_partition_start);
             });
         }

@@ -73,6 +73,13 @@ void mutation_fragment::reset_memory(const schema& s, std::optional<reader_resou
     }
 }
 
+mutation_fragment::data::data(reader_permit permit, kind _kind) : _memory(permit.consume_memory()), _kind(_kind) {
+    // static logging::logger mflog("mutation_fragment");
+    // if (_kind == kind::static_row || _kind == kind::clustering_row) {
+    //     mflog.info("MUTATION FRAGMENT OF TYPE {}", _kind);
+    // }
+}
+
 void mutation_fragment::destroy_data() noexcept
 {
     switch (_data->_kind) {

@@ -262,7 +262,7 @@ public:
     };
 private:
     struct data {
-        data(reader_permit permit, kind _kind) :  _memory(permit.consume_memory()), _kind(_kind) { }
+        data(reader_permit permit, kind _kind);
         ~data() { }
 
         reader_permit::resource_units _memory;

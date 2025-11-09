@@ -43,6 +43,7 @@ class mutation_fragment_v1_stream final {
     }
 
     future<mutation_fragment_opt> read_from_underlying() {
+
         auto mfp = co_await _reader();
         if (!mfp) [[unlikely]] {
             _rt_assembler.on_end_of_stream();
