@@ -748,3 +748,72 @@ async def test_restore_with_non_existing_sstable(manager: ManagerClient, object_
     print(f'Status: {status}')
     assert 'state' in status and status['state'] == 'failed'
     assert 'error' in status and 'Not Found' in status['error']
+
+
+@pytest.mark.asyncio
+async def test_backup_broken_streaming(manager: ManagerClient, s3_storage):
+    # Define configuration for the servers.
+    objconf = s3_storage.create_endpoint_conf()
+    config = {
+        'enable_user_defined_functions': False,
+        'object_storage_endpoints': objconf,
+        'experimental_features': ['keyspace-storage-options'],
+        'task_ttl_in_seconds': 300,
+    }
+    cmd = ['--smp', '1', '--logger-log-level', 'sstables_loader=debug:sstable=debug']
+    servers = await manager.servers_add(servers_num=1, config=config, cmdline=cmd, auto_rack_dc="dc1")
+
+    # Obtain the CQL interface from the manager.
+    cql = manager.get_cql()
+
+    keyspace = 'test_ks'
+    table = 'test_cf'
+    replication_opts = format_tuples({
+        'class': 'NetworkTopologyStrategy',
+        'replication_factor': '1'
+    })
+    create_ks_query = f"CREATE KEYSPACE {keyspace} WITH REPLICATION = {replication_opts};"
+    create_table_query = (
+        f"CREATE TABLE {keyspace}.{table} (name text PRIMARY KEY, value text) "
+        f"WITH tablets = {{'min_tablet_count': '16'}};"
+    )
+    cql.execute(create_ks_query)
+    cql.execute(create_table_query)
+
+    resource_dir = "test/resource/sstables/fully_partially_contained_ssts"
+    prefix = unique_name('/test/streaming_')
+    s3_resource = s3_storage.get_resource()
+    bucket = s3_resource.Bucket(s3_storage.bucket_name)
+    sstables = {}
+
+    print(f"Uploading files from '{resource_dir}' to prefix '{prefix}':")
+
+    for root, _, files in os.walk(resource_dir):
+        for file in files:
+            if file.endswith("-TOC.txt"):
+                if servers[0].server_id not in sstables:
+                    sstables[servers[0].server_id] = []
+                sstables[servers[0].server_id].append(file)
+            local_path = os.path.join(root, file)
+            s3_key = f"{prefix}/{file}"
+
+            print(f" - Uploading {local_path} to {s3_key}")
+            bucket.upload_file(local_path, s3_key)
+
+    restore_task_ids = {}
+    for server in servers:
+        restore_task_ids[server.server_id] = await manager.api.restore(
+            server.ip_addr, keyspace, table,
+            s3_storage.address, s3_storage.bucket_name,
+            prefix, sstables[server.server_id], "node"
+        )
+
+    for server in servers:
+        status = await manager.api.wait_task(server.ip_addr, restore_task_ids[server.server_id])
+        assert status and status.get(
+            'state') == 'done', f"Restore task failed on server {server.server_id}. Reason {status}"
+
+    res = cql.execute(f"SELECT COUNT(*) FROM {keyspace}.{table} BYPASS CACHE USING TIMEOUT 600s;")
+
+    # Just showcase the problem, there should be 2503 rows restored, but before the fix we get 1874
+    assert res[0].count == 1874, f"number of rows after restore is incorrect: {res[0].count}"
