@@ -823,9 +823,8 @@ async def test_backup_broken_streaming(manager: ManagerClient, s3_storage):
 
         res = cql.execute(f"SELECT COUNT(*) FROM {keyspace}.{table} BYPASS CACHE USING TIMEOUT 600s;")
 
-        # FIXME: there should be 2503 rows restored, but before the fix we get 1874
-        # See https://github.com/scylladb/scylladb/issues/26979 for details
-        assert res[0].count == 1874, f"number of rows after restore is incorrect: {res[0].count}"
+
+        assert res[0].count == 2503, f"number of rows after restore is incorrect: {res[0].count}"
 
 @pytest.mark.asyncio
 async def test_restore_primary_replica_same_rack_scope_rack(manager: ManagerClient, object_storage):
