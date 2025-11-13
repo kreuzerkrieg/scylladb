@@ -362,14 +362,6 @@ future<> tablet_sstable_streamer::stream(shared_ptr<stream_progress> progress) {
         std::vector<sstables::shared_sstable> sstables_fully_contained;
         std::vector<sstables::shared_sstable> sstables_partially_contained;
 
-        // sstable is exhausted if its last key is before the current tablet range
-        auto exhausted = [&tablet_range] (const sstables::shared_sstable& sst) {
-            return tablet_range.before(sst->get_last_decorated_key().token(), dht::token_comparator{});
-        };
-        while (sstable_it != _sstables.rend() && exhausted(*sstable_it)) {
-            sstable_it++;
-        }
-
         for (auto sst_it = sstable_it; sst_it != _sstables.rend(); sst_it++) {
             auto sst_token_range = sstable_token_range(*sst_it);
 
