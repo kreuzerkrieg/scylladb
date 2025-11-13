@@ -373,15 +373,17 @@ future<> tablet_sstable_streamer::stream(shared_ptr<stream_progress> progress) {
         for (auto sst_it = sstable_it; sst_it != _sstables.rend(); sst_it++) {
             auto sst_token_range = sstable_token_range(*sst_it);
 
-            // sstables are sorted by first key, so should skip this SSTable since it
-            // doesn't overlap with the current tablet range.
-            if (!tablet_range.overlaps(sst_token_range, dht::token_comparator{})) {
-                // If the start of the next SSTable's token range lies beyond the current tablet's token
-                // range, we can safely conclude that no more relevant SSTables remain for this tablet.
-                if (tablet_range.after(sst_token_range.start()->value(), dht::token_comparator{})) {
-                    break;
-                }
+            auto sst_first = sst_token_range.start()->value();
+            auto sst_last = sst_token_range.end()->value();
+
+            // SSTable entirely before tablet -> skip and continue scanning later (larger keys)
+            if (tablet_range.before(sst_last, dht::token_comparator{})) {
                 continue;
+            }
+
+            // SSTable entirely after tablet -> no further SSTables (larger keys) can overlap
+            if (tablet_range.after(sst_first, dht::token_comparator{})) {
+                break;
             }
 
             if (tablet_range.contains(sst_token_range, dht::token_comparator{})) {
