@@ -180,7 +180,7 @@ private:
 class tablet_sstable_streamer : public sstable_streamer {
     const locator::tablet_map& _tablet_map;
     using shared_sstables = std::vector<sstables::shared_sstable>;
-    static future<std::tuple<shared_sstables, shared_sstables>> get_sstables_by_tablet_range(const shared_sstables& sstables, const dht::token_range& tablet_range);
+    static std::tuple<shared_sstables, shared_sstables> get_sstables_by_tablet_range(const shared_sstables& sstables, const dht::token_range& tablet_range);
 public:
     tablet_sstable_streamer(netw::messaging_service& ms, replica::database& db, ::table_id table_id, locator::effective_replication_map_ptr erm,
                             std::vector<sstables::shared_sstable> sstables, primary_replica_only primary, unlink_sstables unlink, stream_scope scope)
@@ -345,7 +345,7 @@ public:
     }
 };
 
-future<std::tuple<tablet_sstable_streamer::shared_sstables, tablet_sstable_streamer::shared_sstables>>
+std::tuple<tablet_sstable_streamer::shared_sstables, tablet_sstable_streamer::shared_sstables>
 tablet_sstable_streamer::get_sstables_by_tablet_range(const shared_sstables& sstables, const dht::token_range& tablet_range) {
     std::vector<sstables::shared_sstable> sstables_fully_contained;
     std::vector<sstables::shared_sstable> sstables_partially_contained;
@@ -373,9 +373,8 @@ tablet_sstable_streamer::get_sstables_by_tablet_range(const shared_sstables& sst
         } else {
             sstables_partially_contained.push_back(sst);
         }
-        co_await coroutine::maybe_yield();
     }
-    co_return std::make_tuple(std::move(sstables_fully_contained), std::move(sstables_partially_contained));
+    return std::make_tuple(std::move(sstables_fully_contained), std::move(sstables_partially_contained));
 }
 
 future<> tablet_sstable_streamer::stream(shared_ptr<stream_progress> progress) {
@@ -385,7 +384,7 @@ future<> tablet_sstable_streamer::stream(shared_ptr<stream_progress> progress) {
 
     for (auto tablet_id : _tablet_map.tablet_ids() | std::views::filter([this] (auto tid) { return tablet_in_scope(tid); })) {
         auto tablet_range = _tablet_map.get_token_range(tablet_id);
-        auto&& [sstables_fully_contained, sstables_partially_contained] = co_await get_sstables_by_tablet_range(_sstables, tablet_range);
+        auto&& [sstables_fully_contained, sstables_partially_contained] = get_sstables_by_tablet_range(_sstables, tablet_range);
         auto per_tablet_progress = make_shared<per_tablet_stream_progress>(
             progress,
             sstables_fully_contained.size() + sstables_partially_contained.size());
