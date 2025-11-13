@@ -350,18 +350,12 @@ future<> tablet_sstable_streamer::stream(shared_ptr<stream_progress> progress) {
 
     for (auto tablet_id : _tablet_map.tablet_ids() | std::views::filter([this] (auto tid) { return tablet_in_scope(tid); })) {
         auto tablet_range = _tablet_map.get_token_range(tablet_id);
-
-        auto sstable_token_range = [] (const sstables::shared_sstable& sst) {
-            return dht::token_range(sst->get_first_decorated_key().token(),
-                                    sst->get_last_decorated_key().token());
-        };
-
         std::vector<sstables::shared_sstable> sstables_fully_contained;
         std::vector<sstables::shared_sstable> sstables_partially_contained;
 
         // sstables are sorted by first key in reverse order.
         for (const auto& sst : std::ranges::reverse_view(_sstables)) {
-            auto sst_token_range = sstable_token_range(sst);
+            dht::token_range sst_token_range{sst->get_first_decorated_key().token(), sst->get_last_decorated_key().token()};
 
             SCYLLA_ASSERT(sst_token_range.start().has_value());
             SCYLLA_ASSERT(sst_token_range.end().has_value());
