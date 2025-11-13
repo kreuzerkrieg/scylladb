@@ -348,9 +348,6 @@ future<> tablet_sstable_streamer::stream(shared_ptr<stream_progress> progress) {
         progress->start(_tablet_map.tablet_count());
     }
 
-    // sstables are sorted by first key in reverse order.
-    auto sstable_it = _sstables.rbegin();
-
     for (auto tablet_id : _tablet_map.tablet_ids() | std::views::filter([this] (auto tid) { return tablet_in_scope(tid); })) {
         auto tablet_range = _tablet_map.get_token_range(tablet_id);
 
@@ -362,8 +359,9 @@ future<> tablet_sstable_streamer::stream(shared_ptr<stream_progress> progress) {
         std::vector<sstables::shared_sstable> sstables_fully_contained;
         std::vector<sstables::shared_sstable> sstables_partially_contained;
 
-        for (auto sst_it = sstable_it; sst_it != _sstables.rend(); sst_it++) {
-            auto sst_token_range = sstable_token_range(*sst_it);
+        // sstables are sorted by first key in reverse order.
+        for (const auto& sst : std::ranges::reverse_view(_sstables)) {
+            auto sst_token_range = sstable_token_range(sst);
 
             SCYLLA_ASSERT(sst_token_range.start().has_value());
             SCYLLA_ASSERT(sst_token_range.end().has_value());
@@ -381,9 +379,9 @@ future<> tablet_sstable_streamer::stream(shared_ptr<stream_progress> progress) {
             }
 
             if (tablet_range.contains(sst_token_range, dht::token_comparator{})) {
-                sstables_fully_contained.push_back(*sst_it);
+                sstables_fully_contained.push_back(sst);
             } else {
-                sstables_partially_contained.push_back(*sst_it);
+                sstables_partially_contained.push_back(sst);
             }
             co_await coroutine::maybe_yield();
         }
