@@ -179,8 +179,6 @@ private:
 
 class tablet_sstable_streamer : public sstable_streamer {
     const locator::tablet_map& _tablet_map;
-    using shared_sstables = std::vector<sstables::shared_sstable>;
-    static std::tuple<shared_sstables, shared_sstables> get_sstables_by_tablet_range(const shared_sstables& sstables, const dht::token_range& tablet_range);
 public:
     tablet_sstable_streamer(netw::messaging_service& ms, replica::database& db, ::table_id table_id, locator::effective_replication_map_ptr erm,
                             std::vector<sstables::shared_sstable> sstables, primary_replica_only primary, unlink_sstables unlink, stream_scope scope)
@@ -344,38 +342,6 @@ public:
         }
     }
 };
-
-std::tuple<tablet_sstable_streamer::shared_sstables, tablet_sstable_streamer::shared_sstables>
-tablet_sstable_streamer::get_sstables_by_tablet_range(const shared_sstables& sstables, const dht::token_range& tablet_range) {
-    std::vector<sstables::shared_sstable> sstables_fully_contained;
-    std::vector<sstables::shared_sstable> sstables_partially_contained;
-    // sstables are sorted by first key in reverse order.
-    for (const auto& sst : std::ranges::reverse_view(sstables)) {
-        dht::token_range sst_token_range{sst->get_first_decorated_key().token(), sst->get_last_decorated_key().token()};
-
-        SCYLLA_ASSERT(sst_token_range.start().has_value());
-        SCYLLA_ASSERT(sst_token_range.end().has_value());
-        auto sst_first = sst_token_range.start()->value();
-        auto sst_last = sst_token_range.end()->value();
-
-        // SSTable entirely before tablet -> skip and continue scanning later (larger keys)
-        if (tablet_range.before(sst_last, dht::token_comparator{})) {
-            continue;
-        }
-
-        // SSTable entirely after tablet -> no further SSTables (larger keys) can overlap
-        if (tablet_range.after(sst_first, dht::token_comparator{})) {
-            break;
-        }
-
-        if (tablet_range.contains(sst_token_range, dht::token_comparator{})) {
-            sstables_fully_contained.push_back(sst);
-        } else {
-            sstables_partially_contained.push_back(sst);
-        }
-    }
-    return std::make_tuple(std::move(sstables_fully_contained), std::move(sstables_partially_contained));
-}
 
 future<> tablet_sstable_streamer::stream(shared_ptr<stream_progress> progress) {
     if (progress) {
@@ -823,4 +789,35 @@ future<tasks::task_id> sstables_loader::download_new_sstables(sstring ks_name, s
     auto task = co_await _task_manager_module->make_and_start_task<download_task_impl>({}, container(), std::move(endpoint), std::move(bucket), std::move(ks_name), std::move(cf_name),
                                                                                        std::move(prefix), std::move(sstables), scope, primary_replica_only(primary_replica));
     co_return task->id();
+}
+
+std::tuple<shared_sstables, shared_sstables> get_sstables_by_tablet_range(const shared_sstables& sstables, const dht::token_range& tablet_range) {
+    std::vector<sstables::shared_sstable> sstables_fully_contained;
+    std::vector<sstables::shared_sstable> sstables_partially_contained;
+    // sstables are sorted by first key in reverse order.
+    for (const auto& sst : std::ranges::reverse_view(sstables)) {
+        dht::token_range sst_token_range{sst->get_first_decorated_key().token(), sst->get_last_decorated_key().token()};
+
+        SCYLLA_ASSERT(sst_token_range.start().has_value());
+        SCYLLA_ASSERT(sst_token_range.end().has_value());
+        auto sst_first = sst_token_range.start()->value();
+        auto sst_last = sst_token_range.end()->value();
+
+        // SSTable entirely before tablet -> skip and continue scanning later (larger keys)
+        if (tablet_range.before(sst_last, dht::token_comparator{})) {
+            continue;
+        }
+
+        // SSTable entirely after tablet -> no further SSTables (larger keys) can overlap
+        if (tablet_range.after(sst_first, dht::token_comparator{})) {
+            break;
+        }
+
+        if (tablet_range.contains(sst_token_range, dht::token_comparator{})) {
+            sstables_fully_contained.push_back(sst);
+        } else {
+            sstables_partially_contained.push_back(sst);
+        }
+    }
+    return std::make_tuple(std::move(sstables_fully_contained), std::move(sstables_partially_contained));
 }
