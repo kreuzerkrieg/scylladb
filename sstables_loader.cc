@@ -367,11 +367,11 @@ future<> tablet_sstable_streamer::stream(shared_ptr<stream_progress> progress) {
         dht::token _start;
         dht::token _end;
     };
-    auto sstables = _sstables | std::views::transform([](auto const& entity) -> sst_holder {
-                        return {._sst = entity, ._start = entity->get_first_decorated_key().token(), ._end = entity->get_last_decorated_key().token()};
+    auto sstables = _sstables | std::views::reverse | std::views::transform([](auto const& sst) -> sst_holder {
+                        return {._sst = sst, ._start = sst->get_first_decorated_key().token(), ._end = sst->get_last_decorated_key().token()};
                     }) |
                     std::ranges::to<std::vector>();
-    std::ranges::sort(sstables, [](const auto& lhs, const auto& rhs) { return lhs._start < rhs._start; });
+    // std::ranges::sort(sstables, [](const auto& lhs, const auto& rhs) { return lhs._start < rhs._start; });
 
     for (auto& [_tablet_range, _sstables_fully_contained, _sstables_partially_contained] : tablet_collection) {
         const auto& tablet_start = _tablet_range.start()->value();
