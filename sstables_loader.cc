@@ -347,16 +347,55 @@ future<> tablet_sstable_streamer::stream(shared_ptr<stream_progress> progress) {
     if (progress) {
         progress->start(_tablet_map.tablet_count());
     }
+    struct tablet_sstable_collection {
+        dht::token_range _tablet_range;
+        std::vector<sstables::shared_sstable> _sstables_fully_contained;
+        std::vector<sstables::shared_sstable> _sstables_partially_contained;
+    };
 
-    for (auto tablet_id : _tablet_map.tablet_ids() | std::views::filter([this] (auto tid) { return tablet_in_scope(tid); })) {
-        auto tablet_range = _tablet_map.get_token_range(tablet_id);
-        auto&& [sstables_fully_contained, sstables_partially_contained] = get_sstables_by_tablet_range(_sstables, tablet_range);
-        auto per_tablet_progress = make_shared<per_tablet_stream_progress>(
-            progress,
-            sstables_fully_contained.size() + sstables_partially_contained.size());
-        auto tablet_pr = dht::to_partition_range(tablet_range);
-        co_await stream_sstables(tablet_pr, std::move(sstables_partially_contained), per_tablet_progress);
-        co_await stream_fully_contained_sstables(tablet_pr, std::move(sstables_fully_contained), per_tablet_progress);
+    auto tablet_collection = _tablet_map.tablet_ids() | std::views::filter([this](auto tid) { return tablet_in_scope(tid); }) |
+                             std::views::transform([this](auto tid) { return tablet_sstable_collection{._tablet_range = _tablet_map.get_token_range(tid)}; }) |
+                             std::ranges::to<std::vector>();
+    if (tablet_collection.empty()) {
+        co_return;
+    }
+    std::ranges::sort(tablet_collection,
+                      [](const auto& lhs, const auto& rhs) { return lhs._tablet_range.start()->value() < rhs._tablet_range.start()->value(); });
+
+    struct sst_holder {
+        sstables::shared_sstable _sst;
+        dht::token _start;
+        dht::token _end;
+    };
+    auto sstables = _sstables | std::views::transform([](auto const& entity) -> sst_holder {
+                        return {._sst = entity, ._start = entity->get_first_decorated_key().token(), ._end = entity->get_last_decorated_key().token()};
+                    }) |
+                    std::ranges::to<std::vector>();
+    std::ranges::sort(sstables, [](const auto& lhs, const auto& rhs) { return lhs._start < rhs._start; });
+
+    for (auto& [_tablet_range, _sstables_fully_contained, _sstables_partially_contained] : tablet_collection) {
+        const auto& tablet_start = _tablet_range.start()->value();
+        const auto& tablet_end = _tablet_range.end()->value();
+
+        auto lo_it = std::ranges::lower_bound(sstables, tablet_start, {}, &sst_holder::_end);
+        auto lo = std::ranges::distance(sstables.begin(), lo_it);
+
+        auto hi_it = std::ranges::upper_bound(sstables, tablet_end, {}, &sst_holder::_start);
+        auto hi = std::ranges::distance(sstables.begin(), hi_it);
+
+        for (; lo < hi; ++lo) {
+            if (auto& holder = sstables[lo]; _tablet_range.contains(dht::token_range{holder._start, holder._end}, dht::token_comparator{}))
+                _sstables_fully_contained.push_back(holder._sst);
+            else
+                _sstables_partially_contained.push_back(holder._sst);
+            co_await maybe_yield();
+        }
+    }
+    for (auto& [_tablet_range, _sstables_fully_contained, _sstables_partially_contained] : tablet_collection) {
+        auto per_tablet_progress = make_shared<per_tablet_stream_progress>(progress, _sstables_fully_contained.size() + _sstables_partially_contained.size());
+        auto tablet_pr = dht::to_partition_range(_tablet_range);
+        co_await stream_sstables(tablet_pr, std::move(_sstables_partially_contained), per_tablet_progress);
+        co_await stream_fully_contained_sstables(tablet_pr, std::move(_sstables_fully_contained), per_tablet_progress);
     }
 }
 
