@@ -356,6 +356,7 @@ future<std::vector<tablet_sstable_collection>> get_sstables_for_tablets(const st
     for (auto& [tablet_range, sstables_fully_contained, sstables_partially_contained] : tablets_sstables) {
         // if the sstable's last token is before the tablet's first token, we can skip it
         auto tablet_first = tablet_range.start().value().value();
+        auto tablet_last = tablet_range.end().value().value();
         while (sstable_it != reversed_sstables.cend() && (*sstable_it)->get_last_decorated_key().token() <= tablet_first) {
             ++sstable_it;
         }
@@ -364,20 +365,17 @@ future<std::vector<tablet_sstable_collection>> get_sstables_for_tablets(const st
             const auto& sst = *sst_it;
             auto sst_first = sst->get_first_decorated_key().token();
             auto sst_last = sst->get_last_decorated_key().token();
-            auto sst_token_range = dht::token_range{sst_first, sst_last};
 
-            // sstables are sorted by first key, so should skip this SSTable since it
-            // doesn't overlap with the current tablet range.
-            if (!tablet_range.overlaps(sst_token_range, dht::token_comparator{})) {
-                // If the start of the next SSTable's token range lies beyond the current tablet's token
-                // range, we can safely conclude that no more relevant SSTables remain for this tablet.
-                if (tablet_range.after(sst_token_range.start()->value(), dht::token_comparator{})) {
-                    break;
-                }
+            // SSTable entirely after tablet -> no further SSTables (larger keys) can overlap
+            if (tablet_last < sst_first) {
+                break;
+            }
+            // SSTable entirely before tablet -> skip and continue scanning later (larger keys)
+            if (sst_last <= tablet_first) {
                 continue;
             }
 
-            if (tablet_range.contains(sst_token_range, dht::token_comparator{})) {
+            if (tablet_range.contains(dht::token_range{sst_first, sst_last}, dht::token_comparator{})) {
                 sstables_fully_contained.push_back(*sst_it);
             } else {
                 sstables_partially_contained.push_back(*sst_it);
