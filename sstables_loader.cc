@@ -349,7 +349,8 @@ future<> tablet_sstable_streamer::stream(shared_ptr<stream_progress> progress) {
     }
 
     // sstables are sorted by first key in reverse order.
-    auto sstable_it = _sstables.rbegin();
+    auto reversed_sstables = _sstables | std::views::reverse;
+    auto sstable_it = reversed_sstables.cbegin();
 
     for (auto tablet_id : _tablet_map.tablet_ids() | std::views::filter([this] (auto tid) { return tablet_in_scope(tid); })) {
         auto tablet_range = _tablet_map.get_token_range(tablet_id);
@@ -364,10 +365,10 @@ future<> tablet_sstable_streamer::stream(shared_ptr<stream_progress> progress) {
 
         // sstable should be skipped if ends before the tablet starts
         auto tablet_first = tablet_range.start().value().value();
-        while (sstable_it != _sstables.rend() && (*sstable_it)->get_last_decorated_key().token() < tablet_first) {
+        while (sstable_it != reversed_sstables.cend() && (*sstable_it)->get_last_decorated_key().token() < tablet_first) {
             ++sstable_it;
         }
-        for (auto sst_it = sstable_it; sst_it != _sstables.rend(); sst_it++) {
+        for (auto sst_it = sstable_it; sst_it != reversed_sstables.cend(); ++sst_it) {
             auto sst_token_range = sstable_token_range(*sst_it);
 
             auto sst_first = sst_token_range.start()->value();
