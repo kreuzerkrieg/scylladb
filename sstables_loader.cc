@@ -354,11 +354,6 @@ future<std::vector<tablet_sstable_collection>> get_sstables_for_tablets(const st
     auto sstable_it = reversed_sstables.cbegin();
 
     for (auto& [tablet_range, sstables_fully_contained, sstables_partially_contained] : tablets_sstables) {
-        auto sstable_token_range = [] (const sstables::shared_sstable& sst) {
-            return dht::token_range(sst->get_first_decorated_key().token(),
-                                    sst->get_last_decorated_key().token());
-        };
-
         // if the sstable's last token is before the tablet's first token, we can skip it
         auto tablet_first = tablet_range.start().value().value();
         while (sstable_it != reversed_sstables.cend() && (*sstable_it)->get_last_decorated_key().token() <= tablet_first) {
@@ -366,7 +361,10 @@ future<std::vector<tablet_sstable_collection>> get_sstables_for_tablets(const st
         }
 
         for (auto sst_it = sstable_it; sst_it != reversed_sstables.cend(); sst_it++) {
-            auto sst_token_range = sstable_token_range(*sst_it);
+            const auto& sst = *sst_it;
+            auto sst_first = sst->get_first_decorated_key().token();
+            auto sst_last = sst->get_last_decorated_key().token();
+            auto sst_token_range = dht::token_range{sst_first, sst_last};
 
             // sstables are sorted by first key, so should skip this SSTable since it
             // doesn't overlap with the current tablet range.
