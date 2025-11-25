@@ -352,14 +352,16 @@ future<> tablet_sstable_streamer::stream(shared_ptr<stream_progress> progress) {
     auto reversed_sstables = _sstables | std::views::reverse;
     auto sstable_it = reversed_sstables.cbegin();
 
-    for (auto tablet_id : _tablet_map.tablet_ids() | std::views::filter([this] (auto tid) { return tablet_in_scope(tid); })) {
-        auto tablet_range = _tablet_map.get_token_range(tablet_id);
+    auto tablet_ranges = _tablet_map.tablet_ids() | std::views::filter([this](auto tid) { return tablet_in_scope(tid); }) |
+                         std::views::transform([this](auto tid) { return _tablet_map.get_token_range(tid); });
 
+    for (const auto& tablet_range : tablet_ranges) {
         std::vector<sstables::shared_sstable> sstables_fully_contained;
         std::vector<sstables::shared_sstable> sstables_partially_contained;
 
         // sstable should be skipped if ends before the tablet starts
         auto tablet_first = tablet_range.start().value().value();
+        auto tablet_last = tablet_range.end().value().value();
         while (sstable_it != reversed_sstables.cend() && (*sstable_it)->get_last_decorated_key().token() < tablet_first) {
             ++sstable_it;
         }
@@ -369,11 +371,11 @@ future<> tablet_sstable_streamer::stream(shared_ptr<stream_progress> progress) {
             auto sst_last = sst->get_last_decorated_key().token();
 
             // SSTable entirely after tablet -> no further SSTables (larger keys) can overlap
-            if (tablet_range.after(sst_first, dht::token_comparator{})) {
+            if (tablet_last < sst_first) {
                 break;
             }
             // SSTable entirely before tablet -> skip and continue scanning later (larger keys)
-            if (tablet_range.before(sst_last, dht::token_comparator{})) {
+            if (sst_last < tablet_first) {
                 continue;
             }
 
