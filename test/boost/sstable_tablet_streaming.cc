@@ -67,12 +67,12 @@ SEASTAR_TEST_CASE(test_streaming_ranges_distribution) {
             auto collection = get_tablet_sstable_collection({dht::token{5}, dht::token{10}});
             auto ssts = make_sstables_with_ranges(env,
                                                   {
-                                                      {4, 5},   // touches start
+                                                      {4, 5},   // touches start, non-inclusive, skipped
                                                       {10, 11}, // touches end
                                                   });
             auto res = get_sstables_for_tablets(ssts, std::move(collection)).get();
             REQUIRE_WITH_CONTEXT(res[0].sstables_fully_contained, 0);
-            REQUIRE_WITH_CONTEXT(res[0].sstables_partially_contained, 2);
+            REQUIRE_WITH_CONTEXT(res[0].sstables_partially_contained, 1);
         }
 
         // 3) Tablet fully inside a large SSTable
@@ -161,14 +161,14 @@ SEASTAR_TEST_CASE(test_streaming_ranges_distribution) {
             auto collection = get_tablet_sstable_collection({dht::token{100}, dht::token{200}});
             auto ssts = make_sstables_with_ranges(env,
                                                   {
-                                                      {50, 100},  // touches start -> partial
+                                                      {50, 100},  // touches start, non inclusive, skipped
                                                       {100, 120}, // starts at start -> fully contained
                                                       {180, 200}, // ends at end   -> fully contained
                                                       {200, 220}, // touches end   -> partial
                                                   });
             auto res = get_sstables_for_tablets(ssts, std::move(collection)).get();
             REQUIRE_WITH_CONTEXT(res[0].sstables_fully_contained, 2);
-            REQUIRE_WITH_CONTEXT(res[0].sstables_partially_contained, 2);
+            REQUIRE_WITH_CONTEXT(res[0].sstables_partially_contained, 1);
         }
 
         // 10) Large SSTable set where early break should occur
@@ -262,20 +262,6 @@ SEASTAR_TEST_CASE(test_streaming_ranges_distribution_in_tablets) {
 
             REQUIRE_WITH_CONTEXT(res[0].sstables_fully_contained, 0);
             REQUIRE_WITH_CONTEXT(res[0].sstables_partially_contained, 0);
-        }
-
-        {
-            // Edge case: SSTable touching tablet boundary
-            auto collection = get_tablet_sstable_collection(dht::token_range{dht::token{5}, dht::token{10}});
-            auto ssts = make_sstables_with_ranges(env,
-                                                  {
-                                                      {4, 5},   // touches start
-                                                      {10, 11}, // touches end
-                                                  });
-            auto res = get_sstables_for_tablets(ssts, std::move(collection)).get();
-
-            REQUIRE_WITH_CONTEXT(res[0].sstables_fully_contained, 0);
-            REQUIRE_WITH_CONTEXT(res[0].sstables_partially_contained, 2);
         }
 
         {

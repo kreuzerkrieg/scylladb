@@ -359,12 +359,10 @@ future<std::vector<tablet_sstable_collection>> get_sstables_for_tablets(const st
                                     sst->get_last_decorated_key().token());
         };
 
-        // sstable is exhausted if its last key is before the current tablet range
-        auto exhausted = [&tablet_range] (const sstables::shared_sstable& sst) {
-            return tablet_range.before(sst->get_last_decorated_key().token(), dht::token_comparator{});
-        };
-        while (sstable_it != reversed_sstables.cend() && exhausted(*sstable_it)) {
-            sstable_it++;
+        // if the sstable's last token is before the tablet's first token, we can skip it
+        auto tablet_first = tablet_range.start().value().value();
+        while (sstable_it != reversed_sstables.cend() && (*sstable_it)->get_last_decorated_key().token() <= tablet_first) {
+            ++sstable_it;
         }
 
         for (auto sst_it = sstable_it; sst_it != reversed_sstables.cend(); sst_it++) {
