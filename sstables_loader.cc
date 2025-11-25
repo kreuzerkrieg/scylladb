@@ -355,11 +355,6 @@ future<> tablet_sstable_streamer::stream(shared_ptr<stream_progress> progress) {
     for (auto tablet_id : _tablet_map.tablet_ids() | std::views::filter([this] (auto tid) { return tablet_in_scope(tid); })) {
         auto tablet_range = _tablet_map.get_token_range(tablet_id);
 
-        auto sstable_token_range = [] (const sstables::shared_sstable& sst) {
-            return dht::token_range(sst->get_first_decorated_key().token(),
-                                    sst->get_last_decorated_key().token());
-        };
-
         std::vector<sstables::shared_sstable> sstables_fully_contained;
         std::vector<sstables::shared_sstable> sstables_partially_contained;
 
@@ -369,10 +364,9 @@ future<> tablet_sstable_streamer::stream(shared_ptr<stream_progress> progress) {
             ++sstable_it;
         }
         for (auto sst_it = sstable_it; sst_it != reversed_sstables.cend(); ++sst_it) {
-            auto sst_token_range = sstable_token_range(*sst_it);
-
-            auto sst_first = sst_token_range.start()->value();
-            auto sst_last = sst_token_range.end()->value();
+            const auto& sst = *sst_it;
+            auto sst_first = sst->get_first_decorated_key().token();
+            auto sst_last = sst->get_last_decorated_key().token();
 
             // SSTable entirely after tablet -> no further SSTables (larger keys) can overlap
             if (tablet_range.after(sst_first, dht::token_comparator{})) {
@@ -383,10 +377,10 @@ future<> tablet_sstable_streamer::stream(shared_ptr<stream_progress> progress) {
                 continue;
             }
 
-            if (tablet_range.contains(sst_token_range, dht::token_comparator{})) {
-                sstables_fully_contained.push_back(*sst_it);
+            if (tablet_range.contains(dht::token_range{sst_first, sst_last}, dht::token_comparator{})) {
+                sstables_fully_contained.push_back(sst);
             } else {
-                sstables_partially_contained.push_back(*sst_it);
+                sstables_partially_contained.push_back(sst);
             }
             co_await coroutine::maybe_yield();
         }
