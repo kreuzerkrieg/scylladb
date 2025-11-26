@@ -361,7 +361,7 @@ future<std::vector<tablet_sstable_collection>> get_sstables_for_tablets(const st
             ++sstable_it;
         }
 
-        for (auto sst_it = sstable_it; sst_it != reversed_sstables.cend(); sst_it++) {
+        for (auto sst_it = sstable_it; sst_it != reversed_sstables.cend(); ++sst_it) {
             const auto& sst = *sst_it;
             auto sst_first = sst->get_first_decorated_key().token();
             auto sst_last = sst->get_last_decorated_key().token();
