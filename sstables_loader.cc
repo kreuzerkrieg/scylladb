@@ -249,9 +249,9 @@ private:
                     if (tasks.empty()) {
                         break;
                     }
-                    co_await when_all_succeed(tasks.begin(), tasks.end()).then([&tasks, progress = std::move(progress)] {
+                    co_await when_all_succeed(tasks.begin(), tasks.end()).then([tasks_count = tasks.size(), progress = std::move(progress)] {
                         if (progress) {
-                            progress->advance(tasks.size());
+                            progress->advance(tasks_count);
                         }
                     });
                 }
