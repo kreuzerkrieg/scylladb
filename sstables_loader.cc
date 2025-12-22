@@ -214,7 +214,7 @@ private:
     stream_fully_contained_sstables(const dht::partition_range& pr, std::vector<sstables::shared_sstable> sstables, shared_ptr<stream_progress> progress) {
         if (_stream_scope == stream_scope::node && !sstables.empty() && sstables.front()->storage_options().is_object_storage_type()) {
             llog.debug("Directly downloading {} fully contained SSTables to local node from object storage.", sstables.size());
-            return download_fully_contained_sstables(std::move(sstables), std::move(progress)).then([this](auto downloaded_ssts) -> future<> {
+            return download_fully_contained_sstables(std::move(sstables)).then([this, progress = std::move(progress)](auto downloaded_ssts) -> future<> {
                 auto dwnld_ssts = std::move(downloaded_ssts);
                 auto dwnld_ssts_its = dwnld_ssts | std::views::transform([](auto& ssts) { return ssts.cbegin(); }) | std::ranges::to<std::vector>();
                 while (true) {
@@ -231,13 +231,15 @@ private:
                                                from);
                                     auto& db = _db.local();
                                     auto& table = db.find_column_family(ks, cf);
-                                    auto sst = table.get_sstables_manager().make_sstable(table.schema(),
+                                    auto& sst_manager = table.get_sstables_manager();
+                                    auto sst = sst_manager.make_sstable(table.schema(),
                                                                                          table.get_storage_options(),
                                                                                          min_info._generation,
                                                                                          sstables::sstable_state::normal,
                                                                                          min_info._version,
                                                                                          min_info._format);
                                     sst->set_sstable_level(0);
+                                    auto units = co_await sst_manager.dir_semaphore().get_units(1);
                                     co_await sst->load(table.get_effective_replication_map()->get_sharder(*table.schema()));
                                     co_await table.add_sstable_and_update_cache(sst);
                                 }));
@@ -247,7 +249,11 @@ private:
                     if (tasks.empty()) {
                         break;
                     }
-                    co_await when_all_succeed(tasks.begin(), tasks.end());
+                    co_await when_all_succeed(tasks.begin(), tasks.end()).then([&tasks, progress = std::move(progress)] {
+                        if (progress) {
+                            progress->advance(tasks.size());
+                        }
+                    });
                 }
                 co_return;
             });
@@ -255,8 +261,7 @@ private:
         return stream_sstables(pr, std::move(sstables), std::move(progress));
     }
 
-    future<sst_classification_info> download_fully_contained_sstables(std::vector<sstables::shared_sstable> sstables,
-                                                                      shared_ptr<stream_progress> progress) const {
+    future<sst_classification_info> download_fully_contained_sstables(std::vector<sstables::shared_sstable> sstables) const {
         constexpr auto foptions = file_open_options{.extent_allocation_size_hint = 32_MiB, .sloppy_size = true};
         constexpr auto stream_options = file_output_stream_options{.buffer_size = 128_KiB, .write_behind = 10};
         const auto fis_options = file_input_stream_options{.buffer_size = 128_KiB, .read_ahead = 2};
@@ -306,13 +311,7 @@ private:
 
                     std::exception_ptr eptr;
                     try {
-                        while (true) {
-                            auto buff = co_await src.read();
-                            if (!buff) {
-                                break;
-                            }
-                            co_await out.write(buff.get(), buff.size());
-                        }
+                        co_await seastar::copy(src, out);
                     } catch (...) {
                         eptr = std::current_exception();
                         llog.info("Error downloading SSTable component {}. Reason: {}", it->first, eptr);
@@ -328,16 +327,11 @@ private:
                         SCYLLA_ASSERT(shards.size() == 1);
                         llog.debug("SSTable shards {}", fmt::join(shards, ", "));
                         downloaded_sstables[shards.front()].emplace_back(gen, descriptor.version, descriptor.format);
-                        co_await sst->destroy();
-                        sst = {};
                     }
                 } catch (...) {
                     llog.info("Error downloading SSTable component {}. Reason: {}", it->first, std::current_exception());
                     throw;
                 }
-            }
-            if (progress) {
-                progress->advance(1);
             }
         }
         co_return downloaded_sstables;
