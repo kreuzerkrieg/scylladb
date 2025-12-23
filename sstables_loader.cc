@@ -214,7 +214,7 @@ private:
     stream_fully_contained_sstables(const dht::partition_range& pr, std::vector<sstables::shared_sstable> sstables, shared_ptr<stream_progress> progress) {
         if (_stream_scope == stream_scope::node && !sstables.empty() && sstables.front()->storage_options().is_object_storage_type()) {
             llog.debug("Directly downloading {} fully contained SSTables to local node from object storage.", sstables.size());
-            return download_fully_contained_sstables(std::move(sstables)).then([this, progress = std::move(progress)](auto downloaded_ssts) -> future<> {
+            return download_fully_contained_sstables(std::move(sstables)).then([this, progress](auto downloaded_ssts) -> future<> {
                 auto dwnld_ssts = std::move(downloaded_ssts);
                 auto dwnld_ssts_its = dwnld_ssts | std::views::transform([](auto& ssts) { return ssts.cbegin(); }) | std::ranges::to<std::vector>();
                 while (true) {
@@ -249,7 +249,7 @@ private:
                     if (tasks.empty()) {
                         break;
                     }
-                    co_await when_all_succeed(tasks.begin(), tasks.end()).then([tasks_count = tasks.size(), progress = std::move(progress)] {
+                    co_await when_all_succeed(tasks.begin(), tasks.end()).then([tasks_count = tasks.size(), progress] {
                         if (progress) {
                             progress->advance(tasks_count);
                         }
