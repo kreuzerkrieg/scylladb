@@ -23,7 +23,7 @@ future<shared_ptr<tls::certificate_credentials>> utils::http::system_trust_crede
     co_return system_trust_credentials;
 }
 
-utils::http::dns_connection_factory::state::state(shared_ptr<tls::certificate_credentials> cin) 
+utils::http::state::state(shared_ptr<tls::certificate_credentials> cin)
     : creds(std::move(cin))
 {}
 

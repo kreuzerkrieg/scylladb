@@ -21,6 +21,13 @@ namespace utils::http {
 
 future<shared_ptr<tls::certificate_credentials>> system_trust_credentials();
 
+struct state {
+    bool initialized = false;
+    std::vector<net::inet_address> addr_list;
+    shared_ptr<tls::certificate_credentials> creds;
+    state(shared_ptr<tls::certificate_credentials>);
+};
+
 class dns_connection_factory : public seastar::http::experimental::connection_factory {
 protected:
     std::string _host;
@@ -28,12 +35,6 @@ protected:
     bool _use_https;
     size_t _addr_pos{0};
     logging::logger& _logger;
-    struct state {
-        bool initialized = false;
-        std::vector<net::inet_address> addr_list;
-        shared_ptr<tls::certificate_credentials> creds;
-        state(shared_ptr<tls::certificate_credentials>);
-    };
     lw_shared_ptr<state> _state;
     shared_future<> _done;
 
