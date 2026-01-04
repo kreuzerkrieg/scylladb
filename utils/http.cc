@@ -23,11 +23,11 @@ future<shared_ptr<tls::certificate_credentials>> utils::http::system_trust_crede
     co_return system_trust_credentials;
 }
 
-utils::http::state::state(shared_ptr<tls::certificate_credentials> cin)
+utils::http::address_provider::address_provider(shared_ptr<tls::certificate_credentials> cin)
     : creds(std::move(cin))
 {}
 
-future<> utils::http::dns_connection_factory::initialize(lw_shared_ptr<state> state, std::string host, bool use_https, logging::logger& logger) {
+future<> utils::http::dns_connection_factory::initialize(lw_shared_ptr<address_provider> state, std::string host, bool use_https, logging::logger& logger) {
     co_await coroutine::all(
         [state, host] () -> future<> {
             auto hent = co_await net::dns::get_host_by_name(host, net::inet_address::family::INET);
@@ -63,7 +63,7 @@ utils::http::dns_connection_factory::dns_connection_factory(std::string host, in
     , _port(port)
     , _use_https(use_https)
     , _logger(logger)
-    , _state(make_lw_shared<state>(std::move(certs)))
+    , _state(make_lw_shared<address_provider>(std::move(certs)))
     , _done(initialize(_state, _host, _use_https, _logger))
 {}
 
