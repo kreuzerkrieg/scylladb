@@ -51,6 +51,7 @@ target_sources(utils
     labels.cc
     aws_sigv4.cc
     rest/client.cc
+    s3/aws_dns_connection_factory.cc
     s3/aws_error.cc
     s3/client.cc
     s3/default_aws_retry_strategy.cc
