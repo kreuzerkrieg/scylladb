@@ -27,6 +27,7 @@ import yaml
 
 from test import ALL_MODES, DEBUG_MODES, TOP_SRC_DIR, TEST_DIR, TEST_RUNNER
 from test.pylib.artifact_registry import ArtifactRegistry
+from test.pylib.gcs_server import GCSServer
 from test.pylib.host_registry import HostRegistry
 from test.pylib.ldap_server import start_ldap
 from test.pylib.minio_server import MinioServer
@@ -563,6 +564,14 @@ async def start_3rd_party_services(tempdir_base: pathlib.Path, toxiproxy_byte_li
     await ms.start()
     TestSuite.artifacts.add_exit_artifact(None, ms.stop)
 
+    gcs = GCSServer(
+        tempdir_base=str(tempdir_base),
+        address=await hosts.lease_host(),
+        logger=LogPrefixAdapter(logger=logging.getLogger("fake-gcs"), extra={"prefix": "fake-gcs"}),
+    )
+    await gcs.start()
+    TestSuite.artifacts.add_exit_artifact(None, gcs.stop)
+
     TestSuite.artifacts.add_exit_artifact(None, hosts.cleanup)
 
     mock_s3_server = MockS3Server(
@@ -584,6 +593,18 @@ async def start_3rd_party_services(tempdir_base: pathlib.Path, toxiproxy_byte_li
     )
     await proxy_s3_server.start()
     TestSuite.artifacts.add_exit_artifact(None, proxy_s3_server.stop)
+
+    gcs_uri = f"http://{os.environ[gcs.ENV_ADDRESS]}:{os.environ[gcs.ENV_PORT]}"
+    gcs_s3_server = S3ProxyServer(
+        host=await hosts.lease_host(),
+        port=9003,
+        minio_uri=gcs_uri,
+        max_retries=3,
+        seed=int(time.time()),
+        logger=LogPrefixAdapter(logger=logging.getLogger("gcs_proxy"), extra={"prefix": "gcs_proxy"}),
+    )
+    await gcs_s3_server.start()
+    TestSuite.artifacts.add_exit_artifact(None, gcs_s3_server.stop)
 
 def find_suite_config(path: pathlib.Path, config_filename: str) -> pathlib.Path:
     for directory in (path.joinpath("_") if path.is_dir() else path).absolute().relative_to(TEST_DIR).parents:
