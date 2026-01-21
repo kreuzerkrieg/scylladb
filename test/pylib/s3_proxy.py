@@ -8,7 +8,6 @@
 # S3 proxy server to inject retryable errors for fuzzy testing.
 
 import asyncio
-import json
 import logging
 import os
 import random
@@ -64,44 +63,36 @@ class LRUCache:
                 del self.cache[key]
 
 
-# Simple proxy between s3 client and minio to randomly inject errors and simulate cases when the request succeeds but the wire got "broken"
+# Simple proxy between object storage client and server to randomly inject errors and simulate cases when the request succeeds but the wire got "broken"
 def true_or_false():
     return random.choice([True, False])
 
 
 class InjectingHandler(BaseHTTPRequestHandler):
     retryable_codes = list((408, 419, 429, 440)) + list(range(500, 599))
-
-    aws_error_names = list(("InternalFailureException",
-                            "InternalFailure",
-                            "InternalServerError",
-                            "InternalError",
-                            "RequestExpiredException",
-                            "RequestExpired",
-                            "ServiceUnavailableException",
-                            "ServiceUnavailableError",
-                            "ServiceUnavailable",
-                            "RequestThrottledException",
-                            "RequestThrottled",
-                            "ThrottlingException",
-                            "ThrottledException",
-                            "Throttling",
-                            "SlowDownException",
-                            "SlowDown",
-                            "RequestTimeTooSkewedException",
-                            "RequestTimeTooSkewed",
-                            "RequestTimeoutException",
-                            "RequestTimeout",
-                            # Not really retryable, but we can use it to test the client behavior when the token is expired
-                            "ExpiredTokenException",
-                            ))
-
-    # https://github.com/googleapis/googleapis/blob/master/google/rpc/code.proto
-    # https://google.aip.dev/193
-    # https://docs.cloud.google.com/apis/docs/http#http_methods_verbs
-    gcp_error_names = list(
-        ({"UNKNOWN", 500}, {"DEADLINE_EXCEEDED", 504}, {"UNAUTHENTICATED", 401}, {"RESOURCE_EXHAUSTED", 429},
-         {"ABORTED", 409}, {"UNIMPLEMENTED", 501}, {"INTERNAL", 500}, {"UNAVAILABLE", 503}, {"DATA_LOSS", 500}))
+    error_names = list(("InternalFailureException",
+                        "InternalFailure",
+                        "InternalServerError",
+                        "InternalError",
+                        "RequestExpiredException",
+                        "RequestExpired",
+                        "ServiceUnavailableException",
+                        "ServiceUnavailableError",
+                        "ServiceUnavailable",
+                        "RequestThrottledException",
+                        "RequestThrottled",
+                        "ThrottlingException",
+                        "ThrottledException",
+                        "Throttling",
+                        "SlowDownException",
+                        "SlowDown",
+                        "RequestTimeTooSkewedException",
+                        "RequestTimeTooSkewed",
+                        "RequestTimeoutException",
+                        "RequestTimeout",
+                        # Not really retryable, but we can use it to test the client behavior when the token is expired
+                        "ExpiredTokenException",
+                        ))
 
     def __init__(self, policies, logger, minio_uri, max_retries, *args, **kwargs):
         self.minio_uri = minio_uri
@@ -147,13 +138,10 @@ class InjectingHandler(BaseHTTPRequestHandler):
 
         return policy
 
-    def get_retryable_aws_http_codes(self):
-        return random.choice(self.retryable_codes), random.choice(self.aws_error_names)
+    def get_retryable_http_codes(self):
+        return random.choice(self.retryable_codes), random.choice(self.error_names)
 
-    def get_retryable_gcp_http_codes(self):
-        return random.choice(self.retryable_codes), random.choice(self.gcp_error_names)
-
-    def respond_aws_with_error(self, reset_connection: bool):
+    def respond_with_error(self, reset_connection: bool):
         if reset_connection:
             try:
                 # Forcefully close the connection to simulate a connection reset
@@ -161,7 +149,7 @@ class InjectingHandler(BaseHTTPRequestHandler):
             except OSError:
                 pass
             return
-        code, error_name = self.get_retryable_aws_http_codes()
+        code, error_name = self.get_retryable_http_codes()
         self.send_response(code)
         self.send_header('Content-Type', 'text/plain; charset=utf-8')
         self.send_header('Connection', 'keep-alive')
@@ -177,42 +165,6 @@ class InjectingHandler(BaseHTTPRequestHandler):
         self.send_header('Content-Length', str(len(response)))
         self.end_headers()
         self.wfile.write(response)
-
-    def respond_gcp_with_error(self, reset_connection: bool):
-        if reset_connection:
-            try:
-                # Simulate a connection reset
-                self.request.shutdown_request()
-            except OSError:
-                pass
-            return
-
-        code = random.choice(self.retryable_codes + list((401,)))
-
-        self.send_response(code)
-        self.send_header('Content-Type', 'application/json; charset=utf-8')
-        self.send_header('Connection', 'keep-alive')
-
-        # Example GCP-style error payload
-        response = {
-            "error": {
-                "errors": [
-                    {
-                        "domain": "global",
-                        "reason": "someReason",
-                        "message": "Some Message"
-                    }
-                ],
-                "code": code,
-                "message": "Proxy injected error. " + (
-                    "Login Required" if code == 401 else "Client should retry.")
-            }
-        }
-
-        encoded = json.dumps(response).encode("utf-8")
-        self.send_header("Content-Length", str(len(encoded)))
-        self.end_headers()
-        self.wfile.write(encoded)
 
     def process_request(self):
         try:
@@ -237,7 +189,7 @@ class InjectingHandler(BaseHTTPRequestHandler):
 
             if policy.should_fail:
                 policy.error_count += 1
-                self.respond_aws_with_error(reset_connection=policy.server_should_fail)
+                self.respond_with_error(reset_connection=policy.server_should_fail)
             else:
                 # Once the request is successfully processed, we remove the policy from the cache to make following request to the resource being illegible to fail
                 self.policies.remove(self.path)
@@ -275,10 +227,11 @@ class InjectingHandler(BaseHTTPRequestHandler):
 # in the `self.req_states`, adding custom logger, etc. This server will be started automatically from `test.py`. In
 # addition, it is possible just to start this server using another script - `start_s3_proxy.py` to run it locally to
 # provide proxy between tests and minio
-class S3ProxyServer:
-    def __init__(self, host: str, port: int, minio_uri: str, max_retries: int, seed: int, logger):
+class ObjectStorageProxyServer:
+    def __init__(self, server_type: str, host: str, port: int, minio_uri: str, max_retries: int, seed: int, logger):
+        self.server_type = server_type.upper()
         self.logger = logger
-        self.logger.info('Setting minio proxy random seed to %s', seed)
+        self.logger.info('Setting proxy random seed to %s', seed)
         random.seed(seed)
         self.req_states = LRUCache(10000)
         handler = partial(InjectingHandler, self.req_states, logger, minio_uri, max_retries)
@@ -289,7 +242,8 @@ class S3ProxyServer:
         self.server.socket.settimeout(10000)
         self.server.socket.listen(1000)
         self.is_running = False
-        self.envs = {'PROXY_S3_SERVER_PORT': f'{port}', 'PROXY_S3_SERVER_HOST': f'{host}'}
+        self.envs = {'PROXY_' + self.server_type + '_SERVER_PORT': f'{port}',
+                     'PROXY_' + self.server_type + '_SERVER_HOST': f'{host}'}
 
     def _set_environ(self):
         for key, value in self.envs.items():
@@ -304,7 +258,7 @@ class S3ProxyServer:
 
     async def start(self):
         if not self.is_running:
-            self.logger.info('Starting S3 proxy server on %s', self.server.server_address)
+            self.logger.info(f'Starting {self.server_type} proxy server on %s', self.server.server_address)
             self._set_environ()
             loop = asyncio.get_running_loop()
             self.server_thread = loop.run_in_executor(None, self.server.serve_forever)
@@ -312,7 +266,7 @@ class S3ProxyServer:
 
     async def stop(self):
         if self.is_running:
-            self.logger.info('Stopping S3 proxy server')
+            self.logger.info(f'Stopping {self.server_type} proxy server')
             self._unset_environ()
             self.server.shutdown()
             await self.server_thread

@@ -32,7 +32,7 @@ from test.pylib.host_registry import HostRegistry
 from test.pylib.ldap_server import start_ldap
 from test.pylib.minio_server import MinioServer
 from test.pylib.resource_gather import get_resource_gather, setup_cgroup
-from test.pylib.s3_proxy import S3ProxyServer
+from test.pylib.s3_proxy import ObjectStorageProxyServer
 from test.pylib.s3_server_mock import MockS3Server
 from test.pylib.util import LogPrefixAdapter, get_xdist_worker_id
 
@@ -583,7 +583,8 @@ async def start_3rd_party_services(tempdir_base: pathlib.Path, toxiproxy_byte_li
     TestSuite.artifacts.add_exit_artifact(None, mock_s3_server.stop)
 
     minio_uri = f"http://{os.environ[ms.ENV_ADDRESS]}:{os.environ[ms.ENV_PORT]}"
-    proxy_s3_server = S3ProxyServer(
+    proxy_s3_server = ObjectStorageProxyServer(
+        server_type="s3",
         host=await hosts.lease_host(),
         port=9002,
         minio_uri=minio_uri,
@@ -595,9 +596,10 @@ async def start_3rd_party_services(tempdir_base: pathlib.Path, toxiproxy_byte_li
     TestSuite.artifacts.add_exit_artifact(None, proxy_s3_server.stop)
 
     gcs_uri = f"http://{os.environ[gcs.ENV_ADDRESS]}:{os.environ[gcs.ENV_PORT]}"
-    gcs_s3_server = S3ProxyServer(
+    gcs_s3_server = ObjectStorageProxyServer(
+        server_type="gcs",
         host=await hosts.lease_host(),
-        port=9003,
+        port=2010,
         minio_uri=gcs_uri,
         max_retries=3,
         seed=int(time.time()),

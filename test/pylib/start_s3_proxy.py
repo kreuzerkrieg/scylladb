@@ -5,7 +5,7 @@ import logging
 import signal
 import time
 
-from s3_proxy import S3ProxyServer
+from s3_proxy import ObjectStorageProxyServer
 
 
 async def run():
@@ -20,8 +20,8 @@ async def run():
     parser.add_argument('--rnd-seed', type=int, default=int(time.time()))
     args = parser.parse_args()
     logging.basicConfig(level=args.log_level)
-    server = S3ProxyServer(args.host, args.port, args.minio_uri, args.max_retries, args.rnd_seed,
-                           logging.getLogger('s3-proxy'))
+    server = ObjectStorageProxyServer("s3", args.host, args.port, args.minio_uri, args.max_retries, args.rnd_seed,
+                                      logging.getLogger('s3-proxy'))
 
     print('Starting S3 proxy server')
     await server.start()
