@@ -23,22 +23,7 @@ future<shared_ptr<tls::certificate_credentials>> utils::http::system_trust_crede
     co_return system_trust_credentials;
 }
 
-utils::http::dns_connection_factory::connection_resources::connection_resources(const std::string& host,
-                                                                        bool use_https,
-                                                                        shared_ptr<tls::certificate_credentials> creds,
-                                                                        logging::logger& logger)
-    : _creds(std::move(creds)), _host(host), _use_https(use_https), _logger(logger), _addr_update_gate("address_provider"), _addr_update_timer([this] {
-        auto gh = _addr_update_gate.hold();
-        // Can safely ignore the future here, as the gate will ensure the instance is held
-        std::ignore = [this]() -> future<> {
-            _logger.debug("Host resolution expired, re-resolving host {}", _host);
-            co_await renew_addresses();
-        }().finally([gh = std::move(gh)] {});;
-    }) {
-    _addr_update_timer.arm(lowres_clock::now());
-}
-
-future<> utils::http::dns_connection_factory::connection_resources::init_addresses() {
+future<> utils::http::dns_connection_factory::init_addresses() {
     _addr_init = false;
     auto hent = co_await net::dns::get_host_by_name(_host, net::inet_address::family::INET);
     _address_ttl = std::ranges::min_element(hent.addr_entries, [](const net::hostent::address_entry& lhs, const net::hostent::address_entry& rhs) {
@@ -59,7 +44,7 @@ future<> utils::http::dns_connection_factory::connection_resources::init_address
     _addr_init = true;
 }
 
-future<> utils::http::dns_connection_factory::connection_resources::init_credentials() {
+future<> utils::http::dns_connection_factory::init_credentials() {
     if (_use_https && !_creds) {
         _creds = co_await system_trust_credentials();
     }
@@ -69,7 +54,7 @@ future<> utils::http::dns_connection_factory::connection_resources::init_credent
     _logger.debug("Initialized credentials, tls={}", _creds == nullptr ? "no" : "yes");
 }
 
-future<net::inet_address> utils::http::dns_connection_factory::connection_resources::get_address() {
+future<net::inet_address> utils::http::dns_connection_factory::get_address() {
     if (!_addr_init) [[unlikely]] {
         auto units = co_await get_units(_init_semaphore, 1);
         if (!_addr_init) {
@@ -80,7 +65,7 @@ future<net::inet_address> utils::http::dns_connection_factory::connection_resour
     co_return _addr_list[_addr_pos++ % _addr_list.size()];
 }
 
-future<shared_ptr<tls::certificate_credentials>> utils::http::dns_connection_factory::connection_resources::get_creds() {
+future<shared_ptr<tls::certificate_credentials>> utils::http::dns_connection_factory::get_creds() {
     if (!_creds_init) [[unlikely]] {
         auto units = co_await get_units(_init_semaphore, 1);
         if (!_creds_init) {
@@ -91,18 +76,14 @@ future<shared_ptr<tls::certificate_credentials>> utils::http::dns_connection_fac
     co_return _creds;
 }
 
-future<> utils::http::dns_connection_factory::connection_resources::renew_addresses() {
+future<> utils::http::dns_connection_factory::renew_addresses() {
     co_await init_addresses();
 }
 
-future<> utils::http::dns_connection_factory::connection_resources::close() {
-    _addr_update_timer.cancel();
-    return _addr_update_gate.close();
-}
 
 future<connected_socket> utils::http::dns_connection_factory::connect() {
-    auto socket_addr = socket_address(co_await _provider.get_address(), _port);
-    if (auto creds = co_await _provider.get_creds()) {
+    auto socket_addr = socket_address(co_await get_address(), _port);
+    if (auto creds = co_await get_creds()) {
         _logger.debug("Making new HTTPS connection addr={} host={}", socket_addr, _host);
         co_return co_await tls::connect(creds, socket_addr, tls::tls_options{.server_name = _host});
     }
@@ -112,12 +93,24 @@ future<connected_socket> utils::http::dns_connection_factory::connect() {
 
 utils::http::dns_connection_factory::dns_connection_factory(dns_connection_factory&&) = default;
 
-utils::http::dns_connection_factory::dns_connection_factory(std::string host, int port, bool use_https, logging::logger& logger, shared_ptr<tls::certificate_credentials> certs)
+utils::http::dns_connection_factory::dns_connection_factory(
+    std::string host, int port, bool use_https, logging::logger& logger, shared_ptr<tls::certificate_credentials> certs)
     : _host(std::move(host))
     , _port(port)
     , _logger(logger)
-    , _provider(_host, use_https, std::move(certs), _logger)
-{}
+    , _creds(std::move(certs))
+    , _use_https(use_https)
+    , _addr_update_gate("address_provider")
+    , _addr_update_timer([this] {
+        auto gh = _addr_update_gate.hold();
+        // Can safely ignore the future here, as the gate will ensure the instance is held
+        std::ignore = [this]() -> future<> {
+            _logger.debug("Host resolution expired, re-resolving host {}", _host);
+            co_await renew_addresses();
+        }().finally([gh = std::move(gh)] {});
+    }) {
+    _addr_update_timer.arm(lowres_clock::now());
+}
 
 utils::http::dns_connection_factory::dns_connection_factory(std::string uri, logging::logger& logger, shared_ptr<tls::certificate_credentials> certs) 
     : dns_connection_factory([&] {
@@ -133,7 +126,8 @@ future<connected_socket> utils::http::dns_connection_factory::make(abort_source*
     co_return co_await connect();
 }
 future<> utils::http::dns_connection_factory::close() {
-    return _provider.close();
+    _addr_update_timer.cancel();
+    return _addr_update_gate.close();
 }
 
 static const char HTTPS[] = "https";
