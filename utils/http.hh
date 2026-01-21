@@ -27,22 +27,22 @@ protected:
     std::string _host;
     int _port;
     logging::logger& _logger;
-        semaphore _init_semaphore{1};
-        bool _addr_init = false;
-        bool _creds_init = false;
-        std::vector<net::inet_address> _addr_list;
-        shared_ptr<tls::certificate_credentials> _creds;
-        uint16_t _addr_pos{0};
-        bool _use_https;
-        std::chrono::seconds _address_ttl{0};
-        seastar::named_gate _addr_update_gate;
-        timer<lowres_clock> _addr_update_timer;
+    semaphore _init_semaphore{1};
+    bool _addr_init = false;
+    bool _creds_init = false;
+    std::vector<net::inet_address> _addr_list;
+    shared_ptr<tls::certificate_credentials> _creds;
+    uint16_t _addr_pos{0};
+    bool _use_https;
+    std::chrono::seconds _address_ttl{0};
+    seastar::named_gate _addr_update_gate;
+    timer<lowres_clock> _addr_update_timer;
 
-        future<> init_addresses();
-        future<> init_credentials();
-        future<net::inet_address> get_address();
-        future<shared_ptr<tls::certificate_credentials>> get_creds();
-        future<> renew_addresses();
+    future<> init_addresses();
+    future<> init_credentials();
+    future<net::inet_address> get_address();
+    future<shared_ptr<tls::certificate_credentials>> get_creds();
+    future<> renew_addresses();
     future<connected_socket> connect();
 public:
     dns_connection_factory(dns_connection_factory&&);
