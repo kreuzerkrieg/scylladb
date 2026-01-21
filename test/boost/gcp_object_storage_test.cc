@@ -263,3 +263,17 @@ SEASTAR_FIXTURE_TEST_CASE(test_merge_objects, local_gcs_wrapper, *check_gcp_stor
 }
 
 BOOST_AUTO_TEST_SUITE_END()
+
+SEASTAR_TEST_CASE(test) {
+    auto host = tests::getenv_safe("GCS_SERVER_ADDRESS");
+    auto port = tests::getenv_safe("GCS_SERVER_PORT");
+    auto endpoint = format("http://{}:{}", host, port);
+    std::cout << endpoint << std::endl;
+    auto client = std::make_unique<storage::client>(endpoint, std::nullopt /*, co_await google_credentials::get_default_credentials()*/);
+    co_await client->create_bucket("project", "test-bucket");
+    /*auto uuid = fmt::format("{}", utils::UUID_gen::get_time_UUID());
+    std::vector<temporary_buffer<char>> written;
+
+    co_await create_object_of_size(*client, "test-bucket", uuid, 11 * 1024, &written, {});*/
+    co_return;
+}
