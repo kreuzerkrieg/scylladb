@@ -30,7 +30,7 @@ future<> utils::http::dns_connection_factory::init_addresses() {
                        return lhs.ttl < rhs.ttl;
                    })->ttl;
     _addr_list = hent.addr_entries | std::views::transform(&net::hostent::address_entry::addr) | std::ranges::to<std::vector>();
-    _logger.debug("Initialized addresses={}", _addr_list);
+    _logger.debug("Initialized addresses={}", *_addr_list);
     if (_address_ttl.count() == 0) {
         // Zero values are interpreted to mean that the Resource
         // Record can only be used for the transaction in progress,
@@ -55,14 +55,21 @@ future<> utils::http::dns_connection_factory::init_credentials() {
 }
 
 future<net::inet_address> utils::http::dns_connection_factory::get_address() {
-    if (!_addr_init) [[unlikely]] {
-        auto units = co_await get_units(_init_semaphore, 1);
-        if (!_addr_init) {
-            co_await init_addresses();
+    // semaphore
+    if (!_addr_list) {
+        auto hent = co_await net::dns::get_host_by_name(_host, net::inet_address::family::INET);
+        _address_ttl = std::ranges::min_element(hent.addr_entries, [](const net::hostent::address_entry& lhs, const net::hostent::address_entry& rhs) {
+                           return lhs.ttl < rhs.ttl;
+                       })->ttl;
+        if (_address_ttl.count() == 0) {
+            co_return hent.addr_entries[_addr_pos++ % hent.addr_entries.size()].addr;
         }
+        _addr_list = hent.addr_entries | std::views::transform(&net::hostent::address_entry::addr) | std::ranges::to<std::vector>();
+        _addr_update_timer.rearm(lowres_clock::now() + _address_ttl);
     }
 
-    co_return _addr_list[_addr_pos++ % _addr_list.size()];
+    const auto& addresses = _addr_list.value();
+    co_return addresses[_addr_pos++ % addresses.size()];
 }
 
 future<shared_ptr<tls::certificate_credentials>> utils::http::dns_connection_factory::get_creds() {
@@ -81,8 +88,8 @@ future<> utils::http::dns_connection_factory::renew_addresses() {
 }
 
 
-future<connected_socket> utils::http::dns_connection_factory::connect() {
-    auto socket_addr = socket_address(co_await get_address(), _port);
+future<connected_socket> utils::http::dns_connection_factory::connect(net::inet_address address) {
+    auto socket_addr = socket_address(address, _port);
     if (auto creds = co_await get_creds()) {
         _logger.debug("Making new HTTPS connection addr={} host={}", socket_addr, _host);
         co_return co_await tls::connect(creds, socket_addr, tls::tls_options{.server_name = _host});
@@ -122,13 +129,15 @@ utils::http::dns_connection_factory::dns_connection_factory(std::string uri, log
 
 future<connected_socket> utils::http::dns_connection_factory::make(abort_source*) {
     try {
-        co_return co_await connect();
+        auto address = co_await get_address();
+        co_return co_await connect(address);
     } catch (...) {
         // On failure, forcefully renew address resolution and try again
         _logger.debug("Connection failed, resetting address provider and retrying: {}", std::current_exception());
     }
-    co_await renew_addresses();
-    co_return co_await connect();
+    _addr_list.reset();
+    auto address = co_await get_address();
+    co_return co_await connect(address);
 }
 future<> utils::http::dns_connection_factory::close() {
     _addr_update_timer.cancel();
