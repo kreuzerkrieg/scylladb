@@ -915,6 +915,14 @@ future<> sstables_loader::download_task_impl::run() {
         co_await _progress_per_shard.start();
         _progress_state = progress_state::initialized;
         co_await _loader.invoke_on_all([this, &sstables_on_shards, table_id] (sstables_loader& loader) mutable -> future<> {
+            llog.info("Restore on a shard {} triggered with following parameters, keyspace={}, table={}, sstables_count={}, scope={}, "
+                    "primary_replica_only={}",
+                    this_shard_id(),
+                    _ks,
+                    _cf,
+                    sstables_on_shards[this_shard_id()].size(),
+                    static_cast<int>(_scope),
+                    _primary_replica);
             co_await loader.load_and_stream(_ks, _cf, table_id, std::move(sstables_on_shards[this_shard_id()]), _primary_replica, false, _scope,
                                             _progress_per_shard.local().progress);
         });
