@@ -505,7 +505,7 @@ void set_sstables_loader(http_context& ctx, routes& r, sharded<sstables_loader>&
         auto bucket = req->get_query_param("bucket");
         auto prefix = req->get_query_param("prefix");
         auto scope = parse_stream_scope(req->get_query_param("scope"));
-        auto primary_replica_only = validate_bool_x(req->get_query_param("primary_replica_only"), false);
+        auto primary_replica_only = true; //validate_bool_x(req->get_query_param("primary_replica_only"), false);
 
         rjson::chunked_content content = co_await util::read_entire_stream(*req->content_stream);
         rjson::value parsed = rjson::parse(std::move(content));
