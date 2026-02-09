@@ -13,6 +13,7 @@
 #include "utils/UUID.hh"
 #include "utils/chunked_vector.hh"
 #include "cdc/generation_id.hh"
+#include "dht/token.hh"
 #include "locator/host_id.hh"
 
 #include <seastar/core/future.hh>
@@ -44,6 +45,8 @@ namespace db {
 struct sstable_info {
     utils::UUID id;
     sstring prefix;
+    dht::token first_token;
+    dht::token last_token;
 };
 
 class system_distributed_keyspace {

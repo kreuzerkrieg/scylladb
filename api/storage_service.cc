@@ -519,6 +519,17 @@ void set_sstables_loader(http_context& ctx, routes& r, sharded<sstables_loader>&
         co_return json::json_return_type(fmt::to_string(task_id));
     });
 
+    ss::tablet_aware_restore.set(r, [&sst_loader](std::unique_ptr<http::request> req) -> future<json::json_return_type> {
+        auto endpoint = req->get_query_param("endpoint");
+        auto keyspace = req->get_query_param("keyspace");
+        auto table = req->get_query_param("table");
+        auto bucket = req->get_query_param("bucket");
+        auto prefix = req->get_query_param("prefix");
+
+        auto task_id =
+            co_await sst_loader.local().download_new_sstables(keyspace, table, prefix, std::move(sstables), endpoint, bucket);
+        co_return json::json_return_type(fmt::to_string(task_id));
+    });
 }
 
 void unset_sstables_loader(http_context& ctx, routes& r) {
