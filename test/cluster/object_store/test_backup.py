@@ -16,6 +16,7 @@ from test.cluster.util import wait_for_cql_and_get_hosts, get_replication, new_t
 from test.pylib.rest_client import read_barrier
 from test.pylib.util import unique_name, wait_all
 from cassandra.cluster import ConsistencyLevel
+from cassandra.query import SimpleStatement
 from collections import defaultdict
 from test.pylib.util import wait_for
 import statistics
@@ -256,7 +257,8 @@ async def test_simple_backup_and_restore(manager: ManagerClient, object_storage,
             'system_key_directory': str(d),
             'user_info_encryption': { 'enabled': True, 'key_provider': 'LocalFileSystemKeyProviderFactory' }
         }
-    cmd = ['--logger-log-level', 'sstables_loader=debug:sstable_directory=trace:snapshots=trace:s3=trace:sstable=debug:http=debug:encryption=debug:api=info']
+    cmd = ['--logger-log-level', 'sstables_loader=debug:sstable_directory=trace:snapshots=trace:s3=trace:sstable=debug:http=debug:encryption=debug:api=info:sstables_tablet_aware_loader=debug']
+    # cmd = ['--default-log-level', 'trace']
     server = await manager.server_add(config=cfg, cmdline=cmd)
 
     cql = manager.get_cql()
@@ -303,6 +305,41 @@ async def test_simple_backup_and_restore(manager: ManagerClient, object_storage,
     status = await manager.api.wait_task(server.ip_addr, tid)
     assert (status is not None) and (status['state'] == 'done')
 
+    obj = object_storage.get_resource().Bucket(object_storage.bucket_name).Object(f"{prefix}/manifest.json")
+    body = obj.get()["Body"].read().decode("utf-8")
+    manifest = json.loads(body)
+    # --- Extract shared fields ---
+    snapshot_name = manifest["snapshot"]["name"]
+    keyspace = manifest["table"]["keyspace_name"]
+    table = manifest["table"]["table_name"]
+    datacenter = manifest["node"]["datacenter"]
+    rack = manifest["node"]["rack"]
+
+    # --- Insert one row per SSTable ---
+    for sstable in manifest["sstables"]:
+        cql_fmt = (
+            "INSERT INTO system_distributed.snapshot_sstables "
+            "(snapshot_name, \"keyspace\", \"table\", datacenter, rack, sstable_id, first_token, last_token, prefix, toc_name) "
+            "VALUES ('{}', '{}', '{}', '{}', '{}', {}, {}, {}, '{}', '{}') "
+            "USING TTL 100000000;"
+        )
+
+        statement = cql_fmt.format(
+            snapshot_name,
+            keyspace,
+            table,
+            datacenter,
+            rack,
+            sstable["id"],
+            sstable["first_token"],
+            sstable["last_token"],
+            prefix,
+            sstable["toc_name"],
+        )
+        cql_statement = SimpleStatement(statement, consistency_level=ConsistencyLevel.ONE)
+        print("Executing:", statement)
+        manager.get_cql().execute(cql_statement)
+
     print('Drop the table data and validate it\'s gone')
     cql.execute(f"TRUNCATE TABLE {ks}.{cf};")
     files = list_sstables()
@@ -313,7 +350,8 @@ async def test_simple_backup_and_restore(manager: ManagerClient, object_storage,
     assert len(objects) > 0
 
     print('Try to restore')
-    tid = await manager.api.restore(server.ip_addr, ks, cf, object_storage.address, object_storage.bucket_name, prefix, toc_names)
+    tid = await manager.api.tablet_aware_restore(server.ip_addr, keyspace, table, object_storage.address,
+                                                 object_storage.bucket_name, snapshot_name, datacenter, rack)
 
     if do_abort:
         await manager.api.abort_task(server.ip_addr, tid)
@@ -321,7 +359,8 @@ async def test_simple_backup_and_restore(manager: ManagerClient, object_storage,
     status = await manager.api.wait_task(server.ip_addr, tid)
     if not do_abort:
         assert status is not None
-        assert status['state'] == 'done'
+        assert status[
+                   'state'] == 'done', f"Unexpected task state: {status['state']}, expected 'done'. Full status: {status}"
         assert status['progress_units'] == 'batches'
         assert status['progress_completed'] == status['progress_total']
         assert status['progress_completed'] > 0
@@ -630,7 +669,7 @@ async def do_load_sstables(ks, cf, servers, topology, sstables, scope, manager, 
         servers_per_dc = defaultdict(list)
         for s in servers:
             servers_per_dc[s.datacenter].append(s)
-        
+
         for dc, sstables_in_dc in sstables_per_dc.items():
             for s in servers_per_dc[dc]:
                 if scope == 'node':
@@ -646,7 +685,7 @@ async def do_load_sstables(ks, cf, servers, topology, sstables, scope, manager, 
         for s, sstables_list in sstables.items():
             servers_per_dc_rack.setdefault(s.datacenter, defaultdict(list))[s.rack].append(s)
             sstables_per_dc_rack.setdefault(s.datacenter, defaultdict(list))[s.rack].extend(sstables_list)
-        for dc, racks in sstables_per_dc_rack.items(): 
+        for dc, racks in sstables_per_dc_rack.items():
             for rack, sstables_in_rack in racks.items():
                 if scope == 'rack':
                     assert topology.rf == topology.racks
@@ -738,7 +777,7 @@ async def test_restore_with_streaming_scopes(build_mode: str, manager: ManagerCl
 
     scopes = ['rack', 'dc'] if build_mode == 'debug' else ['all', 'dc', 'rack', 'node']
     restored_min_tablet_counts = [original_min_tablet_count] if build_mode == 'debug' else [2, original_min_tablet_count, 10]
-    
+
     schema, keys, replication_opts = await create_dataset(manager, ks, cf, topology, logger, num_keys=num_keys, min_tablet_count=original_min_tablet_count)
 
     # validate replicas assertions hold on fresh dataset
