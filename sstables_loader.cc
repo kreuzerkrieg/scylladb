@@ -1072,12 +1072,12 @@ public:
 
 protected:
     virtual future<> run() override {
-        (void)_loader; (void)_tid; (void)_snap_name; (void)_endpoint; (void)_bucket;
-        co_return; // To be implemented
+        co_await _loader.local()._ss.local().restore_tablets(_tid, _snap_name, _endpoint, _bucket);
     }
 };
 
 future<tasks::task_id> sstables_loader::restore_tablets(table_id tid, sstring keyspace, sstring table, sstring snap_name, sstring endpoint, sstring bucket, utils::chunked_vector<sstring> manifests) {
+    co_await populate_snapshot_sstables_from_manifests(_storage_manager, _sys_dist_ks, keyspace, table, endpoint, bucket, snap_name, std::move(manifests));
     auto task = co_await _task_manager_module->make_and_start_task<tablet_restore_task_impl>({}, container(), keyspace, tid, std::move(snap_name), std::move(endpoint), std::move(bucket));
     co_return task->id();
 }
