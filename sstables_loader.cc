@@ -32,6 +32,7 @@
 #include "service/storage_service.hh"
 #include "sstables_loader_helpers.hh"
 #include "db/system_distributed_keyspace.hh"
+#include "idl/sstables_loader.dist.hh"
 
 #include "sstables/object_storage_client.hh"
 #include "utils/rjson.hh"
@@ -856,9 +857,21 @@ sstables_loader::sstables_loader(sharded<replica::database>& db,
     , _sched_group(std::move(sg))
 {
     tm.register_module("sstables_loader", _task_manager_module);
+    ser::sstables_loader_rpc_verbs::register_restore_tablet(&_messaging, [this] (const rpc::client_info& cinfo, locator::global_tablet_id gid, sstring snap_name, sstring endpoint, sstring bucket) -> future<restore_result> {
+        llog.info("Downloading sstables for tablet {} from {}@{}/{}", gid, snap_name, endpoint, bucket);
+        try {
+            co_await download_tablet_sstables(gid, snap_name, endpoint, bucket);
+        } catch (...) {
+            llog.info("Error downloading sstables for tablet {}. Reason: {}", gid, std::current_exception());
+            throw;
+        }
+        llog.debug("Finished loading sstables for tablet {}", gid);
+        co_return restore_result{};
+    });
 }
 
 future<> sstables_loader::stop() {
+    co_await ser::sstables_loader_rpc_verbs::unregister(&_messaging),
     co_await _task_manager_module->stop();
 }
 
