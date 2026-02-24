@@ -79,6 +79,9 @@ public:
     /* This table is used by the backup and restore code to store per-sstable metadata.
      * The data the coordinator node puts in this table comes from the snapshot manifests. */
     static constexpr auto SNAPSHOT_SSTABLES = "snapshot_sstables";
+    /* This table is used by the backup and restore code to store per-table CQL schema metadata.
+     * The data the coordinator node puts in this table comes from the snapshot manifests. */
+    static constexpr auto SNAPSHOT_CQL_TABLES = "snapshot_cql_tables";
 
     /* Information required to modify/query some system_distributed tables, passed from the caller. */
     struct context {
@@ -137,6 +140,8 @@ public:
     future<> drop_service_level(sstring service_level_name) const;
     future<> insert_snapshot_sstable(sstring snapshot_name, sstring ks, sstring table, sstring dc, sstring rack, sstables::sstable_id sstable_id, dht::token first_token, dht::token last_token, sstring toc_name, sstring prefix, db::consistency_level cl = db::consistency_level::EACH_QUORUM);
     future<utils::chunked_vector<snapshot_sstable_entry>> get_snapshot_sstables(sstring snapshot_name, sstring ks, sstring table, sstring dc, sstring rack, db::consistency_level cl = db::consistency_level::LOCAL_QUORUM, std::optional<dht::token> start_token = std::nullopt, std::optional<dht::token> end_token = std::nullopt) const;
+    future<> insert_snapshot_cql_table(sstring snapshot_name, sstring ks, sstring table, bool is_view, sstring schema, db::consistency_level cl = db::consistency_level::EACH_QUORUM);
+    future<sstring> get_snapshot_cql_table_schema(sstring snapshot_name, sstring ks, sstring table, db::consistency_level cl = db::consistency_level::LOCAL_QUORUM) const;
 
 private:
     future<> create_tables(std::vector<schema_ptr> tables);
