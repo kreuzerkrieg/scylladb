@@ -174,7 +174,7 @@ future<> client::authorize(http::request& req) {
         }
     }
 
-    auto time_point_str = utils::aws::format_time_point(db_clock::now());
+    auto time_point_str = utils::aws::format_time_point(lowres_system_clock::now());
     auto time_point_st = time_point_str.substr(0, 8);
     req._headers["x-amz-date"] = time_point_str;
     req._headers["x-amz-content-sha256"] = "UNSIGNED-PAYLOAD";
@@ -336,7 +336,7 @@ http::experimental::client::reply_handler client::wrap_handler(http::request& re
             auto should_retry = possible_error->is_retryable();
             if (possible_error->get_error_type() == aws::aws_error_type::REQUEST_TIME_TOO_SKEWED) {
                 s3l.warn("Request failed with REQUEST_TIME_TOO_SKEWED. Machine time: {}, request timestamp: {}",
-                         utils::aws::format_time_point(db_clock::now()),
+                         utils::aws::format_time_point(lowres_system_clock::now()),
                          request.get_header("x-amz-date"));
                 should_retry = utils::http::retryable::yes;
                 co_await authorize(request);
@@ -453,6 +453,18 @@ future<stats> client::get_object_stats(sstring object_name, seastar::abort_sourc
         return make_ready_future<>();
     }, as);
     co_return st;
+}
+
+future<bool> client::object_exists(sstring object_name, seastar::abort_source* as) {
+    try {
+        co_await get_object_header(object_name, ignore_reply, as);
+    } catch (const storage_io_error& e) {
+        if (e.code().value() == ENOENT) {
+            co_return false;
+        }
+        throw;
+    }
+    co_return true;
 }
 
 static rapidxml::xml_node<>* first_node_of(rapidxml::xml_node<>* root,

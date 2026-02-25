@@ -298,6 +298,7 @@ future<> test_env::stop() {
         }
     }
     co_await _impl->mgr.close();
+    _impl->mgr.unplug_sstables_registry();
     co_await _impl->semaphore.stop();
 }
 
@@ -363,7 +364,6 @@ future<> test_env::do_with_async(noncopyable_function<void (test_env&)> func, te
             test_env env(std::move(cfg), *scf, &sstm.local());
             auto close_env = defer([&] { env.stop().get(); });
             env.manager().plug_sstables_registry(std::make_unique<mock_sstables_registry>());
-            auto unplu = defer([&env] { env.manager().unplug_sstables_registry(); });
             func(env);
         });
     }
