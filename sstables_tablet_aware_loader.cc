@@ -214,8 +214,10 @@ future<> sstables_loader::attach_sstable(table_id tid, const minimal_sst_info& m
     auto sst = sst_manager.make_sstable(
         table.schema(), table.get_storage_options(), min_info.generation, sstables::sstable_state::normal, min_info.version, min_info.format);
     sst->set_sstable_level(0);
-    co_await sst->load(table.get_effective_replication_map()->get_sharder(*table.schema()));
+    auto erm = table.get_effective_replication_map();
+    co_await sst->load(erm->get_sharder(*table.schema()));
     co_await table.add_sstable_and_update_cache(sst);
+    co_return;
 }
 
 future<> sstables_loader::load_snapshot_sstables(locator::global_tablet_id tid, sstring snap_name, sstring endpoint, sstring bucket) {
