@@ -27,6 +27,7 @@
 #include "replica/database_fwd.hh"
 #include "tasks/task_handler.hh"
 #include "service/storage_proxy.hh"
+#include "replica/schema_describe_helper.hh"
 
 #include "test/lib/test_utils.hh"
 #include "test/lib/random_utils.hh"
@@ -168,4 +169,49 @@ SEASTAR_TEST_CASE(test_snapshot_cql_tables_api_works, *boost::unit_test::precond
 
         BOOST_CHECK_EQUAL(result_schema, schema);
     }, db_cfg_ptr);
+}
+
+sstring verify_tablet_options(cql_test_env& env, table_id tid, size_t desired_count, bool hints_expected) {
+    auto schema = env.local_db().find_schema(tid);
+    auto schema_desc = schema->describe(replica::make_schema_describe_helper(schema, env.local_db().as_data_dictionary()), cql3::describe_option::STMTS);
+    auto create_stmt = schema_desc.create_statement.value().linearize();
+
+    auto min_tablet_count = fmt::format("'min_tablet_count': '{}'", desired_count);
+    auto max_tablet_count = fmt::format("'max_tablet_count': '{}'", desired_count);
+
+    BOOST_CHECK_EQUAL(create_stmt.find(min_tablet_count) != sstring::npos, hints_expected);
+    BOOST_CHECK_EQUAL(create_stmt.find(max_tablet_count) != sstring::npos, hints_expected);
+
+    return create_stmt;
+}
+
+SEASTAR_TEST_CASE(test_restore_recreate_table_with_tablet_hints, *boost::unit_test::precondition(tests::has_scylla_test_env)) {
+    auto db_cfg_ptr = make_shared<db::config>();
+    db_cfg_ptr->tablets_mode_for_new_keyspaces(db::tablets_mode_t::mode::enabled);
+
+    return do_with_some_data_in_thread({"cf"}, [] (cql_test_env& env) {
+        table_id tid = env.local_db().find_uuid("ks", "cf");
+
+        auto token_metadata = env.local_db().get_token_metadata_ptr();
+        auto& tmap = token_metadata->tablets().get_tablet_map(tid);
+        auto desired_count = tmap.tablet_count();
+
+        auto initial_create_stmt = verify_tablet_options(env, tid, desired_count, false);
+
+        replica::recreate_table_with_tablet_hints("snapshot", "ks", tid,
+                                                            desired_count, desired_count,
+                                                            env.local_db(),
+                                                            env.get_system_distributed_keyspace().local(),
+                                                            env.get_storage_proxy().local(), env.migration_manager().local(),
+                                                            db::consistency_level::ONE).get();
+
+        tid = env.local_db().find_uuid("ks", "cf");
+        auto create_stmt = verify_tablet_options(env, tid, desired_count, true);
+
+        // throws if the table is not found
+        auto stored_schema = env.get_system_distributed_keyspace().local().get_snapshot_cql_table_schema("snapshot", "ks", "cf", db::consistency_level::ONE).get();
+        BOOST_CHECK_EQUAL(stored_schema, initial_create_stmt);
+        BOOST_CHECK_NE(stored_schema, create_stmt);
+
+    }, false, db_cfg_ptr, 10);
 }
