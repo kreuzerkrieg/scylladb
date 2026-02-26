@@ -110,7 +110,7 @@ future<minimal_sst_info> sstables_loader::download_sstable(table_id tid, sstable
                 if (shards.size() != 1) {
                     on_internal_error(tall, "Fully-contained sstable must belong to one shard only");
                 }
-                tall.debug("SSTable shards {}", fmt::join(shards, ", "));
+                tall.debug("SSTable shards {} for SSTable {}", fmt::join(shards, ", "), sst->toc_filename());
                 co_return minimal_sst_info{shards.front(), gen, descriptor.version, descriptor.format};
             }
         } catch (...) {
@@ -155,7 +155,6 @@ future<utils::chunked_vector<db::sstable_info>> sstables_loader::get_owned_sstab
 }
 
 future<std::vector<std::vector<minimal_sst_info>>> sstables_loader::get_snapshot_sstables(locator::global_tablet_id tid, sstring snap_name, sstring endpoint, sstring bucket) const {
-    std::vector<std::vector<minimal_sst_info>> min_infos(smp::count);
     const auto& topo = _db.local().get_token_metadata().get_topology();
     auto s = _db.local().find_schema(tid.table);
     auto sst_infos = co_await _sys_dist_ks.get_snapshot_sstables(snap_name, s->ks_name(), s->cf_name(), topo.get_datacenter(), topo.get_rack());
@@ -168,7 +167,7 @@ future<std::vector<std::vector<minimal_sst_info>>> sstables_loader::get_snapshot
     tall.debug("{} SSTables owned by this node tablets", owned_sstables.size());
     if (owned_sstables.empty()) {
         // It can happen that a tablet exists and contains no data. Just skip it
-        co_return min_infos;
+        co_return std::vector<std::vector<minimal_sst_info>>(smp::count);
     }
 
     auto ep_type = _storage_manager.get_endpoint_type(endpoint);
@@ -188,18 +187,27 @@ future<std::vector<std::vector<minimal_sst_info>>> sstables_loader::get_snapshot
             // TODO
             return nullptr;
         });
-    co_await smp::invoke_on_all([this, tid, &sstables_on_shards, &min_infos] -> future<> {
-        auto sst_chunk = std::move(sstables_on_shards[this_shard_id()]);
-        co_await max_concurrent_for_each(sst_chunk, 16, [this, tid, &min_infos](const auto& sst) -> future<> {
-            auto min_info = co_await download_sstable(tid.table, sst);
-            min_infos[min_info.shard].emplace_back(std::move(min_info));
-        });
-    });
 
-    co_return min_infos;
+    co_return co_await container().map_reduce0(
+        [this, tid, &sstables_on_shards](auto&) -> future<std::vector<std::vector<minimal_sst_info>>> {
+            auto sst_chunk = std::move(sstables_on_shards[this_shard_id()]);
+            std::vector<std::vector<minimal_sst_info>> local_min_infos(smp::count);
+            co_await max_concurrent_for_each(sst_chunk, 16, [this, tid, &local_min_infos](const auto& sst) -> future<> {
+                auto min_info = co_await download_sstable(tid.table, sst);
+                local_min_infos[min_info.shard].emplace_back(std::move(min_info));
+            });
+            co_return local_min_infos;
+        },
+        std::vector<std::vector<minimal_sst_info>>(smp::count),
+        [](auto init, auto&& item) -> std::vector<std::vector<minimal_sst_info>> {
+            for (std::size_t i = 0; i < item.size(); ++i) {
+                init[i].append_range(std::move(item[i]));
+            }
+            return init;
+        });
 }
 
-future<> sstables_loader::attach_sstable(shard_id from_shard, table_id tid, const minimal_sst_info& min_info) const {
+future<> sstables_loader::attach_sstable(table_id tid, const minimal_sst_info& min_info) const {
     auto& db = _db.local();
     auto& table = db.find_column_family(tid);
     auto& sst_manager = table.get_sstables_manager();
@@ -213,9 +221,9 @@ future<> sstables_loader::attach_sstable(shard_id from_shard, table_id tid, cons
 future<> sstables_loader::load_snapshot_sstables(locator::global_tablet_id tid, sstring snap_name, sstring endpoint, sstring bucket) {
     try {
         auto downloaded_ssts = co_await get_snapshot_sstables(tid, snap_name, endpoint, bucket);
-        co_await smp::invoke_on_all([this, tid, &downloaded_ssts, from = this_shard_id()] -> future<> {
+        co_await smp::invoke_on_all([this, tid, &downloaded_ssts] -> future<> {
             auto shard_ssts = std::move(downloaded_ssts[this_shard_id()]);
-            co_await max_concurrent_for_each(shard_ssts, 16, [this, tid, from](const auto& min_info) -> future<> { co_await attach_sstable(from, tid.table, min_info); });
+            co_await max_concurrent_for_each(shard_ssts, 16, [this, tid](const auto& min_info) -> future<> { co_await attach_sstable(tid.table, min_info); });
         });
     } catch (...) {
         tall.info("Error loading snapshot SSTables. Reason: {}", std::current_exception());

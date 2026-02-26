@@ -108,7 +108,7 @@ private:
     future<std::vector<std::vector<minimal_sst_info>>> get_snapshot_sstables(locator::global_tablet_id tid, sstring snap_name, sstring endpoint, sstring bucket) const;
     future<utils::chunked_vector<db::sstable_info>> get_owned_sstables(locator::global_tablet_id, utils::chunked_vector<db::sstable_info> sst_infos) const;
     future<minimal_sst_info> download_sstable(table_id tid, sstables::shared_sstable sstable) const;
-    future<> attach_sstable(shard_id from_shard, table_id tid, const minimal_sst_info& min_info) const;
+    future<> attach_sstable(table_id tid, const minimal_sst_info& min_info) const;
 
 public:
     sstables_loader(sharded<replica::database>& db,

@@ -78,6 +78,7 @@
 
 #include <boost/range/join.hpp>
 #include <seastar/core/metrics_registration.hh>
+#include <seastar/util/short_streams.hh>
 #include "utils/labels.hh"
 
 #include "sstables/sstables_manager.hh"
