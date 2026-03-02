@@ -31,6 +31,7 @@
 #include "message/messaging_service.hh"
 #include "service/storage_service.hh"
 #include "sstables_loader_helpers.hh"
+#include "db/system_distributed_keyspace.hh"
 
 #include "sstables/object_storage_client.hh"
 #include "utils/rjson.hh"
@@ -873,6 +874,75 @@ future<tasks::task_id> sstables_loader::download_new_sstables(sstring ks_name, s
                                                                                        std::move(prefix), std::move(sstables), scope, primary_replica_only(primary_replica));
     co_return task->id();
 }
+
+future<> sstables_loader::attach_sstable(table_id tid, const minimal_sst_info& min_info) const {
+    auto& db = _db.local();
+    auto& table = db.find_column_family(tid);
+    llog.debug("Adding downloaded SSTables to the table {} on shard {}", table.schema()->cf_name(), this_shard_id());
+    auto& sst_manager = table.get_sstables_manager();
+    auto sst = sst_manager.make_sstable(
+        table.schema(), table.get_storage_options(), min_info.generation, sstables::sstable_state::normal, min_info.version, min_info.format);
+    sst->set_sstable_level(0);
+    auto erm = table.get_effective_replication_map();
+    co_await sst->load(erm->get_sharder(*table.schema()));
+    co_await table.add_sstable_and_update_cache(sst);
+}
+
+future<> sstables_loader::download_tablet_sstables(locator::global_tablet_id tid, sstring snap_name, sstring endpoint, sstring bucket) {
+    auto s = _db.local().find_schema(tid.table);
+    const auto& tm = _db.local().get_token_metadata();
+    auto tablet_range = tm.tablets().get_tablet_map(tid.table).get_token_range(tid.tablet);
+    const auto& topo = tm.get_topology();
+
+    auto sst_infos = co_await _sys_dist_ks.get_snapshot_sstables(snap_name, s->ks_name(), s->cf_name(), topo.get_datacenter(), topo.get_rack());
+    llog.debug("{} SSTables found", sst_infos.size(), tid);
+    if (sst_infos.empty()) {
+        throw std::runtime_error(format("No SSTables found in system_distributed.snapshot_sstables for {}", snap_name));
+    }
+
+    auto [ fully, partially ] = co_await get_sstables_for_tablet(sst_infos, tablet_range, [] (const auto& si) { return si.first_token; }, [] (const auto& si) { return si.last_token; });
+    if (!partially.empty()) {
+        llog.debug("Sstable {} is partially contained", partially.front().sstable_id);
+        throw std::logic_error("sstables_partially_contained");
+    }
+    llog.debug("{} SSTables owned by this node tablets", fully.size());
+    if (fully.empty()) {
+        // It can happen that a tablet exists and contains no data. Just skip it
+        co_return;
+    }
+
+    auto ep_type = _storage_manager.get_endpoint_type(endpoint);
+    sstables::sstable_open_config cfg {
+        .load_bloom_filter = false,
+    };
+    auto [_, sstables_on_shards] = co_await replica::distributed_loader::get_sstables_from_object_store(_db, s->ks_name(), s->cf_name(),
+        fully | std::views::transform(&db::snapshot_sstable_entry::toc_name) | std::ranges::to<std::vector>(), endpoint, ep_type, bucket, fully.front().prefix, cfg, [&] { return nullptr; });
+
+    auto downloaded_ssts = co_await container().map_reduce0(
+        [tid, &sstables_on_shards](auto& loader) -> future<std::vector<std::vector<minimal_sst_info>>> {
+            auto sst_chunk = std::move(sstables_on_shards[this_shard_id()]);
+            std::vector<std::vector<minimal_sst_info>> local_min_infos(smp::count);
+            co_await max_concurrent_for_each(sst_chunk, 16, [&loader, tid, &local_min_infos](const auto& sst) -> future<> {
+                auto& table = loader._db.local().find_column_family(tid.table);
+                auto min_info = co_await download_sstable(loader._db.local(), table, sst, llog);
+                local_min_infos[min_info.shard].emplace_back(std::move(min_info));
+            });
+            co_return local_min_infos;
+        },
+        std::vector<std::vector<minimal_sst_info>>(smp::count),
+        [](auto init, auto&& item) -> std::vector<std::vector<minimal_sst_info>> {
+            for (std::size_t i = 0; i < item.size(); ++i) {
+                init[i].append_range(std::move(item[i]));
+            }
+            return init;
+        });
+
+    co_await container().invoke_on_all([tid, &downloaded_ssts] (auto& loader) -> future<> {
+        auto shard_ssts = std::move(downloaded_ssts[this_shard_id()]);
+        co_await max_concurrent_for_each(shard_ssts, 16, [&loader, tid](const auto& min_info) -> future<> { co_await loader.attach_sstable(tid.table, min_info); });
+    });
+}
+
 future<std::vector<tablet_sstable_collection>> get_sstables_for_tablets_for_tests(const std::vector<sstables::shared_sstable>& sstables,
                                                                                   std::vector<dht::token_range>&& tablets_ranges) {
     return tablet_sstable_streamer::get_sstables_for_tablets(sstables, std::move(tablets_ranges));

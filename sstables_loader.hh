@@ -16,13 +16,15 @@
 #include "sstables/shared_sstable.hh"
 #include "tasks/task_manager.hh"
 #include "db/consistency_level_type.hh"
-
+#include "locator/tablets.hh"
 
 using namespace seastar;
 
 namespace replica {
 class database;
 }
+
+struct minimal_sst_info;
 
 namespace sstables { class storage_manager; }
 
@@ -100,6 +102,9 @@ private:
             shared_ptr<stream_progress> progress);
 
     future<seastar::shared_ptr<const locator::effective_replication_map>> await_topology_quiesced_and_get_erm(table_id table_id);
+    future<> download_tablet_sstables(locator::global_tablet_id tid, sstring snap_name, sstring endpoint, sstring bucket);
+    future<> attach_sstable(table_id tid, const minimal_sst_info& min_info) const;
+
 public:
     sstables_loader(sharded<replica::database>& db,
             sharded<service::storage_service>& ss,
