@@ -524,6 +524,10 @@ public:
         return *_storage;
     }
 
+    storage& get_storage_for_tests() {
+        return *_storage;
+    }
+
 private:
     friend struct component_name;
     friend class sstable_stream_sink_impl;
