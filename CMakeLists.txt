@@ -56,9 +56,13 @@ set(CMAKE_VISIBILITY_INLINES_HIDDEN ON)
 add_compile_definitions(SEASTAR_NO_EXCEPTION_HACK)
 # Hacks needed to expose internal APIs for xxhash dependencies
 add_compile_definitions(XXH_PRIVATE_API)
-# Define SEASTAR_TESTING_MAIN globally, matching configure.py behavior.
-# Some test files #undef this when they don't need it.
-add_compile_definitions(SEASTAR_TESTING_MAIN)
+# Note: SEASTAR_TESTING_MAIN is NOT defined globally here (unlike configure.py)
+# because in CMake single-config builds, seastar is added as a subdirectory and
+# global definitions leak into seastar's own targets. This causes a duplicate
+# 'main' symbol in seastar_testing (both entry_point.cc and seastar_test.cc
+# would define main via seastar_test.hh).
+# Instead, SEASTAR_TESTING_MAIN is defined per-target in test/CMakeLists.txt
+# for SEASTAR-kind tests that need it.
 
 if(is_multi_config)
     find_package(Seastar)
@@ -180,6 +184,50 @@ file(MAKE_DIRECTORY "${scylla_gen_build_dir}")
 
 include(add_version_library)
 generate_scylla_version()
+
+# Pre-generate ragel headers at configure time if they don't exist.
+# These generated headers (request_parser.hh, response_parser.hh, chunk_parsers.hh)
+# are included transitively through stdafx.hh (the precompiled header).
+# Without them, the PCH compilation fails during IDE compiler probes that run
+# after configure but before any build targets are built.
+if(NOT ragel_RAGEL_EXECUTABLE)
+  find_program(ragel_RAGEL_EXECUTABLE ragel)
+endif()
+if(ragel_RAGEL_EXECUTABLE)
+  if(is_multi_config)
+    foreach(config ${CMAKE_CONFIGURATION_TYPES})
+      set(_seastar_gen_dir "${CMAKE_BINARY_DIR}/${config}/seastar/gen/include/seastar/http")
+      foreach(_parser chunk_parsers request_parser response_parser)
+        if(NOT EXISTS "${_seastar_gen_dir}/${_parser}.hh")
+          file(MAKE_DIRECTORY "${_seastar_gen_dir}")
+          execute_process(
+            COMMAND ${ragel_RAGEL_EXECUTABLE} -G2
+              -o "${_seastar_gen_dir}/${_parser}.hh"
+              "${CMAKE_CURRENT_SOURCE_DIR}/seastar/src/http/${_parser}.rl"
+            RESULT_VARIABLE _ragel_result)
+          if(NOT _ragel_result EQUAL 0)
+            message(WARNING "Failed to pre-generate ${_parser}.hh for config ${config}")
+          endif()
+        endif()
+      endforeach()
+    endforeach()
+  else()
+    set(_seastar_gen_dir "${CMAKE_BINARY_DIR}/seastar/gen/include/seastar/http")
+    foreach(_parser chunk_parsers request_parser response_parser)
+      if(NOT EXISTS "${_seastar_gen_dir}/${_parser}.hh")
+        file(MAKE_DIRECTORY "${_seastar_gen_dir}")
+        execute_process(
+          COMMAND ${ragel_RAGEL_EXECUTABLE} -G2
+            -o "${_seastar_gen_dir}/${_parser}.hh"
+            "${CMAKE_CURRENT_SOURCE_DIR}/seastar/src/http/${_parser}.rl"
+          RESULT_VARIABLE _ragel_result)
+        if(NOT _ragel_result EQUAL 0)
+          message(WARNING "Failed to pre-generate ${_parser}.hh")
+        endif()
+      endif()
+    endforeach()
+  endif()
+endif()
 
 option(Scylla_USE_PRECOMPILED_HEADER "Use precompiled header for Scylla" ON)
 add_library(scylla-precompiled-header STATIC exported_templates.cc)
