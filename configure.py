@@ -277,16 +277,20 @@ def generate_compdb(compdb, ninja, buildfile, modes):
                 subprocess.run(['./scripts/merge-compdb.py', ninja_compdb.name + ':' + mode_out] + submodule_compdbs, 
                                stdout=combined_mode_specific_compdb)
 
-    # sort modes by supposed indexing speed
-    for mode in ['dev', 'debug', 'release', 'sanitize']:
+    # Create a root symlink for IDE/tooling convenience (clangd, CLion, etc.).
+    # Point it to the first selected mode's compdb. If multiple modes are
+    # selected, prefer them in this order (lightest for indexing first).
+    preference = ['dev', 'debug', 'release', 'sanitize', 'coverage']
+    preferred = sorted(modes, key=lambda m: preference.index(m) if m in preference else len(preference))
+    for mode in preferred:
         compdb_target = outdir + '/' + mode + '/' + compdb
         if os.path.exists(compdb_target):
+            # Always update the symlink to match the current configuration.
             try:
-                os.symlink(compdb_target, compdb)
-            except FileExistsError:
-                # if there is already a valid compile_commands.json link in the
-                # source root, we are done.
+                os.remove(compdb)
+            except FileNotFoundError:
                 pass
+            os.symlink(compdb_target, compdb)
             return
 
 

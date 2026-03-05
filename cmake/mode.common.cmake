@@ -131,6 +131,7 @@ function(maybe_limit_stack_usage_in_KB stack_usage_threshold_in_KB config)
   check_cxx_compiler_flag(${_stack_usage_threshold_flag} _stack_usage_flag_supported)
   if(_stack_usage_flag_supported)
     add_compile_options($<$<CONFIG:${config}>:${_stack_usage_threshold_flag}>)
+    add_compile_options($<$<CONFIG:${config}>:-Wno-error=stack-usage=>)
   endif()
 endfunction()
 

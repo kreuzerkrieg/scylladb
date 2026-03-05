@@ -51,6 +51,15 @@ set(CMAKE_CXX_EXTENSIONS ON CACHE INTERNAL "")
 set(CMAKE_CXX_SCAN_FOR_MODULES OFF CACHE INTERNAL "")
 set(CMAKE_VISIBILITY_INLINES_HIDDEN ON)
 
+# Global defines matching configure.py
+# Since gcc 13, libgcc doesn't need the exception workaround
+add_compile_definitions(SEASTAR_NO_EXCEPTION_HACK)
+# Hacks needed to expose internal APIs for xxhash dependencies
+add_compile_definitions(XXH_PRIVATE_API)
+# Define SEASTAR_TESTING_MAIN globally, matching configure.py behavior.
+# Some test files #undef this when they don't need it.
+add_compile_definitions(SEASTAR_TESTING_MAIN)
+
 if(is_multi_config)
     find_package(Seastar)
     # this is atypical compared to standard ExternalProject usage:
@@ -98,10 +107,14 @@ else()
     set(Seastar_IO_URING ON CACHE BOOL "" FORCE)
     set(Seastar_SCHEDULING_GROUPS_COUNT 21 CACHE STRING "" FORCE)
     set(Seastar_UNUSED_RESULT_ERROR ON CACHE BOOL "" FORCE)
+    # Match configure.py's build_seastar_shared_libs: Debug and Dev
+    # build Seastar as a shared library, others build it static.
+    if(CMAKE_BUILD_TYPE STREQUAL "Debug" OR CMAKE_BUILD_TYPE STREQUAL "Dev")
+        set(BUILD_SHARED_LIBS ON CACHE BOOL "" FORCE)
+    else()
+        set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+    endif()
     add_subdirectory(seastar)
-    target_compile_definitions (seastar
-      PRIVATE
-        SEASTAR_NO_EXCEPTION_HACK)
 endif()
 
 set(ABSL_PROPAGATE_CXX_STD ON CACHE BOOL "" FORCE)
@@ -140,6 +153,10 @@ set_target_properties(absl_strerror PROPERTIES EXCLUDE_FROM_ALL TRUE)
 # System libraries dependencies
 find_package(Boost REQUIRED
     COMPONENTS filesystem program_options system thread regex unit_test_framework)
+# When using shared Boost libraries, define BOOST_ALL_DYN_LINK (matching configure.py)
+if(NOT Boost_USE_STATIC_LIBS)
+    add_compile_definitions(BOOST_ALL_DYN_LINK)
+endif()
 target_link_libraries(Boost::regex
   INTERFACE
     ICU::i18n
