@@ -158,13 +158,16 @@ static void assert_table_sstable_count(table_for_tests& t, size_t expected_count
 }
 
 static void corrupt_sstable(sstables::shared_sstable sst) {
-    auto f = open_file_dma(sstables::test(sst).filename(component_type::Data).native(), open_flags::wo).get();
+    auto f = sst->readable_file_for_all_components().get()[component_type::Data];
     auto close_f = deferred_close(f);
     const auto wbuf_align = f.memory_dma_alignment();
-    const auto wbuf_len = f.disk_write_dma_alignment();
+    const auto wbuf_len = f.size().get();
     auto wbuf = seastar::temporary_buffer<char>::aligned(wbuf_align, wbuf_len);
     std::fill(wbuf.get_write(), wbuf.get_write() + wbuf_len, 0xba);
-    f.dma_write(0, wbuf.get(), wbuf_len).get();
+    auto os = output_stream<char>(sst->get_storage_for_tests().make_component_sink(*sst, component_type::Data, open_flags::wo, {}).get());
+    auto close_os = deferred_close(os);
+    os.write(std::move(wbuf)).get();
+    os.flush().get();
 }
 
 SEASTAR_TEST_CASE(compaction_manager_basic_test) {
@@ -508,7 +511,7 @@ SEASTAR_TEST_CASE(compact_02) {
 template <typename ExceptionType>
 static void compact_corrupted_by_compression_mode(const std::string& tname,
         compress_sstable compress,
-        compaction::compaction_type_options&& options,
+        compaction::compaction_type_options options,
         const sstring& error_msg)
 {
     test_env::do_with_async([&] (test_env& env) {
@@ -562,13 +565,16 @@ static void compact_corrupted_by_compression_mode(const std::string& tname,
 
         sst = make_sstable_containing(env.make_sstable(schema), muts);
         {
-            auto f = open_file_dma(sstables::test(sst).filename(component_type::Digest).native(), open_flags::rw).get();
+            auto f = sst->readable_file_for_all_components().get()[component_type::Digest];
             auto stream = make_file_input_stream(f);
             auto close_stream = deferred_close(stream);
             auto digest_str = util::read_entire_stream_contiguous(stream).get();
             auto digest = boost::lexical_cast<uint32_t>(digest_str);
             auto new_digest = to_sstring<bytes>(digest + 1); // a random invalid digest
-            f.dma_write(0, new_digest.c_str(), new_digest.size()).get();
+            auto os = output_stream<char>(sst->get_storage_for_tests().make_component_sink(*sst, component_type::Digest, open_flags::wo | open_flags::truncate, {}).get());
+            auto close_os = deferred_close(os);
+            os.write(std::move(new_digest)).get();
+            os.flush().get();
         }
         test_failing_compact(schema, {sst}, error_msg, "Digest mismatch");
     }).get();
@@ -577,7 +583,7 @@ static void compact_corrupted_by_compression_mode(const std::string& tname,
 template <typename ExceptionType>
 static void compact_corrupted(const std::string& tname, compaction::compaction_type_options&& options, const sstring& error_msg) {
     for (const auto& compress : {compress_sstable::no, compress_sstable::yes}) {
-        compact_corrupted_by_compression_mode<ExceptionType>(tname, compress, std::move(options), error_msg);
+        compact_corrupted_by_compression_mode<ExceptionType>(tname, compress, options, error_msg);
     }
 }
 
@@ -636,7 +642,7 @@ static shared_sstable add_sstable_for_overlapping_test(test_env& env, lw_shared_
     column_family_test(cf).add_sstable(sst).get();
     return sst;
 }
-static shared_sstable sstable_for_overlapping_test(test_env& env, const schema_ptr& schema,
+static shared_sstable sstable_for_overlapping_test(test_env& env, schema_ptr schema,
         const partition_key& first_key, const partition_key& last_key, uint32_t level = 0) {
     auto sst = env.make_sstable(schema);
     sstables::test(sst).set_values_for_leveled_strategy(1 /* size */, level, 0 /* max_timestamp */, first_key, last_key);
@@ -661,7 +667,8 @@ static bool sstable_overlaps(const lw_shared_ptr<replica::column_family>& cf, ss
 SEASTAR_TEST_CASE(leveled_01) {
   BOOST_REQUIRE_EQUAL(smp::count, 1);
   return test_env::do_with_async([] (test_env& env) {
-    auto cf = env.make_table_for_tests();
+    auto schema = simple_schema().schema();
+    auto cf = env.make_table_for_tests(schema);
     auto stop_cf = deferred_stop(cf);
 
     const auto keys = tests::generate_partition_keys(50, cf.schema());
@@ -702,7 +709,8 @@ SEASTAR_TEST_CASE(leveled_01) {
 SEASTAR_TEST_CASE(leveled_02) {
   BOOST_REQUIRE_EQUAL(smp::count, 1);
   return test_env::do_with_async([] (test_env& env) {
-    auto cf = env.make_table_for_tests();
+    auto schema = simple_schema().schema();
+    auto cf = env.make_table_for_tests(schema);
     auto stop_cf = deferred_stop(cf);
 
     const auto keys = tests::generate_partition_keys(50, cf.schema());
@@ -753,7 +761,8 @@ SEASTAR_TEST_CASE(leveled_02) {
 SEASTAR_TEST_CASE(leveled_03) {
   BOOST_REQUIRE_EQUAL(smp::count, 1);
   return test_env::do_with_async([] (test_env& env) {
-    auto cf = env.make_table_for_tests();
+    auto schema = simple_schema().schema();
+    auto cf = env.make_table_for_tests(schema);
     auto stop_cf = deferred_stop(cf);
 
     const auto keys = tests::generate_partition_keys(50, cf.schema());
@@ -805,7 +814,8 @@ SEASTAR_TEST_CASE(leveled_03) {
 SEASTAR_TEST_CASE(leveled_04) {
   BOOST_REQUIRE_EQUAL(smp::count, 1);
   return test_env::do_with_async([] (test_env& env) {
-    auto cf = env.make_table_for_tests();
+    auto schema = simple_schema().schema();
+    auto cf = env.make_table_for_tests(schema);
     auto stop_cf = deferred_stop(cf);
 
     const auto keys = tests::generate_partition_keys(50, cf.schema());
@@ -884,7 +894,8 @@ SEASTAR_TEST_CASE(leveled_05) {
 SEASTAR_TEST_CASE(leveled_06) {
     // Test that we can compact a single L1 compaction into an empty L2.
   return test_env::do_with_async([] (test_env& env) {
-    auto cf = env.make_table_for_tests();
+    auto schema = simple_schema().schema();
+    auto cf = env.make_table_for_tests(schema);
     auto stop_cf = deferred_stop(cf);
 
     auto max_sstable_size_in_mb = 1;
@@ -916,7 +927,8 @@ SEASTAR_TEST_CASE(leveled_06) {
 
 SEASTAR_TEST_CASE(leveled_07) {
   return test_env::do_with_async([] (test_env& env) {
-    auto cf = env.make_table_for_tests();
+    auto schema = simple_schema().schema();
+    auto cf = env.make_table_for_tests(schema);
     auto stop_cf = deferred_stop(cf);
 
     const auto key = tests::generate_partition_key(cf.schema());
@@ -940,7 +952,8 @@ SEASTAR_TEST_CASE(leveled_07) {
 
 SEASTAR_TEST_CASE(leveled_invariant_fix) {
   return test_env::do_with_async([] (test_env& env) {
-    auto cf = env.make_table_for_tests();
+    auto schema = simple_schema().schema();
+    auto cf = env.make_table_for_tests(schema);
     auto stop_cf = deferred_stop(cf);
 
     auto sstables_no = cf.schema()->max_compaction_threshold();
@@ -1028,7 +1041,8 @@ SEASTAR_TEST_CASE(leveled_stcs_on_L0) {
 
 SEASTAR_TEST_CASE(overlapping_starved_sstables_test) {
   return test_env::do_with_async([] (test_env& env) {
-    auto cf = env.make_table_for_tests();
+    auto schema = simple_schema().schema();
+    auto cf = env.make_table_for_tests(schema);
     auto stop_cf = deferred_stop(cf);
 
     const auto keys = tests::generate_partition_keys(5, cf.schema());
@@ -1060,7 +1074,8 @@ SEASTAR_TEST_CASE(overlapping_starved_sstables_test) {
 
 SEASTAR_TEST_CASE(check_overlapping) {
   return test_env::do_with_async([] (test_env& env) {
-    auto cf = env.make_table_for_tests();
+    auto schema = simple_schema().schema();
+    auto cf = env.make_table_for_tests(schema);
     auto stop_cf = deferred_stop(cf);
 
     const auto keys = tests::generate_partition_keys(4, cf.schema());
@@ -1586,8 +1601,9 @@ SEASTAR_TEST_CASE(get_fully_expired_sstables_test) {
     auto t3 = gc_clock::from_time_t(20).time_since_epoch().count();
     auto t4 = gc_clock::from_time_t(30).time_since_epoch().count();
 
+    auto schema = simple_schema().schema();
     {
-        auto cf = env.make_table_for_tests();
+        auto cf = env.make_table_for_tests(schema);
         auto close_cf = deferred_stop(cf);
 
         auto sst1 = add_sstable_for_overlapping_test(env, cf, min_key.key(), keys[1].key(), build_stats(t0, t1, t1));
@@ -1599,7 +1615,7 @@ SEASTAR_TEST_CASE(get_fully_expired_sstables_test) {
     }
 
     {
-        auto cf = env.make_table_for_tests();
+        auto cf = env.make_table_for_tests(schema);
         auto close_cf = deferred_stop(cf);
 
         auto sst1 = add_sstable_for_overlapping_test(env, cf, min_key.key(), keys[1].key(), build_stats(t0, t1, t1));
@@ -1955,7 +1971,8 @@ SEASTAR_TEST_CASE(min_max_clustering_key_test_2) {
 
 SEASTAR_TEST_CASE(size_tiered_beyond_max_threshold_test) {
   return test_env::do_with_async([] (test_env& env) {
-    auto cf = env.make_table_for_tests();
+    auto schema = simple_schema().schema();
+    auto cf = env.make_table_for_tests(schema);
     auto stop_cf = deferred_stop(cf);
     auto cs = compaction::make_compaction_strategy(compaction::compaction_strategy_type::size_tiered, cf.schema()->compaction_strategy_options());
 
@@ -2535,13 +2552,16 @@ void scrub_validate_corrupted_digest(compress_sstable compress) {
         // This test is about corrupted data with valid per-chunk checksums.
         // This kind of corruption should be detected by the digest check.
         // Triggering this is not trivial, so we corrupt the Digest file instead.
-        auto f = open_file_dma(sstables::test(sst).filename(component_type::Digest).native(), open_flags::rw).get();
+        auto f = sst->readable_file_for_all_components().get()[component_type::Digest];
         auto stream = make_file_input_stream(f);
         auto close_stream = deferred_close(stream);
         auto digest_str = util::read_entire_stream_contiguous(stream).get();
         auto digest = boost::lexical_cast<uint32_t>(digest_str);
         auto new_digest = to_sstring<bytes>(digest + 1); // a random invalid digest
-        f.dma_write(0, new_digest.c_str(), new_digest.size()).get();
+        auto os = output_stream<char>(sst->get_storage_for_tests().make_component_sink(*sst, component_type::Digest, open_flags::wo, {}).get());
+        auto close_os = deferred_close(os);
+        os.write(std::move(new_digest)).get();
+        os.flush().get();
 
         compaction::compaction_type_options::scrub opts = {
             .operation_mode = compaction::compaction_type_options::scrub::mode::validate,
@@ -3697,7 +3717,7 @@ SEASTAR_TEST_CASE(compaction_strategy_aware_major_compaction_test) {
         sst2->set_sstable_level(3);
         auto candidates = std::vector<sstables::shared_sstable>({ sst, sst2 });
 
-        auto cf = env.make_table_for_tests();
+        auto cf = env.make_table_for_tests(s);
         auto close_cf = deferred_stop(cf);
 
         {
@@ -5230,7 +5250,8 @@ SEASTAR_TEST_CASE(basic_ics_controller_correctness_test) {
         auto s = simple_schema().schema();
 
         auto backlog = [&] (compaction::compaction_backlog_tracker backlog_tracker, uint64_t max_fragment_size) {
-            table_for_tests cf = env.make_table_for_tests();
+            auto schema = simple_schema().schema();
+            table_for_tests cf = env.make_table_for_tests(schema);
             auto stop_cf = defer([&] { cf.stop().get(); });
 
             uint64_t current_sstable_size = default_fragment_size;
@@ -6051,6 +6072,7 @@ SEASTAR_TEST_CASE(cleanup_during_offstrategy_incremental_compaction_test) {
         }
 
         {
+            named_gate callback_gate("compaction_test_gate");
             auto t = env.make_table_for_tests(s);
             auto& cm = t->get_compaction_manager();
             auto stop = deferred_stop(t);
@@ -6064,16 +6086,25 @@ SEASTAR_TEST_CASE(cleanup_during_offstrategy_incremental_compaction_test) {
                     testlog.info("Closing sstable of generation {}, table set size: {}", sst.generation(), sstables->size());
                     sstables_closed++;
                 }));
-                observers.push_back(sst->add_on_delete_handler([&] (sstable& sst) mutable {
+                observers.push_back(sst->add_on_delete_handler([holder = callback_gate.hold(), &sstables_missing_on_delete](auto& sstable) mutable {
                     // ATTN -- the _on_delete callback is not necessarily running in thread
-                    auto missing = (::access(fmt::to_string(sst.get_filename()).c_str(), F_OK) != 0);
-                    testlog.info("Deleting sstable of generation {}: missing={}", sst.generation(), missing);
-                    sstables_missing_on_delete += missing;
+                    std::ignore = sstable.get_storage()
+                                      .exists(sstable, component_type::Data)
+                                      .then([&sstables_missing_on_delete, gen = sstable.generation(), name = sstable.get_filename().format()](auto exists) {
+                                          if (!exists) {
+                                              ++sstables_missing_on_delete;
+                                          }
+                                          testlog.info("Deleting sstable of generation {}: missing={}", gen, !exists);
+                                      }).handle_exception([&](std::exception_ptr e) {
+                                          BOOST_FAIL(format("Exception is not expected here: {}", e));
+                                      })
+                                      .finally([holder = std::move(holder)] {});
                 }));
             }
             ssts = {}; // releases references
             auto owned_ranges_ptr = make_lw_shared<const dht::token_range_vector>(std::move(owned_token_ranges));
             t->perform_cleanup_compaction(std::move(owned_ranges_ptr), tasks::task_info{}).get();
+            callback_gate.close().get();
             BOOST_REQUIRE(cm.sstables_requiring_cleanup(t->try_get_compaction_group_view_with_static_sharding()).empty());
             testlog.info("Cleanup has finished");
         }
@@ -6314,7 +6345,7 @@ SEASTAR_TEST_CASE(unsealed_sstable_compaction_test) {
         sst_cfg.leave_unsealed = true;
         auto unsealed_sstable = make_sstable_easy(env, make_mutation_reader_from_mutations(s, env.make_reader_permit(), std::move(mut)), sst_cfg);
 
-        BOOST_REQUIRE(file_exists(unsealed_sstable->get_filename(sstables::component_type::TemporaryTOC).format()).get());
+        BOOST_REQUIRE(unsealed_sstable->get_storage().exists(*unsealed_sstable, sstables::component_type::TemporaryTOC).get());
 
         auto sst_gen = env.make_sst_factory(s);
         auto info = compact_sstables(env, compaction::compaction_descriptor({ unsealed_sstable }), t, sst_gen).get();
@@ -6342,16 +6373,16 @@ SEASTAR_TEST_CASE(sstable_clone_leaving_unsealed_dest_sstable) {
 
         auto sst2 = env.make_sstable(s, d.generation, d.version, d.format);
         sst2->load(s->get_sharder(), sstable_open_config{ .unsealed_sstable = leave_unsealed }).get();
-        BOOST_REQUIRE(!file_exists(sst2->get_filename(sstables::component_type::TOC).format()).get());
-        BOOST_REQUIRE(file_exists(sst2->get_filename(sstables::component_type::TemporaryTOC).format()).get());
+        BOOST_REQUIRE(!sst2->get_storage().exists(*sst2, sstables::component_type::TOC).get());
+        BOOST_REQUIRE(sst2->get_storage().exists(*sst2, sstables::component_type::TemporaryTOC).get());
 
         leave_unsealed = false;
         d = sst->clone(gen_generator(), leave_unsealed).get();
 
         auto sst3 = env.make_sstable(s, d.generation, d.version, d.format);
         sst3->load(s->get_sharder(), sstable_open_config{ .unsealed_sstable = leave_unsealed }).get();
-        BOOST_REQUIRE(file_exists(sst3->get_filename(sstables::component_type::TOC).format()).get());
-        BOOST_REQUIRE(!file_exists(sst3->get_filename(sstables::component_type::TemporaryTOC).format()).get());
+        BOOST_REQUIRE(sst3->get_storage().exists(*sst3, sstables::component_type::TOC).get());
+        BOOST_REQUIRE(!sst3->get_storage().exists(*sst3, sstables::component_type::TemporaryTOC).get());
     });
 }
 
@@ -6372,15 +6403,15 @@ SEASTAR_TEST_CASE(failure_when_adding_new_sstable_test) {
         BOOST_REQUIRE_THROW(table->add_new_sstable_and_update_cache(sst, on_add).get(), std::runtime_error);
 
         // Verify new sstable was unlinked on failure.
-        BOOST_REQUIRE(!file_exists(sst->get_filename(sstables::component_type::Data).format()).get());
+        BOOST_REQUIRE(!sst->get_storage().exists(*sst, sstables::component_type::Data).get());
 
         auto sst2 = make_sstable_containing(env.make_sstable(s), {mut1});
         auto sst3 = make_sstable_containing(env.make_sstable(s), {mut1});
         BOOST_REQUIRE_THROW(table->add_new_sstables_and_update_cache({sst2, sst3}, on_add).get(), std::runtime_error);
 
         // Verify both sstables are unlinked on failure.
-        BOOST_REQUIRE(!file_exists(sst2->get_filename(sstables::component_type::Data).format()).get());
-        BOOST_REQUIRE(!file_exists(sst3->get_filename(sstables::component_type::Data).format()).get());
+        BOOST_REQUIRE(!sst2->get_storage().exists(*sst2, sstables::component_type::Data).get());
+        BOOST_REQUIRE(!sst3->get_storage().exists(*sst3, sstables::component_type::Data).get());
     });
 }
 
