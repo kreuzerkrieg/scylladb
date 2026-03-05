@@ -878,7 +878,8 @@ future<std::vector<tablet_sstable_collection>> get_sstables_for_tablets_for_test
     return tablet_sstable_streamer::get_sstables_for_tablets(sstables, std::move(tablets_ranges));
 }
 
-static future<size_t> process_manifest(input_stream<char>& is, const sstring& expected_snapshot_name,
+static future<size_t> process_manifest(input_stream<char>& is, sstring keyspace, sstring table,
+                                 const sstring& expected_snapshot_name,
                                  const sstring& manifest_prefix, db::system_distributed_keyspace& sys_dist_ks,
                                  db::consistency_level cl) {
     // Read the entire JSON content
@@ -897,8 +898,12 @@ static future<size_t> process_manifest(input_stream<char>& is, const sstring& ex
         throw std::runtime_error(fmt::format("Manifest {} belongs to snapshot '{}', expected '{}'",
             manifest_prefix, snapshot_name, expected_snapshot_name));
     }
-    auto keyspace = sstring(rjson::to_string_view(parsed["table"]["keyspace_name"]));
-    auto table = sstring(rjson::to_string_view(parsed["table"]["table_name"]));
+    if (keyspace.empty()) {
+        keyspace = sstring(rjson::to_string_view(parsed["table"]["keyspace_name"]));
+    }
+    if (table.empty()) {
+        table = sstring(rjson::to_string_view(parsed["table"]["table_name"]));
+    }
     auto datacenter = sstring(rjson::to_string_view(parsed["node"]["datacenter"]));
     auto rack = sstring(rjson::to_string_view(parsed["node"]["rack"]));
 
@@ -920,7 +925,7 @@ static future<size_t> process_manifest(input_stream<char>& is, const sstring& ex
     co_return tablet_count;
 }
 
-future<size_t> populate_snapshot_sstables_from_manifests(sstables::storage_manager& sm, db::system_distributed_keyspace& sys_dist_ks, sstring endpoint, sstring bucket, sstring expected_snapshot_name, utils::chunked_vector<sstring> manifest_prefixes, db::consistency_level cl) {
+future<size_t> populate_snapshot_sstables_from_manifests(sstables::storage_manager& sm, db::system_distributed_keyspace& sys_dist_ks, sstring keyspace, sstring table, sstring endpoint, sstring bucket, sstring expected_snapshot_name, utils::chunked_vector<sstring> manifest_prefixes, db::consistency_level cl) {
     // Download manifests in parallel and populate system_distributed.snapshot_sstables
     // with the content extracted from each manifest
     auto client = sm.get_endpoint_client(endpoint);
@@ -933,7 +938,7 @@ future<size_t> populate_snapshot_sstables_from_manifests(sstables::storage_manag
         sstables::object_name name(bucket, manifest_prefix);
         auto source = client->make_download_source(name);
         return seastar::with_closeable(input_stream<char>(std::move(source)), [&] (input_stream<char>& is) {
-            return process_manifest(is, expected_snapshot_name, manifest_prefix, sys_dist_ks, cl).then([&](size_t count) {
+            return process_manifest(is, keyspace, table, expected_snapshot_name, manifest_prefix, sys_dist_ks, cl).then([&](size_t count) {
                 if (!tablet_count) {
                     tablet_count = count;
                 } else if (*tablet_count != count) {
