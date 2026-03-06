@@ -1976,6 +1976,12 @@ class topology_coordinator : public endpoint_lifecycle_subscriber
                         }
                         break;
                     }
+                    // Barrier ensures all nodes have applied preceding schema changes
+                    // (i.e. table recreation done by recreate_table_with_tablet_hints)
+                    // before we send restore RPCs to them.
+                    if (!do_barrier()) {
+                        break;
+                    }
                     if (advance_in_background(gid, tablet_state.restore, "restore", [this, gid, &tmap] () -> future<> {
                         auto& tinfo = tmap.get_tablet_info(gid.tablet);
                         auto config = tinfo.restore_cfg;
