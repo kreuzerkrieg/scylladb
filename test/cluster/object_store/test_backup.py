@@ -755,7 +755,6 @@ async def test_restore_tablets(build_mode: str, manager: ManagerClient, object_s
 
     servers, host_ids = await create_cluster(topology, topology.rf >= topology.racks, manager, logger, object_storage)
 
-    await manager.disable_tablet_balancing()
     cql = manager.get_cql()
 
     num_keys = 10
