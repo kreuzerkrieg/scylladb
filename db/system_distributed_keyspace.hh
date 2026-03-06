@@ -143,6 +143,13 @@ public:
     future<> insert_snapshot_cql_table(sstring snapshot_name, sstring ks, sstring table, bool is_view, sstring schema, db::consistency_level cl = db::consistency_level::EACH_QUORUM);
     future<sstring> get_snapshot_cql_table_schema(sstring snapshot_name, sstring ks, sstring table, db::consistency_level cl = db::consistency_level::LOCAL_QUORUM) const;
 
+    inline service::migration_manager& get_migration_manager() {
+        return _mm;
+    }
+
+    inline service::storage_proxy& get_storage_proxy() {
+        return _sp;
+    }
 private:
     future<> create_tables(std::vector<schema_ptr> tables);
 };
