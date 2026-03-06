@@ -125,12 +125,12 @@ future<std::optional<locator::tablet_transition_stage>> read_tablet_transition_s
 /// Validates changes to system.tablets represented by mutations
 void validate_tablet_metadata_change(const locator::tablet_metadata& tm, const utils::chunked_vector<canonical_mutation>& mutations);
 
-future<table_id> recreate_table_with_tablet_hints(const sstring& snapshot_name, const sstring& ks, const table_id& tid,
-                                                size_t min_tablet_count, size_t max_tablet_count,
-                                                replica::database& db,
-                                                db::system_distributed_keyspace& sys_dis_ks,
-                                                service::storage_proxy& sp,
-                                                service::migration_manager& mm,
-                                                db::consistency_level cl = db::consistency_level::EACH_QUORUM);
+future<> recreate_table_with_tablet_hints(const sstring& snapshot_name, const sstring& ks, const table_id& tid,
+                                          size_t min_tablet_count, size_t max_tablet_count,
+                                          replica::database& db,
+                                          db::system_distributed_keyspace& sys_dis_ks,
+                                          service::storage_proxy& sp,
+                                          service::migration_manager& mm,
+                                          db::consistency_level cl = db::consistency_level::EACH_QUORUM);
 
 } // namespace replica

@@ -1364,13 +1364,13 @@ sstables::sstable_set_impl::selector_and_schema_t tablet_sstable_set::make_incre
     return std::make_tuple(std::make_unique<tablet_incremental_selector>(*this), *_schema);
 }
 
-future<table_id> recreate_table_with_tablet_hints(const sstring& snapshot_name, const sstring& ks, const table_id& tid,
-                                                size_t min_tablet_count, size_t max_tablet_count,
-                                                replica::database& db,
-                                                db::system_distributed_keyspace& sys_dis_ks,
-                                                service::storage_proxy& sp,
-                                                service::migration_manager& mm,
-                                                db::consistency_level cl) {
+future<> recreate_table_with_tablet_hints(const sstring& snapshot_name, const sstring& ks, const table_id& tid,
+                                          size_t min_tablet_count, size_t max_tablet_count,
+                                          replica::database& db,
+                                          db::system_distributed_keyspace& sys_dis_ks,
+                                          service::storage_proxy& sp,
+                                          service::migration_manager& mm,
+                                          db::consistency_level cl) {
     if (this_shard_id() != 0) {
         throw std::runtime_error("Only shard 0 can execute recreate_table_with_tablet_hints");
     }
@@ -1387,6 +1387,7 @@ future<table_id> recreate_table_with_tablet_hints(const sstring& snapshot_name, 
         {"min_tablet_count", to_sstring(min_tablet_count)},
         {"max_tablet_count", to_sstring(max_tablet_count)}
     });
+    builder.set_uuid(tid);
     auto modified_schema = builder.build();
 
     enum class ddl_operation { drop, create };
@@ -1418,8 +1419,6 @@ future<table_id> recreate_table_with_tablet_hints(const sstring& snapshot_name, 
 
     co_await execute_ddl(ddl_operation::drop);
     co_await execute_ddl(ddl_operation::create);
-
-    co_return db.find_uuid(ks, cf_name);
 }
 
 } // namespace replica
