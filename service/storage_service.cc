@@ -5528,29 +5528,33 @@ future<> storage_service::restore_tablets(table_id table, sstring snap_name, sst
         });
     }
 
-    const auto tm = get_token_metadata_ptr();
-    const auto& tmap = tm->tablets().get_tablet_map(table);
     std::vector<future<>> wait;
-    co_await tmap.for_each_tablet([&] (locator::tablet_id tid, const locator::tablet_info& info) -> future<> {
-        auto gid = locator::global_tablet_id{table, tid};
-        auto last_token = tmap.get_last_token(tid);
-        co_await transit_tablet(table, last_token, [&] (const locator::tablet_map& tmap, api::timestamp_type write_timestamp) {
-            utils::chunked_vector<canonical_mutation> updates;
-            updates.emplace_back(tablet_mutation_builder_for_base_table(write_timestamp, table)
-                .set_stage(last_token, locator::tablet_transition_stage::restore)
-                .set_new_replicas(last_token, tmap.get_tablet_info(gid.tablet).replicas)
-                .set_restore_config(last_token, locator::restore_config{ snap_name, endpoint, bucket })
-                .set_transition(last_token, locator::tablet_transition_kind::restore)
-                .build());
+    {
+        auto tm = get_token_metadata_ptr();
+        const auto& tmap = tm->tablets().get_tablet_map(table);
+        co_await tmap.for_each_tablet([&] (locator::tablet_id tid, const locator::tablet_info& info) -> future<> {
+            auto gid = locator::global_tablet_id{table, tid};
+            auto last_token = tmap.get_last_token(tid);
+            co_await transit_tablet(table, last_token, [&] (const locator::tablet_map& tmap, api::timestamp_type write_timestamp) {
+                utils::chunked_vector<canonical_mutation> updates;
+                updates.emplace_back(tablet_mutation_builder_for_base_table(write_timestamp, table)
+                    .set_stage(last_token, locator::tablet_transition_stage::restore)
+                    .set_new_replicas(last_token, tmap.get_tablet_info(gid.tablet).replicas)
+                    .set_restore_config(last_token, locator::restore_config{ snap_name, endpoint, bucket })
+                    .set_transition(last_token, locator::tablet_transition_kind::restore)
+                    .build());
 
-            sstring reason = format("Restoring tablet {}", gid);
-            return std::make_tuple(std::move(updates), std::move(reason));
-        }, false);
-        wait.emplace_back(_topology_state_machine.event.wait([this, gid] {
-            auto& tmap = get_token_metadata().tablets().get_tablet_map(gid.table);
-            return !tmap.get_tablet_transition_info(gid.tablet);
-        }));
-    });
+                sstring reason = format("Restoring tablet {}", gid);
+                return std::make_tuple(std::move(updates), std::move(reason));
+            }, false);
+            wait.emplace_back(_topology_state_machine.event.wait([this, gid] {
+                auto& tmap = get_token_metadata().tablets().get_tablet_map(gid.table);
+                return !tmap.get_tablet_transition_info(gid.tablet);
+            }));
+        });
+        // Release tm before waiting, to avoid holding a stale token_metadata
+        // reference that would block barrier_and_drain during tablet transitions.
+    }
 
     co_await when_all_succeed(wait.begin(), wait.end()).discard_result();
     slogger.info("Restoring {} finished", table);
