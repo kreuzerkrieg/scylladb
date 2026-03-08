@@ -50,12 +50,6 @@ function(add_scylla_test name)
   list(APPEND scylla_tests "${dirname}/${name}")
   set(scylla_tests "${scylla_tests}" PARENT_SCOPE)
 
-  if(Scylla_ENABLE_LTO)
-    # The runtime benefits of LTO don't outweight the compile time costs for tests.
-    target_link_options(${name} PRIVATE
-      $<$<CONFIG:RelWithDebInfo>:-fno-lto>)
-  endif()
-
   target_include_directories(${name}
     PRIVATE
       ${CMAKE_SOURCE_DIR})
@@ -68,9 +62,8 @@ function(add_scylla_test name)
     target_link_libraries(${name}
       PRIVATE
         Seastar::seastar_testing)
-    target_compile_definitions(${name}
-      PRIVATE
-        SEASTAR_TESTING_MAIN)
+    # SEASTAR_TESTING_MAIN is already propagated via scylla-main (PUBLIC define),
+    # through test-lib, matching configure.py's global definition.
   elseif(kind STREQUAL "BOOST")
     target_link_libraries(${name}
       PRIVATE

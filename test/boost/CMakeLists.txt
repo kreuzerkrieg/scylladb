@@ -312,12 +312,17 @@ add_scylla_test(address_map_test
   KIND SEASTAR)
 add_scylla_test(object_storage_upload_test
   KIND SEASTAR)
+add_scylla_test(symmetric_key_test
+  KIND SEASTAR
+  LIBRARIES
+    encryption)
 
 add_scylla_test(combined_tests
   KIND SEASTAR
   SOURCES
     combined_tests.cc
     aggregate_fcts_test.cc
+    auth_cache_test.cc
     auth_test.cc
     batchlog_manager_test.cc
     cache_algorithm_test.cc
