@@ -71,7 +71,7 @@ static const sstring superuser_col_name("super");
 
 }
 
-static logging::logger log("auth_service");
+static logging::logger asvc_log("auth_service");
 
 class auth_migration_listener final : public ::service::migration_listener {
     service& _service;
@@ -105,13 +105,13 @@ private:
         (void)do_with(auth::make_data_resource(ks_name), ::service::group0_batch::unused(), [this] (auto& r, auto& mc) mutable {
             return _service.revoke_all(r, mc);
         }).handle_exception([] (std::exception_ptr e) {
-            log.error("Unexpected exception while revoking all permissions on dropped keyspace: {}", e);
+            asvc_log.error("Unexpected exception while revoking all permissions on dropped keyspace: {}", e);
         });
 
         (void)do_with(auth::make_functions_resource(ks_name), ::service::group0_batch::unused(), [this] (auto& r, auto& mc) mutable {
             return _service.revoke_all(r, mc);
         }).handle_exception([] (std::exception_ptr e) {
-            log.error("Unexpected exception while revoking all permissions on functions in dropped keyspace: {}", e);
+            asvc_log.error("Unexpected exception while revoking all permissions on functions in dropped keyspace: {}", e);
         });
     }
 
@@ -124,7 +124,7 @@ private:
         (void)do_with(auth::make_data_resource(ks_name, cf_name), ::service::group0_batch::unused(), [this] (auto& r, auto& mc) mutable {
             return _service.revoke_all(r, mc);
         }).handle_exception([] (std::exception_ptr e) {
-            log.error("Unexpected exception while revoking all permissions on dropped table: {}", e);
+            asvc_log.error("Unexpected exception while revoking all permissions on dropped table: {}", e);
         });
     }
 
@@ -138,7 +138,7 @@ private:
         (void)do_with(auth::make_functions_resource(ks_name, function_name), ::service::group0_batch::unused(), [this] (auto& r, auto& mc) mutable {
             return _service.revoke_all(r, mc);
         }).handle_exception([] (std::exception_ptr e) {
-            log.error("Unexpected exception while revoking all permissions on dropped function: {}", e);
+            asvc_log.error("Unexpected exception while revoking all permissions on dropped function: {}", e);
         });
     }
     void on_drop_aggregate(const sstring& ks_name, const sstring& aggregate_name) override {
@@ -149,7 +149,7 @@ private:
         (void)do_with(auth::make_functions_resource(ks_name, aggregate_name), ::service::group0_batch::unused(), [this] (auto& r, auto& mc) mutable {
             return _service.revoke_all(r, mc);
         }).handle_exception([] (std::exception_ptr e) {
-            log.error("Unexpected exception while revoking all permissions on dropped aggregate: {}", e);
+            asvc_log.error("Unexpected exception while revoking all permissions on dropped aggregate: {}", e);
         });
     }
     void on_drop_view(const sstring& ks_name, const sstring& view_name) override {}
@@ -224,7 +224,7 @@ future<> service::create_legacy_keyspace_if_missing(::service::migration_manager
                 co_return co_await mm.announce(::service::prepare_new_keyspace_announcement(db.real_database(), ksm, ts),
                         std::move(group0_guard), seastar::format("auth_service: create {} keyspace", meta::legacy::AUTH_KS));
             } catch (const ::service::group0_concurrent_modification&) {
-                log.info("Concurrent operation is detected while creating {} keyspace, retrying.", meta::legacy::AUTH_KS);
+                asvc_log.info("Concurrent operation is detected while creating {} keyspace, retrying.", meta::legacy::AUTH_KS);
             }
         }
     }
@@ -617,7 +617,7 @@ static sstring describe_resource_kind(const permission& perm, const resource& r,
         case resource_kind::role:
             return describe_role_resource(perm, r, role);
         case resource_kind::service_level:
-            on_internal_error(log, "Granting permissions for service levels is not supported");
+            on_internal_error(asvc_log, "Granting permissions for service levels is not supported");
         case resource_kind::functions:
             return describe_udf_resource(perm, r, role);
     }
@@ -932,7 +932,7 @@ future<> migrate_to_auth_v2(db::system_keyspace& sys_ks, ::service::raft_group0_
                             ts,
                             std::move(values));
                     if (muts.size() != 1) {
-                        on_internal_error(log,
+                        on_internal_error(asvc_log,
                                 format("expecting single insert mutation, got {}", muts.size()));
                     }
 

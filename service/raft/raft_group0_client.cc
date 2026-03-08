@@ -31,7 +31,7 @@
 
 namespace service {
 
-static logging::logger logger("group0_client");
+static logging::logger g0c_logger("group0_client");
 
 /* *** Linearizing group 0 operations ***
  *
@@ -167,7 +167,7 @@ future<> raft_group0_client::add_entry(group0_command group0_cmd, group0_guard g
     if (this_shard_id() != 0) {
         // This should not happen since all places which construct `group0_guard` also check that they are on shard 0.
         // Note: `group0_guard::impl` is private to this module, making this easy to verify.
-        on_internal_error(logger, "add_entry: must run on shard 0");
+        on_internal_error(g0c_logger, "add_entry: must run on shard 0");
     }
 
     auto new_group0_state_id = guard.new_group0_state_id();
@@ -185,17 +185,17 @@ future<> raft_group0_client::add_entry(group0_command group0_cmd, group0_guard g
             try {
                 co_await _raft_gr.group0_with_timeouts().add_entry(cmd, raft::wait_type::applied, as, timeout);
             } catch (const raft::dropped_entry& e) {
-                logger.warn("add_entry: returned \"{}\". Retrying the command (prev_state_id: {}, new_state_id: {})",
+                g0c_logger.warn("add_entry: returned \"{}\". Retrying the command (prev_state_id: {}, new_state_id: {})",
                         e, group0_cmd.prev_state_id, group0_cmd.new_state_id);
                 retry = true;
             } catch (const raft::commit_status_unknown& e) {
-                logger.warn("add_entry: returned \"{}\". Retrying the command (prev_state_id: {}, new_state_id: {})",
+                g0c_logger.warn("add_entry: returned \"{}\". Retrying the command (prev_state_id: {}, new_state_id: {})",
                         e, group0_cmd.prev_state_id, group0_cmd.new_state_id);
                 retry = true;
             } catch (const raft::not_a_leader& e) {
                 // This should not happen since follower-to-leader entry forwarding is enabled in group 0.
                 // Just fail the operation by propagating the error.
-                logger.error("add_entry: unexpected `not_a_leader` error: \"{}\". Please file an issue.", e);
+                g0c_logger.error("add_entry: unexpected `not_a_leader` error: \"{}\". Please file an issue.", e);
                 throw;
             }
 
@@ -217,7 +217,7 @@ future<> raft_group0_client::add_entry(group0_command group0_cmd, group0_guard g
 
 future<> raft_group0_client::add_entry_unguarded(group0_command group0_cmd, seastar::abort_source* as) {
     if (this_shard_id() != 0) {
-        on_internal_error(logger, "add_entry_unguarded: must run on shard 0");
+        on_internal_error(g0c_logger, "add_entry_unguarded: must run on shard 0");
     }
 
     raft::command cmd;
@@ -229,7 +229,7 @@ future<> raft_group0_client::add_entry_unguarded(group0_command group0_cmd, seas
     } catch (const raft::not_a_leader& e) {
         // This should not happen since follower-to-leader entry forwarding is enabled in group 0.
         // Just fail the operation by propagating the error.
-        logger.error("add_entry_unguarded: unexpected `not_a_leader` error: \"{}\". Please file an issue.", e);
+        g0c_logger.error("add_entry_unguarded: unexpected `not_a_leader` error: \"{}\". Please file an issue.", e);
         throw;
     }
 }
@@ -251,7 +251,7 @@ future<utils::UUID> raft_group0_client::get_last_group0_state_id() {
 
 future<group0_guard> raft_group0_client::start_operation(seastar::abort_source& as, std::optional<raft_timeout> timeout) {
     if (this_shard_id() != 0) {
-        on_internal_error(logger, "start_group0_operation: must run on shard 0");
+        on_internal_error(g0c_logger, "start_group0_operation: must run on shard 0");
     }
 
     if (_maintenance_mode) {
@@ -261,7 +261,7 @@ future<group0_guard> raft_group0_client::start_operation(seastar::abort_source& 
     group0_upgrade_state upgrade_state = get_group0_upgrade_state();
     if (upgrade_state != group0_upgrade_state::use_post_raft_procedures) {
         // The version no longer supports pre raft procedures
-        on_internal_error(logger, format("unexpected group0 upgrade state {} in start_operation",  upgrade_state));
+        on_internal_error(g0c_logger, format("unexpected group0 upgrade state {} in start_operation",  upgrade_state));
     }
 
     auto operation_holder = co_await get_units(_operation_mutex, 1, as);
@@ -355,7 +355,7 @@ future<> raft_group0_client::init() {
             return service::group0_upgrade_state::recovery;
         }
 
-        logger.error(
+        g0c_logger.error(
                 "load_group0_upgrade_state(): unknown value '{}' for key 'group0_upgrade_state' in Scylla local table."
                 " Did you change the value manually?"
                 " Correct values are: 'use_pre_raft_procedures', 'synchronize', 'use_post_raft_procedures', 'recovery'."
@@ -369,7 +369,7 @@ future<> raft_group0_client::init() {
         ? group0_upgrade_state::recovery
         : value(co_await _sys_ks.load_group0_upgrade_state());
     if (_upgrade_state == group0_upgrade_state::recovery) {
-        logger.warn("RECOVERY mode.");
+        g0c_logger.warn("RECOVERY mode.");
     }
 }
 
@@ -393,7 +393,7 @@ future<> raft_group0_client::set_group0_upgrade_state(group0_upgrade_state state
                 return "use_pre_raft_procedures";
         }
 
-        on_internal_error(logger, format(
+        on_internal_error(g0c_logger, format(
                 "save_group0_upgrade_state: given value is outside the set of possible values (integer value: {})."
                 " This may have been caused by undefined behavior; best restart your system.",
                 static_cast<uint8_t>(s)));
@@ -405,7 +405,7 @@ future<> raft_group0_client::set_group0_upgrade_state(group0_upgrade_state state
 
 future<semaphore_units<>> raft_group0_client::hold_read_apply_mutex(abort_source& as) {
     if (this_shard_id() != 0) {
-        on_internal_error(logger, "hold_read_apply_mutex: must run on shard 0");
+        on_internal_error(g0c_logger, "hold_read_apply_mutex: must run on shard 0");
     }
 
     return get_units(_read_apply_mutex, 1, as);
@@ -419,7 +419,7 @@ raft_group0_client::query_result_guard::query_result_guard(utils::UUID query_id,
     : _query_id{query_id}, _client{&client} {
     auto [_, emplaced] = _client->_results.emplace(_query_id, std::nullopt);
     if (!emplaced) {
-        on_internal_error(logger, "query_result_guard::query_result_guard: there is another query_result_guard alive with the same query_id");
+        on_internal_error(g0c_logger, "query_result_guard::query_result_guard: there is another query_result_guard alive with the same query_id");
     }
 }
 
@@ -438,7 +438,7 @@ service::broadcast_tables::query_result raft_group0_client::query_result_guard::
     auto it = _client->_results.find(_query_id);
 
     if (it == _client->_results.end() || !it->second.has_value()) {
-        on_internal_error(logger, "query_result_guard::get: no result");
+        on_internal_error(g0c_logger, "query_result_guard::get: no result");
     }
 
     return std::move(*it->second);
@@ -477,14 +477,14 @@ group0_batch::~group0_batch() = default;
 
 api::timestamp_type group0_batch::write_timestamp() const {
     if (!_guard) {
-        on_internal_error(logger, "group0_batch: write_timestamp without guard taken");
+        on_internal_error(g0c_logger, "group0_batch: write_timestamp without guard taken");
     }
     return _guard->write_timestamp();
 }
 
 utils::UUID group0_batch::new_group0_state_id() const {
     if (!_guard) {
-        on_internal_error(logger, "group0_batch: new_group0_state_id without guard taken");
+        on_internal_error(g0c_logger, "group0_batch: new_group0_state_id without guard taken");
     }
     return _guard->new_group0_state_id();
 }
@@ -519,7 +519,7 @@ static future<> add_write_mutations_entry(
         ::service::group0_guard group0_guard,
         seastar::abort_source& as,
         std::optional<::service::raft_timeout> timeout) {
-    logger.trace("add_write_mutations_entry: {} mutations with description {}",
+    g0c_logger.trace("add_write_mutations_entry: {} mutations with description {}",
             muts.size(), description);
     auto group0_cmd = group0_client.prepare_command(
         ::service::write_mutations{
@@ -546,7 +546,7 @@ future<> group0_batch::commit(::service::raft_group0_client& group0_client, seas
         co_return;
     }
     if (!_guard) {
-        on_internal_error(logger, "group0_batch: trying to announce without guard");
+        on_internal_error(g0c_logger, "group0_batch: trying to announce without guard");
     }
     auto description = fmt::to_string(fmt::join(_descriptions, "; "));
     // common case, don't bother with generators as we would have only 1-2 mutations,

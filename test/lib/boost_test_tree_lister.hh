@@ -14,7 +14,7 @@
 
 #include <memory>
 
-namespace internal {
+namespace tree_lister_internal {
 
 using label_info = std::string;
 
@@ -51,9 +51,9 @@ struct test_file_forest {
     std::map<std::string, test_file_info, std::less<>> test_files;
 };
 
-} // namespace internal
+} // namespace tree_lister_internal
 
-using test_file_forest = internal::test_file_forest;
+using test_file_forest = tree_lister_internal::test_file_forest;
 
 /// Implementation of the `boost::unit_test::test_tree_visitor` that
 /// produces a similar result to running a Boost.Test executable with
@@ -93,25 +93,25 @@ private:
 };
 
 template <>
-struct fmt::formatter<internal::test_case_info> {
+struct fmt::formatter<tree_lister_internal::test_case_info> {
     constexpr auto parse(format_parse_context& ctx) { return ctx.begin(); }
-    auto format(const internal::test_case_info&, fmt::format_context& ctx) const -> decltype(ctx.out());
+    auto format(const tree_lister_internal::test_case_info&, fmt::format_context& ctx) const -> decltype(ctx.out());
 };
 
 template <>
-struct fmt::formatter<internal::test_suite_info> {
+struct fmt::formatter<tree_lister_internal::test_suite_info> {
     constexpr auto parse(format_parse_context& ctx) { return ctx.begin(); }
-    auto format(const internal::test_suite_info&, fmt::format_context& ctx) const -> decltype(ctx.out());
+    auto format(const tree_lister_internal::test_suite_info&, fmt::format_context& ctx) const -> decltype(ctx.out());
 };
 
 template <>
-struct fmt::formatter<internal::test_file_info> {
+struct fmt::formatter<tree_lister_internal::test_file_info> {
     constexpr auto parse(format_parse_context& ctx) { return ctx.begin(); }
-    auto format(const internal::test_file_info&, fmt::format_context& ctx) const -> decltype(ctx.out());
+    auto format(const tree_lister_internal::test_file_info&, fmt::format_context& ctx) const -> decltype(ctx.out());
 };
 
 template <>
-struct fmt::formatter<internal::test_file_forest> {
+struct fmt::formatter<tree_lister_internal::test_file_forest> {
     constexpr auto parse(format_parse_context& ctx) { return ctx.begin(); }
-    auto format(const internal::test_file_forest&, fmt::format_context& ctx) const -> decltype(ctx.out());
+    auto format(const tree_lister_internal::test_file_forest&, fmt::format_context& ctx) const -> decltype(ctx.out());
 };

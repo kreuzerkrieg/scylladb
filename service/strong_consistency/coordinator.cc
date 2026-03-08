@@ -18,7 +18,7 @@
 namespace service::strong_consistency {
 
 
-static logging::logger logger("sc_coordinator");
+static logging::logger sc_logger("sc_coordinator");
 
 static const locator::tablet_replica* find_replica(const locator::tablet_info& tinfo, locator::host_id id) {
     const auto it = std::ranges::find_if(tinfo.replicas,
@@ -44,7 +44,7 @@ auto coordinator::create_operation_ctx(const schema& schema, const dht::token& t
         !tablet_aware_rs || 
         tablet_aware_rs->get_consistency() != data_dictionary::consistency_config_option::local)
     {
-        on_internal_error(logger,
+        on_internal_error(sc_logger,
             format("Unexpected replication strategy '{}' with consistency '{}' for table {}.{}",
                 erm->get_replication_strategy().get_type(),
                 tablet_aware_rs
@@ -98,7 +98,7 @@ future<value_or_redirect<>> coordinator::mutate(schema_ptr schema,
             const auto leader_host_id = locator::host_id{not_a_leader->leader.uuid()};
             const auto* target = find_replica(op.tablet_info, leader_host_id);
             if (!target) {
-                on_internal_error(logger,
+                on_internal_error(sc_logger,
                     ::format("table {}.{}, tablet {}, current leader {} is not a replica, replicas {}",
                         schema->ks_name(), schema->cf_name(), op.tablet_id, 
                         leader_host_id, op.tablet_info.replicas));
@@ -117,7 +117,7 @@ future<value_or_redirect<>> coordinator::mutate(schema_ptr schema,
         raft::command raft_cmd;
         ser::serialize(raft_cmd, command);
 
-        logger.debug("mutate(): add_entry({}), term {}",
+        sc_logger.debug("mutate(): add_entry({}), term {}",
             command.mutation.pretty_printer(schema), term);
         try {
             co_await op.raft_server.server().add_entry(std::move(raft_cmd),
@@ -130,16 +130,16 @@ future<value_or_redirect<>> coordinator::mutate(schema_ptr schema,
                 // Holding raft_server.holder guarantees that the raft::server is not
                 // aborted until the holder is released.
 
-                on_internal_error(logger,
+                on_internal_error(sc_logger,
                     format("mutate(): add_entry, unexpected exception {}, table {}.{}, tablet {}, term {}", 
                         ex, schema->ks_name(), schema->cf_name(), op.tablet_id, term));
             } else if (try_catch<raft::not_a_leader>(ex) || try_catch<raft::dropped_entry>(ex)) {
-                logger.debug("mutate(): add_entry, got retriable error {}, table {}.{}, tablet {}, term {}",
+                sc_logger.debug("mutate(): add_entry, got retriable error {}, table {}.{}, tablet {}, term {}",
                     ex, schema->ks_name(), schema->cf_name(), op.tablet_id, term);
 
                 continue;
             } else if (try_catch<raft::commit_status_unknown>(ex)) {
-                logger.debug("mutate(): add_entry, got commit_status_unknown {}, table {}.{}, tablet {}, term {}",
+                sc_logger.debug("mutate(): add_entry, got commit_status_unknown {}, table {}.{}, tablet {}, term {}",
                     ex, schema->ks_name(), schema->cf_name(), op.tablet_id, term);
 
                 // FIXME: use a dedicated ERROR_CODE instead of SERVER_ERROR

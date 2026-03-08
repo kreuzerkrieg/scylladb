@@ -20,7 +20,7 @@ namespace cql3 {
 
 namespace statements {
 
-static logging::logger logger("schema_altering_statement");
+static logging::logger sa_logger("schema_altering_statement");
 
 schema_altering_statement::schema_altering_statement(timeout_config_selector timeout_selector)
     : cf_statement(cf_name())
@@ -82,7 +82,7 @@ schema_altering_statement::execute(query_processor& qp, service::query_state& st
 
 future<std::tuple<::shared_ptr<schema_altering_statement::event_t>, utils::chunked_vector<mutation>, cql3::cql_warnings_vec>> schema_altering_statement::prepare_schema_mutations(query_processor& qp, const query_options& options, api::timestamp_type) const {
     // derived class must implement one of prepare_schema_mutations overloads
-    on_internal_error(logger, "not implemented");
+    on_internal_error(sa_logger, "not implemented");
     co_return std::make_tuple(::shared_ptr<event_t>(nullptr), utils::chunked_vector<mutation>{}, cql3::cql_warnings_vec{});
 }
 

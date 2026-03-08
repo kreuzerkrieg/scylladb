@@ -164,11 +164,11 @@ struct row_update {
     std::vector<nonatomic_column_update> nonatomic_entries;
 };
 
-static gc_clock::duration get_ttl(const atomic_cell_view& acv) {
+static gc_clock::duration get_ttl_duration(const atomic_cell_view& acv) {
     return acv.is_live_and_has_ttl() ? acv.ttl() : gc_clock::duration(0);
 }
 
-static gc_clock::duration get_ttl(const row_marker& rm) {
+static gc_clock::duration get_ttl_duration(const row_marker& rm) {
     return rm.is_expiring() ? rm.ttl() : gc_clock::duration(0);
 }
 
@@ -205,7 +205,7 @@ private:
     */
 
     void cell(bytes_view key, const atomic_cell_view& c) {
-        auto& entry = get_or_append_entry(c.timestamp(), get_ttl(c));
+        auto& entry = get_or_append_entry(c.timestamp(), get_ttl_duration(c));
         entry.cells.emplace_back(to_bytes(key), atomic_cell(*static_cast<V&>(*this).get_value_type(key), c));
     }
 
@@ -236,7 +236,7 @@ struct extract_row_visitor {
     std::map<change_key_t, row_update> _updates;
 
     void cell(const column_definition& cdef, const atomic_cell_view& cell) {
-        _updates[std::pair(cell.timestamp(), get_ttl(cell))].atomic_entries.push_back({cdef.id, atomic_cell(*cdef.type, cell)});
+        _updates[std::pair(cell.timestamp(), get_ttl_duration(cell))].atomic_entries.push_back({cdef.id, atomic_cell(*cdef.type, cell)});
     }
 
     void live_atomic_cell(const column_definition& cdef, const atomic_cell_view& c) {
@@ -310,7 +310,7 @@ struct extract_changes_visitor {
 
             void marker(const row_marker& rm) {
                 _marker_ts = rm.timestamp();
-                _marker_ttl = get_ttl(rm);
+                _marker_ttl = get_ttl_duration(rm);
                 _marker = rm;
 
                 // make sure that an entry corresponding to the row marker's timestamp and ttl is in the map
@@ -520,7 +520,7 @@ struct should_split_visitor {
         _ttl = { ttl };
     }
 
-    void visit(const atomic_cell_view& cell) { visit(cell.timestamp(), get_ttl(cell)); }
+    void visit(const atomic_cell_view& cell) { visit(cell.timestamp(), get_ttl_duration(cell)); }
 
     void live_atomic_cell(const column_definition&, const atomic_cell_view& cell) { visit(cell); }
     void dead_atomic_cell(const column_definition&, const atomic_cell_view& cell) { visit(cell); }
@@ -539,7 +539,7 @@ struct should_split_visitor {
 
     virtual void marker(const row_marker& rm) {
         _had_row_marker = true;
-        visit(rm.timestamp(), get_ttl(rm));
+        visit(rm.timestamp(), get_ttl_duration(rm));
     }
 
     void static_row_cells(auto&& visit_row_cells) {

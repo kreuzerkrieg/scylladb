@@ -88,8 +88,8 @@ gms::application_state_map ec2_multi_region_snitch::get_app_states() const {
     };
 }
 
-using registry_default = class_registrator<i_endpoint_snitch, ec2_multi_region_snitch, const snitch_config&>;
-static registry_default registrator_default_ec2mr("org.apache.cassandra.locator.Ec2MultiRegionSnitch");
-static registry_default registrator_default_ec2mr_short_name("Ec2MultiRegionSnitch");
+using registry_default_ec2mr = class_registrator<i_endpoint_snitch, ec2_multi_region_snitch, const snitch_config&>;
+static registry_default_ec2mr registrator_default_ec2mr("org.apache.cassandra.locator.Ec2MultiRegionSnitch");
+static registry_default_ec2mr registrator_default_ec2mr_short_name("Ec2MultiRegionSnitch");
 
 } // namespace locator

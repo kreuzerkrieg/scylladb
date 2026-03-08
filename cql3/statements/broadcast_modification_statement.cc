@@ -28,7 +28,7 @@
 
 namespace cql3 {
 
-static logging::logger logger("broadcast_modification_statement");
+static logging::logger bmod_logger("broadcast_modification_statement");
 
 namespace statements {
 
@@ -98,7 +98,7 @@ broadcast_modification_statement::execute_without_checking_exception_message(que
             return make_ready_future<::shared_ptr<cql_transport::messages::result_message>>();
         },
         [] (service::broadcast_tables::query_result_select&) -> future<::shared_ptr<cql_transport::messages::result_message>> {
-            on_internal_error(logger, "incorrect query result ");
+            on_internal_error(bmod_logger, "incorrect query result ");
         }
     ), result);
 }

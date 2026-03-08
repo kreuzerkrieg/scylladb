@@ -18,6 +18,8 @@
 
 namespace wasm {
 
+inline constexpr size_t wasm_page_size = 64 * 1024;
+
 class instance_cache;
 
 struct exception : public std::exception {

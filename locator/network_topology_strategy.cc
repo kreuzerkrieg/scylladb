@@ -660,7 +660,7 @@ sstring network_topology_strategy::sanity_check_read_replicas(const effective_re
 }
 
 // Note: signature must match the class_registry signature defined and used by abstract_replication_strategy::to_qualified_class_name
-using registry = class_registrator<abstract_replication_strategy, network_topology_strategy, replication_strategy_params, const topology*>;
-static registry registrator_nts("org.apache.cassandra.locator.NetworkTopologyStrategy");
-static registry registrator_nts_short_name("NetworkTopologyStrategy");
+using registry_nts = class_registrator<abstract_replication_strategy, network_topology_strategy, replication_strategy_params, const topology*>;
+static registry_nts registrator_nts("org.apache.cassandra.locator.NetworkTopologyStrategy");
+static registry_nts registrator_nts_short_name("NetworkTopologyStrategy");
 }

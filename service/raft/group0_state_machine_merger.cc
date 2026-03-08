@@ -11,7 +11,7 @@
 
 namespace service {
 
-static logging::logger slogger("group0_raft_sm_merger");
+static logging::logger g0smm_logger("group0_raft_sm_merger");
 
 static mutation convert_history_mutation(canonical_mutation m, const data_dictionary::database db) {
     return m.to_mutation(db.find_schema(db::system_keyspace::NAME, db::system_keyspace::GROUP0_HISTORY));
@@ -50,7 +50,7 @@ bool group0_state_machine_merger::can_merge(group0_command& cmd, size_t s) const
 }
 
 void group0_state_machine_merger::add(group0_command&& cmd, size_t added_size) {
-    slogger.trace("add to merging set new_state_id: {}", cmd.new_state_id);
+    g0smm_logger.trace("add to merging set new_state_id: {}", cmd.new_state_id);
     auto m = convert_history_mutation(std::move(cmd.history_append), _db);
     // Set `last_group0_state_id` to the maximum of the current value and `cmd.new_state_id`,
     // but make sure we compare them the same way timeuuids are compared in clustering keys
@@ -73,7 +73,7 @@ utils::chunked_vector<canonical_mutation>& group0_state_machine_merger::get_comm
             return chng.mutations;
         },
         [] (broadcast_table_query& query) -> utils::chunked_vector<canonical_mutation>& {
-            on_internal_error(slogger, "trying to merge broadcast table command");
+            on_internal_error(g0smm_logger, "trying to merge broadcast table command");
         },
         [] (topology_change& chng) -> utils::chunked_vector<canonical_mutation>& {
             return chng.mutations;
@@ -89,7 +89,7 @@ utils::chunked_vector<canonical_mutation>& group0_state_machine_merger::get_comm
 
 std::pair<group0_command, mutation> group0_state_machine_merger::merge() {
     auto& cmd = _cmd_to_merge.back(); // use metadata from the last merged command
-    slogger.trace("merge new_state_id: {}", cmd.new_state_id);
+    g0smm_logger.trace("merge new_state_id: {}", cmd.new_state_id);
     using mutation_set_type = std::unordered_set<mutation, mutation_hash_by_key, mutation_equals_by_key>;
     std::unordered_map<table_id, mutation_set_type> mutations;
 

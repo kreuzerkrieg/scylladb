@@ -39,6 +39,10 @@ target_sources(service
     topology_coordinator.cc
     topology_mutation.cc
     topology_state_machine.cc)
+# tablet_allocator.cc: "using namespace locator; using namespace replica;"
+# causes ambiguity for keyspace (locator::keyspace vs replica::keyspace).
+set_source_files_properties(tablet_allocator.cc
+  PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON)
 target_include_directories(service
   PUBLIC
     ${CMAKE_SOURCE_DIR})

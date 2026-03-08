@@ -21,7 +21,7 @@
 
 namespace gms {
 
-static logging::logger logger("features");
+static logging::logger fslogger("features");
 
 static const char* enable_test_feature_error_injection_name = "features_enable_test_feature";
 static const char* enable_test_feature_as_deprecated_error_injection_name = "features_enable_test_feature_as_deprecated";
@@ -159,7 +159,7 @@ feature& feature::operator=(feature&& other) {
 void feature::enable() {
     if (!_enabled) {
         if (this_shard_id() == 0) {
-            logger.info("Feature {} is enabled", name());
+            fslogger.info("Feature {} is enabled", name());
         }
         _enabled = true;
         _s();
@@ -207,7 +207,7 @@ future<> feature_service::enable_features_on_startup(db::system_keyspace& sys_ks
     check_features(persisted_features, persisted_unsafe_to_disable_features);
 
     for (auto&& f : persisted_features) {
-        logger.debug("Enabling persisted feature '{}'", f);
+        fslogger.debug("Enabling persisted feature '{}'", f);
         if (_registered_features.contains(sstring(f))) {
             features_to_enable.insert(std::move(f));
         }

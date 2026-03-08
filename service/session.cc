@@ -12,7 +12,7 @@
 
 namespace service {
 
-static logging::logger slogger("session");
+static logging::logger session_logger("session");
 
 
 session::guard::guard(session& s)
@@ -33,16 +33,16 @@ session::guard session_manager::enter_session(session_id id) {
         throw std::runtime_error(fmt::format("Session not found: {}", id));
     }
     auto guard = i->second->enter();
-    slogger.debug("session {} entered", id);
+    session_logger.debug("session {} entered", id);
     return guard;
 }
 
 void session_manager::create_session(session_id id) {
     auto [i, created] = _sessions.emplace(id, std::make_unique<session>(id));
     if (created) {
-        slogger.debug("session {} created", id);
+        session_logger.debug("session {} created", id);
     } else {
-        slogger.debug("session {} already exists", id);
+        session_logger.debug("session {} already exists", id);
     }
 }
 
@@ -64,10 +64,10 @@ future<> session_manager::drain_closing_sessions() {
         session& s = *i;
         ++i;
         auto id = s.id();
-        slogger.debug("draining session {}", id);
+        session_logger.debug("draining session {}", id);
         co_await s.close();
         if (_sessions.erase(id)) {
-            slogger.debug("session {} closed", id);
+            session_logger.debug("session {} closed", id);
         }
     }
 }

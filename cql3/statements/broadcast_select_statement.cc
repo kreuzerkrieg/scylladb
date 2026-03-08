@@ -24,10 +24,10 @@ namespace cql3 {
 
 namespace statements {
 
-static logging::logger logger("broadcast_select_statement");
+static logging::logger bsel_logger("broadcast_select_statement");
 
 static
-expr::expression get_key(const cql3::expr::expression& partition_key_restrictions) {
+expr::expression get_bsel_key(const cql3::expr::expression& partition_key_restrictions) {
     const auto* conjunction = cql3::expr::as_if<cql3::expr::conjunction>(&partition_key_restrictions);
 
     if (!conjunction || conjunction->children.size() != 1) {
@@ -79,7 +79,7 @@ broadcast_tables::prepared_select broadcast_select_statement::prepare_query() co
     }
 
     return {
-        .key = get_key(_restrictions->get_partition_key_restrictions())
+        .key = get_bsel_key(_restrictions->get_partition_key_restrictions())
     };
 }
 
@@ -106,7 +106,7 @@ broadcast_select_statement::execute_without_checking_exception_message(query_pro
     auto query_result = std::get_if<service::broadcast_tables::query_result_select>(&result);
 
     if (!query_result) {
-        on_internal_error(logger, "incorrect query result ");
+        on_internal_error(bsel_logger, "incorrect query result ");
     }
 
     auto result_set = std::make_unique<cql3::result_set>(std::vector{

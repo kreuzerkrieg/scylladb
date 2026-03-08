@@ -32,13 +32,12 @@ context::context(wasmtime::Engine& engine_ptr, std::string name, instance_cache&
     , total_fuel(total_fuel) {
 }
 
-static constexpr size_t WASM_PAGE_SIZE = 64 * 1024;
 
 static void init_abstract_arg(const abstract_type& t, const bytes_opt& param, wasmtime::ValVec& argv, wasmtime::Store& store, wasmtime::Instance& instance) {
         // set up exported memory's underlying buffer,
         // `memory` is required to be exported in the WebAssembly module
         auto memory = wasmtime::get_memory(instance, store);
-        size_t mem_size = memory->size(store) * WASM_PAGE_SIZE;
+        size_t mem_size = memory->size(store) * wasm::wasm_page_size;
         if (param && param->size() > std::numeric_limits<int32_t>::max()) {
             throw wasm::exception(format("Serialized parameter is too large: {} > {}", param->size(), std::numeric_limits<int32_t>::max()));
         }
@@ -46,8 +45,8 @@ static void init_abstract_arg(const abstract_type& t, const bytes_opt& param, wa
         if (param) {
             switch (uint32_t abi_ver = wasmtime::get_abi(instance, store, *memory)) {
                 case 1: {
-                    auto pre_grow = memory->grow(store, 1 + (serialized_size - 1) / WASM_PAGE_SIZE);
-                    mem_size = pre_grow * WASM_PAGE_SIZE;
+                    auto pre_grow = memory->grow(store, 1 + (serialized_size - 1) / wasm::wasm_page_size);
+                    mem_size = pre_grow * wasm::wasm_page_size;
                     break;
                 }
                 case 2: {

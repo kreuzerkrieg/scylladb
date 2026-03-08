@@ -11,6 +11,14 @@ target_sources(tools
     utils.cc
     lua_sstable_consumer.cc
     json_mutation_stream_parser.cc)
+# These tool entry-point files redefine app_name, global_options, etc.
+# and have conflicting type aliases (json_writer) and operator<< overloads.
+set_source_files_properties(
+    scylla-types.cc
+    scylla-sstable.cc
+    scylla-nodetool.cc
+    scylla-local-file-key-generator.cc
+  PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON)
 target_include_directories(tools
   PUBLIC
     ${CMAKE_SOURCE_DIR}

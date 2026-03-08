@@ -28,6 +28,16 @@ target_sources(test-lib
     azure_kms_fixture.cc
     limiting_data_source.cc
     )
+# gcs_fixture.cc: "using namespace utils::gcp;" brings gcp::storage into scope,
+# causing 'storage' ambiguity with other definitions.
+# boost_test_tree_lister.cc: PUBLIC source propagated to dependent targets (e.g.
+# test-perf) where 'using namespace seastar;' causes 'internal' ambiguity.
+# aws_kms_fixture.cc, azure_kms_fixture.cc: reference encryption:: symbols not
+# linked by all consumers; bundling them into a unity TU forces the linker to
+# pull in unresolved symbols that would otherwise be dead-stripped.
+set_source_files_properties(gcs_fixture.cc boost_test_tree_lister.cc
+    aws_kms_fixture.cc azure_kms_fixture.cc
+  PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON)
 target_include_directories(test-lib
   PUBLIC
     ${CMAKE_SOURCE_DIR})

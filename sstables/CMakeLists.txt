@@ -29,6 +29,11 @@ target_sources(sstables
     trie/bti_row_index_writer.cc
     trie/trie_writer.cc
     writer.cc)
+# object_storage_client.cc: "using namespace seastar; using namespace sstables;
+# using namespace utils;" pollutes scope, causing input_stream and coroutine ambiguity.
+# sstables.cc: redefines static check_buf_size() also present in m_format_read_helpers.cc.
+set_source_files_properties(object_storage_client.cc sstables.cc
+  PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON)
 target_include_directories(sstables
   PUBLIC
     ${CMAKE_SOURCE_DIR})

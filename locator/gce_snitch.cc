@@ -163,8 +163,8 @@ future<sstring> gce_snitch::read_property_file() {
     });
 }
 
-using registry_default = class_registrator<i_endpoint_snitch, gce_snitch, const snitch_config&>;
-static registry_default registrator_default_gce("org.apache.cassandra.locator.GoogleCloudSnitch");
-static registry_default registrator_default_gce_short_name("GoogleCloudSnitch");
+using registry_default_gce = class_registrator<i_endpoint_snitch, gce_snitch, const snitch_config&>;
+static registry_default_gce registrator_default_gce("org.apache.cassandra.locator.GoogleCloudSnitch");
+static registry_default_gce registrator_default_gce_short_name("GoogleCloudSnitch");
 
 } // namespace locator

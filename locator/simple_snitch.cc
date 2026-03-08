@@ -11,7 +11,7 @@
 #include "utils/class_registrator.hh"
 
 namespace locator {
-using registry = class_registrator<i_endpoint_snitch, simple_snitch, const snitch_config&>;
-static registry registrator1_ssnitch("org.apache.cassandra.locator.SimpleSnitch");
-static registry registrator2_ssnitch("SimpleSnitch");
+using registry_ssnitch = class_registrator<i_endpoint_snitch, simple_snitch, const snitch_config&>;
+static registry_ssnitch registrator1_ssnitch("org.apache.cassandra.locator.SimpleSnitch");
+static registry_ssnitch registrator2_ssnitch("SimpleSnitch");
 }

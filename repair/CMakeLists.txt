@@ -4,6 +4,10 @@ target_sources(repair
     repair.cc
     row_level.cc
     incremental.cc)
+# repair.cc includes row_level.hh which has fields only used by row_level.cc;
+# combining them in a unity TU triggers -Wunused-private-field.
+set_source_files_properties(repair.cc
+  PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON)
 target_include_directories(repair
   PUBLIC
     ${CMAKE_SOURCE_DIR})

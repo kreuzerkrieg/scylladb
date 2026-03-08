@@ -17,11 +17,11 @@
 
 namespace {
 
-using label_info = internal::label_info;
+using label_info = tree_lister_internal::label_info;
 
-using test_case_info = internal::test_case_info;
-using test_suite_info = internal::test_suite_info;
-using test_file_info = internal::test_file_info;
+using test_case_info = tree_lister_internal::test_case_info;
+using test_suite_info = tree_lister_internal::test_suite_info;
+using test_file_info = tree_lister_internal::test_file_info;
 
 } // anonymous namespace
 
@@ -391,8 +391,8 @@ static std::string escape_quotation_marks(std::string_view str) {
     return result;
 }
 
-auto fmt::formatter<internal::test_case_info>::format(
-        const internal::test_case_info& test_info,
+auto fmt::formatter<tree_lister_internal::test_case_info>::format(
+        const tree_lister_internal::test_case_info& test_info,
         fmt::format_context& ctx) const -> decltype(ctx.out())
 {
     // Sanity check. The names of tests are expected to comprise only of alphanumeric characters.
@@ -403,8 +403,8 @@ auto fmt::formatter<internal::test_case_info>::format(
             test_info.name, fmt::join(label_range, ","));
 }
 
-auto fmt::formatter<internal::test_suite_info>::format(
-        const internal::test_suite_info& suite_info,
+auto fmt::formatter<tree_lister_internal::test_suite_info>::format(
+        const tree_lister_internal::test_suite_info& suite_info,
         fmt::format_context& ctx) const -> decltype(ctx.out())
 {
     auto actual_suite_range = suite_info.subsuites | std::views::transform([] (auto&& ptr) -> const test_suite_info& {
@@ -416,8 +416,8 @@ auto fmt::formatter<internal::test_suite_info>::format(
             suite_info.name, std::move(suite_range), std::move(test_range));
 }
 
-auto fmt::formatter<internal::test_file_info>::format(
-        const internal::test_file_info& file_info,
+auto fmt::formatter<tree_lister_internal::test_file_info>::format(
+        const tree_lister_internal::test_file_info& file_info,
         fmt::format_context& ctx) const -> decltype(ctx.out())
 {
     auto suite_range = fmt::join(file_info.suites, ",");
@@ -426,8 +426,8 @@ auto fmt::formatter<internal::test_file_info>::format(
             std::move(suite_range), std::move(test_range));
 }
 
-auto fmt::formatter<internal::test_file_forest>::format(
-        const internal::test_file_forest& forest_info,
+auto fmt::formatter<tree_lister_internal::test_file_forest>::format(
+        const tree_lister_internal::test_file_forest& forest_info,
         fmt::format_context& ctx) const -> decltype(ctx.out())
 {
     std::size_t files_left = forest_info.test_files.size();

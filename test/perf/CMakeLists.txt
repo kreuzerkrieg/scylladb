@@ -35,6 +35,10 @@ target_sources(test-perf
     perf_tablets.cc
     tablet_load_balancing.cc
     perf.cc)
+# Disable unity build for test-perf: too many conflicts from PUBLIC sources
+# in test-lib (boost_test_tree_lister.cc 'internal' namespace ambiguity with
+# seastar::internal), plus test_config and using-namespace pollution.
+set_target_properties(test-perf PROPERTIES UNITY_BUILD OFF)
 target_include_directories(test-perf
   PUBLIC
     ${CMAKE_SOURCE_DIR})

@@ -13,7 +13,7 @@
 #include <seastar/core/sleep.hh>
 #include <seastar/http/exception.hh>
 
-static logger rs_logger("gcp_retry_strategy");
+static logger gcp_rs_logger("gcp_retry_strategy");
 
 namespace utils::gcp::storage {
 
@@ -26,15 +26,15 @@ object_storage_retry_strategy::object_storage_retry_strategy(unsigned max_retrie
 
 future<bool> object_storage_retry_strategy::should_retry(std::exception_ptr error, unsigned attempted_retries) const {
     if (attempted_retries >= _max_retries) {
-        rs_logger.warn("Retries exhausted. Retry# {}", attempted_retries);
+        gcp_rs_logger.warn("Retries exhausted. Retry# {}", attempted_retries);
         co_return false;
     }
     auto retryable = from_exception_ptr(error);
     if (retryable) {
-        rs_logger.debug("GCP client request failed. Reason: {}. Retry# {}", error, attempted_retries);
+        gcp_rs_logger.debug("GCP client request failed. Reason: {}. Retry# {}", error, attempted_retries);
         co_await (_as ? _exr.retry(*_as) : _exr.retry());
     } else {
-        rs_logger.warn("GCP client encountered non-retryable error. Reason: {}. Retry# {}", error, attempted_retries);
+        gcp_rs_logger.warn("GCP client encountered non-retryable error. Reason: {}. Retry# {}", error, attempted_retries);
     }
     co_return retryable;
 }

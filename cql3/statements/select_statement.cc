@@ -63,7 +63,7 @@
 #include "db/config.hh"
 
 
-template<typename T = void>
+template<typename T>
 using coordinator_result = cql3::statements::select_statement::coordinator_result<T>;
 
 bool is_internal_keyspace(std::string_view name);
@@ -91,7 +91,7 @@ auto measure_index_latency(const schema& schema, const secondary_index::index& i
 
 } // namespace
 
-static logging::logger logger("select_statement");
+static logging::logger sel_logger("select_statement");
 
 template<typename C>
 struct result_to_error_message_wrapper {
@@ -449,7 +449,7 @@ select_statement::do_execute(query_processor& qp,
             query::is_first_page::no,
             options.get_timestamp(state));
     command->allow_limit = db::allow_per_partition_rate_limit::yes;
-    logger.trace("Executing read query (reversed {}): table schema {}, query schema {}",
+    sel_logger.trace("Executing read query (reversed {}): table schema {}, query schema {}",
         command->slice.is_reversed(), _schema->version(), _query_schema->version());
     tracing::trace(state.get_trace_state(), "Executing read query (reversed {})", command->slice.is_reversed());
 
@@ -2056,7 +2056,7 @@ static uint32_t add_similarity_function_to_selectors(
 static select_statement::ordering_comparator_type get_similarity_ordering_comparator(std::vector<selection::prepared_selector>& prepared_selectors, uint32_t similarity_column_index) {
     auto type = expr::type_of(prepared_selectors[similarity_column_index].expr);
     if (type->get_kind() != abstract_type::kind::float_kind) {
-        seastar::on_internal_error(logger, "Similarity function must return float type.");
+        seastar::on_internal_error(sel_logger, "Similarity function must return float type.");
     }
     return [similarity_column_index, type] (const raw::select_statement::result_row_type& r1, const raw::select_statement::result_row_type& r2) {
         auto& c1 = r1[similarity_column_index];

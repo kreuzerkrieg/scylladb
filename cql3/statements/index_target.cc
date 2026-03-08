@@ -17,8 +17,6 @@ namespace cql3 {
 
 namespace statements {
 
-using db::index::secondary_index;
-
 const sstring index_target::target_option_name = "target";
 const boost::regex index_target::target_regex("^(keys|entries|values|full)\\((.+)\\)$");
 

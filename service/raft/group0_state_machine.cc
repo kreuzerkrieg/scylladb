@@ -52,7 +52,7 @@
 
 namespace service {
 
-static logging::logger slogger("group0_raft_sm");
+static logging::logger g0sm_logger("group0_raft_sm");
 
 group0_state_machine::group0_state_machine(raft_group0_client& client, migration_manager& mm, storage_proxy& sp, storage_service& ss,
         gms::gossiper& gossiper, gms::feature_service& feat)
@@ -69,7 +69,7 @@ static mutation extract_history_mutation(utils::chunked_vector<canonical_mutatio
     auto it = std::find_if(muts.begin(), muts.end(), [history_table_id = s->id()]
             (canonical_mutation& m) { return m.column_family_id() == history_table_id; });
     if (it == muts.end()) {
-        on_internal_error(slogger, "group0 history table mutation not found");
+        on_internal_error(g0sm_logger, "group0 history table mutation not found");
     }
     auto res = it->to_mutation(s);
     muts.erase(it);
@@ -130,7 +130,7 @@ static void collect_client_routes_update(const mutation& mut, client_routes_serv
 
 static future<> notify_client_route_change_if_needed(storage_service& storage_service, const client_routes_service::client_route_keys& client_routes_update) {
     if (client_routes_update.size() > 0) {
-        slogger.trace("write_mutations_to_database: notify_client_routes_change routes_update.size()={}", client_routes_update.size());
+        g0sm_logger.trace("write_mutations_to_database: notify_client_routes_change routes_update.size()={}", client_routes_update.size());
         co_await storage_service.notify_client_routes_change(client_routes_update);
     }
 }
@@ -150,7 +150,7 @@ static future<> maybe_partially_apply_cdc_generation_deletion_then_get_stuck(
         std::copy_if(mutations.begin(), mutations.end(), std::back_inserter(filtered_mutations), is_cdc_generation_data_clearing_mutation);
         co_await mutate(std::move(filtered_mutations));
         while (true) {
-            slogger.info("group0 has hung on error injection, waiting for the process to be killed");
+            g0sm_logger.info("group0 has hung on error injection, waiting for the process to be killed");
             co_await seastar::sleep(std::chrono::seconds(1));
         }
     }
@@ -176,7 +176,7 @@ future<> write_mutations_to_database(storage_service& storage_service, storage_p
             mutations.emplace_back(co_await freeze_gently(mut), s);
         }
     } catch (replica::no_such_column_family& e) {
-        slogger.error("Error while applying mutations from {}: {}", from, e);
+        g0sm_logger.error("Error while applying mutations from {}: {}", from, e);
         throw std::runtime_error(::format("Error while applying mutations: {}", e));
     }
 
@@ -189,7 +189,7 @@ future<> write_mutations_to_database(storage_service& storage_service, storage_p
     co_await mutate(std::move(mutations));
 
     if (need_system_topology_flush) {
-        slogger.trace("write_mutations_to_database: flushing {}.{}", db::system_keyspace::NAME, db::system_keyspace::TOPOLOGY);
+        g0sm_logger.trace("write_mutations_to_database: flushing {}.{}", db::system_keyspace::NAME, db::system_keyspace::TOPOLOGY);
         co_await proxy.get_db().local().flush(db::system_keyspace::NAME, db::system_keyspace::TOPOLOGY);
     }
 
@@ -324,15 +324,15 @@ static void ensure_group0_schema(const group0_command& cmd, data_dictionary::dat
             // Get the schema for the column family
             auto schema = db.find_schema(mut.column_family_id());
             if (!schema) {
-                on_internal_error(slogger, "ensure_group0_schema: schema not found");
+                on_internal_error(g0sm_logger, "ensure_group0_schema: schema not found");
             }
 
             if (!schema->static_props().is_group0_table) {
-                on_internal_error(slogger, fmt::format("ensure_group0_schema: schema is not group0: {}", schema->cf_name()));
+                on_internal_error(g0sm_logger, fmt::format("ensure_group0_schema: schema is not group0: {}", schema->cf_name()));
             }
 
             if (!schema->static_props().use_schema_commitlog) {
-                on_internal_error(slogger, fmt::format("ensure_group0_schema: group0 table {} does not use schema commitlog", schema->cf_name()));
+                on_internal_error(g0sm_logger, fmt::format("ensure_group0_schema: group0 table {} does not use schema commitlog", schema->cf_name()));
             }
         }
     };
@@ -358,7 +358,7 @@ static void ensure_group0_schema(const group0_command& cmd, data_dictionary::dat
 #endif
 
 future<> group0_state_machine::apply(std::vector<raft::command_cref> command) {
-    slogger.trace("apply() is called with {} commands", command.size());
+    g0sm_logger.trace("apply() is called with {} commands", command.size());
 
     co_await utils::get_local_injector().inject("group0_state_machine::delay_apply", 1s);
 
@@ -379,9 +379,9 @@ future<> group0_state_machine::apply(std::vector<raft::command_cref> command) {
         ensure_group0_schema(cmd, _sp.data_dictionary());
 #endif
 
-        slogger.trace("cmd: prev_state_id: {}, new_state_id: {}, creator_addr: {}, creator_id: {}",
+        g0sm_logger.trace("cmd: prev_state_id: {}, new_state_id: {}, creator_addr: {}, creator_id: {}",
                 cmd.prev_state_id, cmd.new_state_id, cmd.creator_addr, cmd.creator_id);
-        slogger.trace("cmd.history_append: {}", cmd.history_append);
+        g0sm_logger.trace("cmd.history_append: {}", cmd.history_append);
 
         if (cmd.prev_state_id) {
             if (*cmd.prev_state_id != m.last_id()) {
@@ -391,12 +391,12 @@ future<> group0_state_machine::apply(std::vector<raft::command_cref> command) {
                 // is the one given by the last command.
                 // Similar thing may happen when we pull group0 state in transfer_snapshot - we pull the latest state of remote tables,
                 // not state at the snapshot descriptor.
-                slogger.trace("cmd.prev_state_id ({}) different than last group 0 state ID in history table ({})",
+                g0sm_logger.trace("cmd.prev_state_id ({}) different than last group 0 state ID in history table ({})",
                         cmd.prev_state_id, m.last_id());
                 continue;
             }
         } else {
-            slogger.trace("unconditional modification, cmd.new_state_id: {}", cmd.new_state_id);
+            g0sm_logger.trace("unconditional modification, cmd.new_state_id: {}", cmd.new_state_id);
         }
 
         auto size = m.cmd_size(cmd);
@@ -465,7 +465,7 @@ future<> group0_state_machine::transfer_snapshot(raft::server_id from_id, raft::
 
     auto holder = _gate.hold();
 
-    slogger.trace("transfer snapshot from {} index {} snp id {}", hid, snp.idx, snp.id);
+    g0sm_logger.trace("transfer snapshot from {} index {} snp id {}", hid, snp.idx, snp.id);
     auto& as = _abort_source;
 
     // (Ab)use MIGRATION_REQUEST to also transfer group0 history table mutation besides schema tables mutations.
@@ -473,7 +473,7 @@ future<> group0_state_machine::transfer_snapshot(raft::server_id from_id, raft::
     if (!cm) {
         // If we're running this code then remote supports Raft group 0, so it should also support canonical mutations
         // (which were introduced a long time ago).
-        on_internal_error(slogger, "Expected MIGRATION_REQUEST to return canonical mutations");
+        on_internal_error(g0sm_logger, "Expected MIGRATION_REQUEST to return canonical mutations");
     }
 
     std::optional<service::raft_snapshot> topology_snp;
@@ -521,7 +521,7 @@ future<> group0_state_machine::transfer_snapshot(raft::server_id from_id, raft::
             for (auto& canonical_mut : raft_snp->mutations) {
                 if (canonical_mut.column_family_id() == s_client_routes->id()) {
                     auto mut = co_await to_mutation_gently(canonical_mut, s_client_routes);
-                    slogger.trace("transfer snapshot: raft snapshot includes client_routes mutation");
+                    g0sm_logger.trace("transfer snapshot: raft snapshot includes client_routes mutation");
                     collect_client_routes_update(mut, client_routes_update);
                 }
             }

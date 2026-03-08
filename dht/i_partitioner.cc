@@ -24,7 +24,7 @@
 
 namespace dht {
 
-static logging::logger logger("i_partitioner");
+static logging::logger iplogger("i_partitioner");
 
 sharder::sharder(unsigned shard_count, unsigned sharding_ignore_msb_bits)
     : _shard_count(shard_count)
@@ -454,7 +454,7 @@ dht::token_range_vector split_token_range_msb(unsigned most_significant_bits) {
         } else {
             auto token = dht::next_token(prev_last_token);
             if (compaction_group_of(most_significant_bits, token) != i) {
-                on_fatal_internal_error(logger, format("split_token_range_msb: inconsistent end_bound compaction group: index={} msbits={} token={} compaction_group_of={}",
+                on_fatal_internal_error(iplogger, format("split_token_range_msb: inconsistent end_bound compaction group: index={} msbits={} token={} compaction_group_of={}",
                                                        i, most_significant_bits, token, compaction_group_of(most_significant_bits, token)));
             }
             start_bound = dht::token_range::bound(prev_last_token, false);

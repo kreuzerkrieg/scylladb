@@ -219,7 +219,7 @@ future<> gossiping_property_file_snitch::pause_io() {
     co_await stop_io();
 }
 
-using registry_default = class_registrator<i_endpoint_snitch, gossiping_property_file_snitch, const snitch_config&>;
-static registry_default registrator_default_gpfs("org.apache.cassandra.locator.GossipingPropertyFileSnitch");
-static registry_default registrator_default_gpfs_short_name("GossipingPropertyFileSnitch");
+using registry_default_gpfs = class_registrator<i_endpoint_snitch, gossiping_property_file_snitch, const snitch_config&>;
+static registry_default_gpfs registrator_default_gpfs("org.apache.cassandra.locator.GossipingPropertyFileSnitch");
+static registry_default_gpfs registrator_default_gpfs_short_name("GossipingPropertyFileSnitch");
 } // namespace locator

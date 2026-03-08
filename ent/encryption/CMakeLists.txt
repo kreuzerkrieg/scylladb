@@ -22,6 +22,10 @@ target_sources(scylla_encryption
     symmetric_key.cc
     system_key.cc
     utils.cc)
+# gcp_host.cc and kms_host.cc: each defines a static get_option() template
+# that conflicts with azure_host.cc's get_option() (different option_override types).
+set_source_files_properties(gcp_host.cc kms_host.cc
+  PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON)
 target_include_directories(scylla_encryption
   PUBLIC
     ${CMAKE_SOURCE_DIR})

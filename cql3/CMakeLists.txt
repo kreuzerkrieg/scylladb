@@ -127,6 +127,11 @@ target_sources(cql3
     result_set.cc
     prepare_context.cc
     ${cql_grammar_srcs})
+# aggregate_fcts.cc has "using namespace cql3; using namespace functions;"
+# which leaks cql3::functions::detail into global scope, causing ambiguity
+# with ::detail used in db/commitlog headers included by other files in batch.
+set_source_files_properties(functions/aggregate_fcts.cc
+  PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON)
 target_include_directories(cql3
   PUBLIC
     ${CMAKE_SOURCE_DIR}

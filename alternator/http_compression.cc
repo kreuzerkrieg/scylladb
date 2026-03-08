@@ -11,7 +11,7 @@
 #include <seastar/coroutine/maybe_yield.hh>
 #include <zlib.h>
 
-static logging::logger slogger("alternator-http-compression");
+static logging::logger hc_slogger("alternator-http-compression");
 
 namespace alternator {
 
@@ -92,7 +92,7 @@ static inline std::string_view trim(std::string_view sv) {
     return trim_left(trim_right(sv));
 }
 
-inline std::vector<std::string_view> split(std::string_view text, char separator) {
+inline std::vector<std::string_view> hc_split(std::string_view text, char separator) {
     std::vector<std::string_view> tokens;
     if (text == "") {
         return tokens;
@@ -125,9 +125,9 @@ response_compressor::compression_type response_compressor::find_compression(std:
     ct_q[static_cast<size_t>(compression_type::none)] = std::numeric_limits<float>::min(); // enabled, but lowest priority
     compression_type selected_ct = compression_type::none;
 
-    std::vector<std::string_view> entries = split(accept_encoding, ',');
+    std::vector<std::string_view> entries = hc_split(accept_encoding, ',');
     for (auto& e : entries) {
-        std::vector<std::string_view> params = split(e, ';');
+        std::vector<std::string_view> params = hc_split(e, ';');
         if (params.size() == 0) {
             continue;
         }
@@ -279,9 +279,9 @@ executor::body_writer compress(response_compressor::compression_type ct, const d
             case response_compressor::compression_type::none:
             case response_compressor::compression_type::any:
             case response_compressor::compression_type::unknown:
-                on_internal_error(slogger,"Compression not selected");
+                on_internal_error(hc_slogger,"Compression not selected");
             default:
-                on_internal_error(slogger, "Unsupported compression type for data sink");
+                on_internal_error(hc_slogger, "Unsupported compression type for data sink");
         }
         return bw(output_stream<char>(data_sink(std::move(data_sink_impl)), compressed_buffer_size, opts));
     };

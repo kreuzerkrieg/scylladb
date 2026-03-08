@@ -20,6 +20,11 @@ target_sources(alternator
     parsed_expression_cache.cc
     http_compression.cc
     ${cql_grammar_srcs})
+# Generated ANTLR parser/lexer files redefine static 'fileName' variable.
+set_source_files_properties(
+    ${CMAKE_CURRENT_BINARY_DIR}/expressionsParser.cpp
+    ${CMAKE_CURRENT_BINARY_DIR}/expressionsLexer.cpp
+  PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON)
 target_include_directories(alternator
   PUBLIC
     ${CMAKE_SOURCE_DIR}

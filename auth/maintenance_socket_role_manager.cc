@@ -18,15 +18,15 @@
 
 namespace auth {
 
-static logging::logger log("maintenance_socket_role_manager");
+static logging::logger msrm_log("maintenance_socket_role_manager");
 
 future<> maintenance_socket_role_manager::ensure_role_operations_are_enabled() {
     if (_is_maintenance_mode) {
-        on_internal_error(log, "enabling role operations not allowed in maintenance mode");
+        on_internal_error(msrm_log, "enabling role operations not allowed in maintenance mode");
     }
 
     if (_std_mgr.has_value()) {
-        on_internal_error(log, "role operations are already enabled");
+        on_internal_error(msrm_log, "role operations are already enabled");
     }
 
     _std_mgr.emplace(_qp, _group0_client, _migration_manager, _cache);
@@ -35,7 +35,7 @@ future<> maintenance_socket_role_manager::ensure_role_operations_are_enabled() {
 
 void maintenance_socket_role_manager::set_maintenance_mode() {
     if (_std_mgr.has_value()) {
-        on_internal_error(log, "cannot enter maintenance mode after role operations have been enabled");
+        on_internal_error(msrm_log, "cannot enter maintenance mode after role operations have been enabled");
     }
     _is_maintenance_mode = true;
 }

@@ -29,6 +29,14 @@ if(DEFINED CMAKE_BUILD_TYPE)
 endif(DEFINED CMAKE_BUILD_TYPE)
 
 option(Scylla_ENABLE_LTO "Turn on link-time optimization for the 'release' mode." ON)
+option(Scylla_UNITY_BUILD "Enable unity build for faster compilation." OFF)
+
+if(Scylla_UNITY_BUILD)
+    set(CMAKE_UNITY_BUILD ON)
+    set(CMAKE_UNITY_BUILD_BATCH_SIZE 16)
+    # Seastar and abseil are third-party; skip them from unity build.
+    set(Seastar_UNITY_BUILD OFF CACHE BOOL "" FORCE)
+endif()
 
 include(mode.common)
 get_property(is_multi_config GLOBAL PROPERTY GENERATOR_IS_MULTI_CONFIG)
@@ -122,6 +130,11 @@ else()
         set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
     endif()
     add_subdirectory(seastar)
+    # Seastar is third-party; disable unity build on it to avoid conflicts
+    # in system headers and internal anonymous namespace symbols.
+    if(Scylla_UNITY_BUILD)
+        set_target_properties(seastar PROPERTIES UNITY_BUILD OFF)
+    endif()
 
     # Coverage mode sets cmake_build_type='Debug' for Seastar
     # (configure.py:515), so Seastar's pkg-config output includes sanitizer
@@ -160,7 +173,15 @@ elseif(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
 endif()
 set(ABSL_DEFAULT_LINKOPTS
     $<$<CONFIG:Debug,Sanitize>:$<TARGET_PROPERTY:Sanitizers::address,INTERFACE_LINK_LIBRARIES>;$<TARGET_PROPERTY:Sanitizers::undefined_behavior,INTERFACE_LINK_LIBRARIES>>)
+# Abseil is third-party; disable unity build to avoid redefinition
+# conflicts in its internal anonymous namespaces.
+if(Scylla_UNITY_BUILD)
+    set(CMAKE_UNITY_BUILD OFF)
+endif()
 add_subdirectory(abseil)
+if(Scylla_UNITY_BUILD)
+    set(CMAKE_UNITY_BUILD ON)
+endif()
 add_library(absl-headers INTERFACE)
 target_include_directories(absl-headers SYSTEM INTERFACE
     "${PROJECT_SOURCE_DIR}/abseil")

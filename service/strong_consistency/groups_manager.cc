@@ -20,7 +20,7 @@ namespace service::strong_consistency {
 
 using namespace locator;
 
-static logging::logger logger("sc_groups_manager");
+static logging::logger scgm_logger("sc_groups_manager");
 
 static raft::server_id to_server_id(host_id host_id) {
     return raft::server_id{host_id.uuid()};
@@ -136,7 +136,7 @@ future<> groups_manager::start_raft_group(global_tablet_id tablet,
     auto config = raft::server::configuration {
         .enable_forwarding = false,
         .on_background_error = [tablet, group_id](std::exception_ptr e) {
-            on_internal_error(logger, 
+            on_internal_error(scgm_logger, 
                 ::format("table {}, tablet {} raft group {} background error {}", 
                     tablet.table, tablet.tablet, group_id, e));
         }
@@ -160,7 +160,7 @@ void groups_manager::schedule_raft_group_deletion(raft::group_id id, raft_group_
     if (state.gate->is_closed()) {
         return;
     }
-    logger.info("schedule_raft_group_deletion(): group id {}", id);
+    scgm_logger.info("schedule_raft_group_deletion(): group id {}", id);
     state.server_control_op = futurize_invoke([this, &state, id, g = state.gate](this auto) -> future<> {
         co_await state.server_control_op.get_future();
         co_await g->close();
@@ -168,13 +168,13 @@ void groups_manager::schedule_raft_group_deletion(raft::group_id id, raft_group_
         co_await std::move(state.leader_info_updater);
 
         _raft_gr.destroy_server(id);
-        logger.info("schedule_raft_group_deletion(): raft server for group id {} is destroyed", id);
+        scgm_logger.info("schedule_raft_group_deletion(): raft server for group id {} is destroyed", id);
 
         // We need to erase the raft group state only if we are still the last operation on it.
         // If another start arrived while we were stopping the raft server, a new gate
         // would have been assigned, and we should leave the state in the map.
         if (state.gate.get() == g.get() && _raft_groups.erase(id) != 1) {
-            on_internal_error(logger, format("raft group {} is already deleted", id));
+            on_internal_error(scgm_logger, format("raft group {} is already deleted", id));
         }
     });
 }
@@ -201,7 +201,7 @@ future<> groups_manager::wait_for_groups_to_start() {
         }
 
         const auto& [id, state] = *it;
-        logger.info("waiting for group {} to start", id);
+        scgm_logger.info("waiting for group {} to start", id);
         co_await state.server_control_op.get_future();
     }
 }
@@ -216,7 +216,7 @@ future<> groups_manager::leader_info_updater(raft_group_state& state, global_tab
             const auto current_leader = state.server->current_leader();
 
             if (current_leader == server_id) {
-                logger.debug("leader_info_updater({}-{}): current term {}, running read_barrier()",
+                scgm_logger.debug("leader_info_updater({}-{}): current term {}, running read_barrier()",
                     tablet, gid,
                     current_term);
                 co_await state.server->read_barrier(nullptr);
@@ -224,13 +224,13 @@ future<> groups_manager::leader_info_updater(raft_group_state& state, global_tab
                     .term = current_term,
                     .last_timestamp = schema->table().get_max_timestamp_for_tablet(tablet.tablet)
                 };
-                logger.debug("leader_info_updater({}-{}): read_barrier() completed, "
+                scgm_logger.debug("leader_info_updater({}-{}): read_barrier() completed, "
                     "new leader term {}, last_timestamp {}",
                     tablet, gid,
                     state.leader_info->term,
                     state.leader_info->last_timestamp);
             } else if (state.leader_info) {
-                logger.debug("leader_info_updater({}-{}): this replica {} is no longer a leader, current leader {}",
+                scgm_logger.debug("leader_info_updater({}-{}): this replica {} is no longer a leader, current leader {}",
                     tablet, gid, server_id, current_leader);
                 state.leader_info = std::nullopt;
             }
@@ -240,15 +240,15 @@ future<> groups_manager::leader_info_updater(raft_group_state& state, global_tab
         }
     } catch (const raft::request_aborted&) {
         // thrown from read_barrier() and wait_for_state_change when the tablet leaves this shard
-        logger.debug("leader_info_updater({}-{}): got raft::request_aborted {}",
+        scgm_logger.debug("leader_info_updater({}-{}): got raft::request_aborted {}",
             tablet, gid, std::current_exception());
     } catch (const raft::stopped_error&) {
         // thrown from read_barrier() and wait_for_state_change when the tablet leaves this shard
-        logger.debug("leader_info_updater({}-{}): got raft::stopped_error {}",
+        scgm_logger.debug("leader_info_updater({}-{}): got raft::stopped_error {}",
             tablet, gid, std::current_exception());
     } catch (const replica::no_such_column_family&) {
         // thrown from find_schema() and schema->table() when the table is dropped
-        logger.debug("leader_info_updater({}-{}): got replica::no_such_column_family {}",
+        scgm_logger.debug("leader_info_updater({}-{}): got replica::no_such_column_family {}",
             tablet, gid, std::current_exception());
     }
 }
@@ -276,14 +276,14 @@ void groups_manager::update(token_metadata_ptr new_tm) {
             return;
         }
 
-        logger.info("update(): starting raft server for tablet {}, group id {}", tablet, id);
+        scgm_logger.info("update(): starting raft server for tablet {}, group id {}", tablet, id);
         state.gate = make_lw_shared<gate>();
         state.server_control_op = futurize_invoke([&state, this, tablet, id, new_tm](this auto) -> future<> {
             co_await state.server_control_op.get_future();
             co_await start_raft_group(tablet, id, std::move(new_tm));
             state.server = &_raft_gr.get_server(id);
             state.leader_info_updater = leader_info_updater(state, tablet, id);
-            logger.info("update(): raft server for tablet {} and group id {} is started", tablet, id);
+            scgm_logger.info("update(): raft server for tablet {} and group id {} is started", tablet, id);
         });
     });
 
@@ -292,12 +292,12 @@ void groups_manager::update(token_metadata_ptr new_tm) {
 
 future<raft_server> groups_manager::acquire_server(raft::group_id group_id) {
     if (!_features.strongly_consistent_tables) {
-        on_internal_error(logger, "strongly consistent tables are not enabled on this shard");
+        on_internal_error(scgm_logger, "strongly consistent tables are not enabled on this shard");
     }
 
     const auto it = _raft_groups.find(group_id);
     if (it == _raft_groups.end()) {
-        on_internal_error(logger, format("raft group {} not found", group_id));
+        on_internal_error(scgm_logger, format("raft group {} not found", group_id));
     }
     auto& state = it->second;
     return state.server_control_op.get_future().then([&state, h = state.gate->hold()] mutable {
@@ -323,7 +323,7 @@ future<> groups_manager::stop() {
         co_return;
     }
 
-    logger.info("stop() enter");
+    scgm_logger.info("stop() enter");
 
     schedule_raft_groups_deletion(true);
 
@@ -331,7 +331,7 @@ future<> groups_manager::stop() {
         co_await _raft_groups.begin()->second.server_control_op.get_future();
     }
 
-    logger.info("stop() completed");
+    scgm_logger.info("stop() completed");
 }
 
 }

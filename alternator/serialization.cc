@@ -15,7 +15,7 @@
 #include "types/json_utils.hh"
 #include "mutation/position_in_partition.hh"
 
-static logging::logger slogger("alternator-serialization");
+static logging::logger serial_slogger("alternator-serialization");
 
 namespace alternator {
 
@@ -191,7 +191,7 @@ bytes serialize_item(const rjson::value& item) {
     type_info type_info = type_info_from_string(rjson::to_string_view(it->name)); // JSON keys are guaranteed to be strings
 
     if (type_info.atype == alternator_type::NOT_SUPPORTED_YET) {
-        slogger.trace("Non-optimal serialization of type {}", it->name);
+        serial_slogger.trace("Non-optimal serialization of type {}", it->name);
         return bytes{int8_t(type_info.atype)} + to_bytes(rjson::print(item));
     }
 
@@ -236,7 +236,7 @@ rjson::value deserialize_item(bytes_view bv) {
     bv.remove_prefix(1);
 
     if (atype == alternator_type::NOT_SUPPORTED_YET) {
-        slogger.trace("Non-optimal deserialization of alternator type {}", int8_t(atype));
+        serial_slogger.trace("Non-optimal deserialization of alternator type {}", int8_t(atype));
         return rjson::parse(std::string_view(reinterpret_cast<const char *>(bv.data()), bv.size()));
     }
     type_representation type_representation = represent_type(atype);

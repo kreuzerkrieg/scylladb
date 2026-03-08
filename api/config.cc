@@ -66,7 +66,7 @@ future<> get_config_swagger_entry(std::string_view name, const std::string& desc
     return os.write(ss.str());
 }
 
-namespace cs = httpd::config_json;
+namespace cj = httpd::config_json;
 
 void set_config(std::shared_ptr < api_registry_builder20 > rb, http_context& ctx, routes& r, db::config& cfg, bool first) {
     rb->register_function(r, [&cfg, first] (output_stream<char>& os) {
@@ -82,7 +82,7 @@ void set_config(std::shared_ptr < api_registry_builder20 > rb, http_context& ctx
         });
     });
 
-    cs::find_config_id.set(r, [&cfg] (const_req r) {
+    cj::find_config_id.set(r, [&cfg] (const_req r) {
         auto id = r.get_path_param("id");
         for (auto&& cfg_ref : cfg.values()) {
             auto&& cfg = cfg_ref.get();
@@ -192,7 +192,7 @@ void set_config(std::shared_ptr < api_registry_builder20 > rb, http_context& ctx
 }
 
 void unset_config(http_context& ctx, routes& r) {
-    cs::find_config_id.unset(r);
+    cj::find_config_id.unset(r);
     sp::get_rpc_timeout.unset(r);
     sp::set_rpc_timeout.unset(r);
     sp::get_read_rpc_timeout.unset(r);

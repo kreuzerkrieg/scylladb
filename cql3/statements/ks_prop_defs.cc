@@ -26,7 +26,7 @@ namespace cql3 {
 
 namespace statements {
 
-static logging::logger logger("ks_prop_defs");
+static logging::logger kspd_logger("ks_prop_defs");
 
 static
 locator::replication_strategy_config_option
@@ -37,7 +37,7 @@ expand_to_racks(const locator::token_metadata& tm,
 {
     auto dc_racks = locator::get_allowed_racks(tm, dc);
 
-    logger.debug("expand_to_racks: dc={} rf={} allowed_racks={}", dc, rf, dc_racks);
+    kspd_logger.debug("expand_to_racks: dc={} rf={} allowed_racks={}", dc, rf, dc_racks);
 
     if (!tm.get_topology().get_datacenters().contains(dc)) {
         throw exceptions::configuration_exception(fmt::format("Unrecognized datacenter name '{}'", dc));
@@ -110,7 +110,7 @@ static locator::replication_strategy_config_options prepare_options(
     const auto& all_dcs = tm.get_datacenter_racks_token_owners();
     auto auto_expand_racks = uses_tablets && rack_list_enabled && (rf_rack_valid_keyspaces || enforce_rack_list);
 
-    logger.debug("prepare_options: {}: is_nts={} auto_expand_racks={} rack_list_enabled={} old_options={} new_options={} all_dcs={}",
+    kspd_logger.debug("prepare_options: {}: is_nts={} auto_expand_racks={} rack_list_enabled={} old_options={} new_options={} all_dcs={}",
                  strategy_class, is_nts, auto_expand_racks, rack_list_enabled, old_options, options, all_dcs);
 
     if (!is_nts) {
@@ -120,7 +120,7 @@ static locator::replication_strategy_config_options prepare_options(
     if (uses_tablets) {
         for (const auto& opt: old_options) {
             if (opt.first == ks_prop_defs::REPLICATION_FACTOR_KEY) {
-                on_internal_error(logger, format("prepare_options: old_options contains invalid key '{}'", ks_prop_defs::REPLICATION_FACTOR_KEY));
+                on_internal_error(kspd_logger, format("prepare_options: old_options contains invalid key '{}'", ks_prop_defs::REPLICATION_FACTOR_KEY));
             }
             if (!options.contains(opt.first)) {
                 throw exceptions::configuration_exception(fmt::format("Attempted to implicitly drop replicas in datacenter {}. If this is the desired behavior, set replication factor to 0 in {} explicitly.", opt.first, opt.first));

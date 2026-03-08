@@ -102,8 +102,8 @@ future<dht::token_range_vector> local_effective_replication_map::get_ranges(host
     return make_ready_future<dht::token_range_vector>();
 }
 
-using registry = class_registrator<abstract_replication_strategy, local_strategy, replication_strategy_params, const topology*>;
-static registry registrator_ls("org.apache.cassandra.locator.LocalStrategy");
-static registry registrator_ls_short_name("LocalStrategy");
+using registry_ls = class_registrator<abstract_replication_strategy, local_strategy, replication_strategy_params, const topology*>;
+static registry_ls registrator_ls("org.apache.cassandra.locator.LocalStrategy");
+static registry_ls registrator_ls_short_name("LocalStrategy");
 
 }

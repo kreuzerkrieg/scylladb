@@ -46,6 +46,11 @@ target_sources(db
     tablet_options.cc
     object_storage_endpoint_param.cc
     )
+# config.cc: "using namespace db::fs;" causes utils::coroutine ambiguity.
+# hints/manager.cc: "using namespace internal;" leaks db::hints::internal into
+# global scope, conflicting with seastar::internal and breaking cql3/error_collector.hh.
+set_source_files_properties(config.cc hints/manager.cc
+  PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON)
 target_include_directories(db
   PUBLIC
     ${CMAKE_SOURCE_DIR})

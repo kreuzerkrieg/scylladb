@@ -38,7 +38,7 @@ namespace cql3 {
 
 namespace statements {
 
-static logging::logger mylogger("create_table");
+static logging::logger ct_logger("create_table");
 
 create_table_statement::create_table_statement(cf_name name,
                                                ::shared_ptr<cf_prop_defs> properties,
@@ -198,7 +198,7 @@ std::unique_ptr<prepared_statement> create_table_statement::raw_statement::prepa
     std::vector<sstring> stmt_warnings;
     auto stmt_warning = [&] (sstring msg) {
         if (this_shard_id() == 0) {
-            mylogger.warn("{}: {}", cf_name, msg);
+            ct_logger.warn("{}: {}", cf_name, msg);
         }
         stmt_warnings.emplace_back(std::move(msg));
     };
@@ -206,7 +206,7 @@ std::unique_ptr<prepared_statement> create_table_statement::raw_statement::prepa
     if (warning) {
         // FIXME: should this warning be returned to the caller?
         // See https://github.com/scylladb/scylladb/issues/20945
-        mylogger.warn("{}", *warning);
+        ct_logger.warn("{}", *warning);
     }
     const bool has_default_ttl = _properties.properties()->get_default_time_to_live() > 0;
 

@@ -77,9 +77,9 @@ dht::token fixed_shard_partitioner::get_token(const sstables::key_view& key) con
     });
 }
 
-using registry = class_registrator<dht::i_partitioner, fixed_shard_partitioner>;
-static registry registrator_fsp(fixed_shard_partitioner::classname);
-static registry registrator_fsp_short_name("FixedShardPartitioner");
+using registry_fsp = class_registrator<dht::i_partitioner, fixed_shard_partitioner>;
+static registry_fsp registrator_fsp(fixed_shard_partitioner::classname);
+static registry_fsp registrator_fsp_short_name("FixedShardPartitioner");
 
 fixed_shard_sharder& fixed_shard_sharder::instance() {
     static thread_local fixed_shard_sharder sharder;

@@ -395,3 +395,13 @@ add_scylla_test(combined_tests
     idl
     tools
     utils)
+# Skip the fattest test files from unity batches: they take 90-134s individually
+# and bundling 16 of them into one TU creates ~200s compilation units that
+# dominate the critical path. Compiling them individually allows parallelism.
+set_source_files_properties(
+    cql_query_test.cc
+    database_test.cc
+    tablets_test.cc
+    mutation_reader_test.cc
+    row_cache_test.cc
+  PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON)

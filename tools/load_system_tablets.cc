@@ -25,7 +25,7 @@
 
 namespace {
 
-logging::logger logger{"load_sys_tablets"};
+logging::logger lst_logger{"load_sys_tablets"};
 
 future<utils::UUID> get_table_id(std::filesystem::path scylla_data_path,
                                  std::string_view keyspace_name,
