@@ -25,7 +25,7 @@
 
 static logging::logger vug_logger("view_update_generator");
 
-static inline void inject_failure(std::string_view operation) {
+static inline void inject_failure_vug(std::string_view operation) {
     utils::get_local_injector().inject(operation,
             [operation] { throw std::runtime_error(std::string(operation)); });
 }
@@ -154,7 +154,7 @@ future<> view_update_generator::start() {
                 }
 
                 try {
-                    inject_failure("view_update_generator_collect_consumed_sstables");
+                    inject_failure_vug("view_update_generator_collect_consumed_sstables");
                     _progress_tracker->on_sstables_deregistration(sstables);
                     // collect all staging sstables to move in a map, grouped by table.
                     std::move(sstables.begin(), sstables.end(), std::back_inserter(_sstables_to_move[t]));
@@ -174,7 +174,7 @@ future<> view_update_generator::start() {
             for (auto it = _sstables_to_move.begin(); it != _sstables_to_move.end(); ) {
                 auto& [t, sstables] = *it;
                 try {
-                    inject_failure("view_update_generator_move_staging_sstable");
+                    inject_failure_vug("view_update_generator_move_staging_sstable");
                     t->move_sstables_from_staging(sstables).get();
                 } catch (...) {
                     // Move from staging will be retried upon restart.
@@ -229,7 +229,7 @@ std::pair<stop_iteration, uint64_t> view_update_generator::generate_updates_from
             ::mutation_reader::forwarding::no);
     auto close_sr = deferred_close(staging_sstable_reader);
 
-    inject_failure("view_update_generator_consume_staging_sstable");
+    inject_failure_vug("view_update_generator_consume_staging_sstable");
     auto result = staging_sstable_reader.consume_in_thread(view_updating_consumer(*this, s, std::move(permit), *table, sstables, _as, staging_sstable_reader_handle));
     return std::make_pair(result, input_size);
 }
@@ -304,7 +304,7 @@ future<> view_update_generator::register_staging_sstable(sstables::shared_sstabl
     if (_as.abort_requested()) {
         return make_ready_future<>();
     }
-    inject_failure("view_update_generator_registering_staging_sstable");
+    inject_failure_vug("view_update_generator_registering_staging_sstable");
     _progress_tracker->on_sstable_registration(sst);
     _sstables_with_tables[table].push_back(std::move(sst));
 

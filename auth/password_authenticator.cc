@@ -73,15 +73,15 @@ sstring password_authenticator::update_row_query() const {
             meta::roles_table::role_col_name);
 }
 
-static const sstring legacy_table_name{"credentials"};
+static const sstring legacy_table_name_pa{"credentials"};
 
 bool password_authenticator::legacy_metadata_exists() const {
-    return _qp.db().has_schema(meta::legacy::AUTH_KS, legacy_table_name);
+    return _qp.db().has_schema(meta::legacy::AUTH_KS, legacy_table_name_pa);
 }
 
 future<> password_authenticator::migrate_legacy_metadata() const {
     plogger.info("Starting migration of legacy authentication metadata.");
-    static const sstring query = seastar::format("SELECT * FROM {}.{}", meta::legacy::AUTH_KS, legacy_table_name);
+    static const sstring query = seastar::format("SELECT * FROM {}.{}", meta::legacy::AUTH_KS, legacy_table_name_pa);
 
     return _qp.execute_internal(
             query,

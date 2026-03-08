@@ -152,6 +152,6 @@ future<sstring> ec2_snitch::read_property_file() {
 }
 
 using registry_default = class_registrator<i_endpoint_snitch, ec2_snitch, const snitch_config&>;
-static registry_default registrator_default("org.apache.cassandra.locator.Ec2Snitch");
-static registry_default registrator_default_short_name("Ec2Snitch");
+static registry_default registrator_default_ec2("org.apache.cassandra.locator.Ec2Snitch");
+static registry_default registrator_default_ec2_short_name("Ec2Snitch");
 } // namespace locator

@@ -41,7 +41,7 @@
 namespace auth {
 
 
-static logging::logger log("standard_role_manager");
+static logging::logger srm_log("standard_role_manager");
 
 static db::consistency_level consistency_for_role(std::string_view role_name) noexcept {
     if (role_name == meta::DEFAULT_SUPERUSER_NAME) {
@@ -177,7 +177,7 @@ future<> standard_role_manager::create_legacy_metadata_tables_if_missing() const
 
 future<> standard_role_manager::legacy_create_default_role_if_missing() {
     if (_superuser.empty()) {
-        on_internal_error(log, "Legacy auth default superuser name is empty");
+        on_internal_error(srm_log, "Legacy auth default superuser name is empty");
     }
     try {
         const auto exists = co_await legacy::default_role_row_satisfies(_qp, &has_can_login, _superuser);
@@ -194,9 +194,9 @@ future<> standard_role_manager::legacy_create_default_role_if_missing() {
                 internal_distributed_query_state(),
                 {_superuser},
                 cql3::query_processor::cache_internal::no).discard_result();
-        log.info("Created default superuser role '{}'.", _superuser);
+        srm_log.info("Created default superuser role '{}'.", _superuser);
     } catch (const exceptions::unavailable_exception& e) {
-        log.warn("Skipped default role setup: some nodes were not ready; will retry");
+        srm_log.warn("Skipped default role setup: some nodes were not ready; will retry");
         throw e;
     }
 }
@@ -235,7 +235,7 @@ future<> standard_role_manager::maybe_create_default_role() {
             meta::roles_table::role_col_name);
     co_await collect_mutations(_qp, batch, insert_query, {_superuser});
     co_await std::move(batch).commit(_group0_client, _as, get_raft_timeout());
-    log.info("Created default superuser role '{}'.", _superuser);
+    srm_log.info("Created default superuser role '{}'.", _superuser);
 }
 
 future<> standard_role_manager::maybe_create_default_role_with_retries() {
@@ -244,29 +244,29 @@ future<> standard_role_manager::maybe_create_default_role_with_retries() {
         try {
             co_return co_await maybe_create_default_role();
         } catch (const ::service::group0_concurrent_modification& ex) {
-            log.warn("Failed to execute maybe_create_default_role due to guard conflict.{}.", retries ? " Retrying" : " Number of retries exceeded, giving up");
+            srm_log.warn("Failed to execute maybe_create_default_role due to guard conflict.{}.", retries ? " Retrying" : " Number of retries exceeded, giving up");
             if (retries--) {
                 continue;
             }
             // Log error but don't crash the whole node startup sequence.
-            log.error("Failed to create default superuser role due to guard conflict.");
+            srm_log.error("Failed to create default superuser role due to guard conflict.");
             co_return;
         } catch (const ::service::raft_operation_timeout_error& ex) {
-            log.error("Failed to create default superuser role due to exception: {}", ex.what());
+            srm_log.error("Failed to create default superuser role due to exception: {}", ex.what());
             co_return;
         }
     }
 }
 
-static const sstring legacy_table_name{"users"};
+static const sstring legacy_table_name_srm{"users"};
 
 bool standard_role_manager::legacy_metadata_exists() {
-    return _qp.db().has_schema(meta::legacy::AUTH_KS, legacy_table_name);
+    return _qp.db().has_schema(meta::legacy::AUTH_KS, legacy_table_name_srm);
 }
 
 future<> standard_role_manager::migrate_legacy_metadata() {
-    log.info("Starting migration of legacy user metadata.");
-    static const sstring query = seastar::format("SELECT * FROM {}.{}", meta::legacy::AUTH_KS, legacy_table_name);
+    srm_log.info("Starting migration of legacy user metadata.");
+    static const sstring query = seastar::format("SELECT * FROM {}.{}", meta::legacy::AUTH_KS, legacy_table_name_srm);
 
     return _qp.execute_internal(
             query,
@@ -287,9 +287,9 @@ future<> standard_role_manager::migrate_legacy_metadata() {
             });
         }).finally([results] {});
     }).then([] {
-        log.info("Finished migrating legacy user metadata.");
+        srm_log.info("Finished migrating legacy user metadata.");
     }).handle_exception([](std::exception_ptr ep) {
-        log.error("Encountered an error during migration!");
+        srm_log.error("Encountered an error during migration!");
         std::rethrow_exception(ep);
     });
 }
@@ -316,7 +316,7 @@ future<> standard_role_manager::start() {
 
                 if (co_await legacy::any_nondefault_role_row_satisfies(_qp, &has_can_login)) {
                     if (legacy_metadata_exists()) {
-                        log.warn("Ignoring legacy user metadata since nondefault roles already exist.");
+                        srm_log.warn("Ignoring legacy user metadata since nondefault roles already exist.");
                     }
                     co_return;
                 }
@@ -570,7 +570,7 @@ standard_role_manager::modify_membership(
                 ROLE_MEMBERS_CF);
         break;
     default:
-        on_internal_error(log, format("unknown membership_change value: {}", int(ch)));
+        on_internal_error(srm_log, format("unknown membership_change value: {}", int(ch)));
     }
     co_await collect_mutations(_qp, mc, modify_role_members,
             {sstring(role_name), sstring(grantee_name)});

@@ -15,7 +15,7 @@ using namespace std::chrono_literals;
 
 static logging::logger vc_logger("view_consumer");
 
-static inline void inject_failure(std::string_view operation) {
+static inline void inject_failure_vc(std::string_view operation) {
     utils::get_local_injector().inject(operation,
             [operation] { throw std::runtime_error(std::string(operation)); });
 }
@@ -42,7 +42,7 @@ void view_consumer::add_fragment(auto&& fragment) {
 }
 
 void view_consumer::flush_fragments() {
-    inject_failure("view_builder_flush_fragments");
+    inject_failure_vc("view_builder_flush_fragments");
     _as.check();
     if (!_fragments.empty()) {
         _fragments.emplace_front(*reader().schema(), permit(), partition_start(get_current_key(), tombstone()));
@@ -63,7 +63,7 @@ void view_consumer::flush_fragments() {
 }
 
 stop_iteration view_consumer::consume_new_partition(const dht::decorated_key& dk) {
-    inject_failure("view_builder_consume_new_partition");
+    inject_failure_vc("view_builder_consume_new_partition");
     if (dk.key().is_empty()) {
         on_internal_error(vc_logger, format("Trying to consume empty partition key {}", dk));
     }
@@ -75,12 +75,12 @@ stop_iteration view_consumer::consume_new_partition(const dht::decorated_key& dk
 }
 
 stop_iteration view_consumer::consume(tombstone) {
-    inject_failure("view_builder_consume_tombstone");
+    inject_failure_vc("view_builder_consume_tombstone");
     return stop_iteration::no;
 }
 
 stop_iteration view_consumer::consume(static_row&& sr, tombstone, bool) {
-    inject_failure("view_builder_consume_static_row");
+    inject_failure_vc("view_builder_consume_static_row");
     if (_views_to_build.empty() || _as.abort_requested()) {
         return stop_iteration::yes;
     }
@@ -90,7 +90,7 @@ stop_iteration view_consumer::consume(static_row&& sr, tombstone, bool) {
 }
 
 stop_iteration view_consumer::consume(clustering_row&& cr, row_tombstone, bool is_live) {
-    inject_failure("view_builder_consume_clustering_row");
+    inject_failure_vc("view_builder_consume_clustering_row");
     if (!is_live) {
         return stop_iteration::no;
     }
@@ -103,12 +103,12 @@ stop_iteration view_consumer::consume(clustering_row&& cr, row_tombstone, bool i
 }
 
 stop_iteration view_consumer::consume(range_tombstone_change&&) {
-    inject_failure("view_builder_consume_range_tombstone");
+    inject_failure_vc("view_builder_consume_range_tombstone");
     return stop_iteration::no;
 }
 
 stop_iteration view_consumer::consume_end_of_partition() {
-    inject_failure("view_builder_consume_end_of_partition");
+    inject_failure_vc("view_builder_consume_end_of_partition");
     utils::get_local_injector().inject("view_builder_consume_end_of_partition_delay", utils::wait_for_message(std::chrono::seconds(60))).get();
     flush_fragments();
     return stop_iteration(should_stop_consuming_end_of_partition());

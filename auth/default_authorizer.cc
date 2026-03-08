@@ -47,10 +47,10 @@ default_authorizer::default_authorizer(cql3::query_processor& qp, ::service::raf
 default_authorizer::~default_authorizer() {
 }
 
-static const sstring legacy_table_name{"permissions"};
+static const sstring legacy_table_name_da{"permissions"};
 
 bool default_authorizer::legacy_metadata_exists() const {
-    return _qp.db().has_schema(meta::legacy::AUTH_KS, legacy_table_name);
+    return _qp.db().has_schema(meta::legacy::AUTH_KS, legacy_table_name_da);
 }
 
 future<bool> default_authorizer::legacy_any_granted() const {
@@ -67,7 +67,7 @@ future<bool> default_authorizer::legacy_any_granted() const {
 
 future<> default_authorizer::migrate_legacy_metadata() {
     alogger.info("Starting migration of legacy permissions metadata.");
-    static const sstring query = seastar::format("SELECT * FROM {}.{}", meta::legacy::AUTH_KS, legacy_table_name);
+    static const sstring query = seastar::format("SELECT * FROM {}.{}", meta::legacy::AUTH_KS, legacy_table_name_da);
 
     return _qp.execute_internal(
             query,

@@ -88,7 +88,7 @@ using namespace std::chrono_literals;
 
 static logging::logger vlogger("view");
 
-static inline void inject_failure(std::string_view operation) {
+static inline void inject_failure_view(std::string_view operation) {
     utils::get_local_injector().inject(operation,
             [operation] { throw std::runtime_error(std::string(operation)); });
 }
@@ -2910,7 +2910,7 @@ future<> view_builder::migrate_to_v1_5(locator::token_metadata_ptr tmptr, db::sy
 }
 
 future<> view_builder::migrate_to_v2(locator::token_metadata_ptr tmptr, db::system_keyspace& sys_ks, cql3::query_processor& qp, service::raft_group0_client& group0_client, abort_source& as, service::group0_guard guard) {
-    inject_failure("view_builder_migrate_to_v2");
+    inject_failure_view("view_builder_migrate_to_v2");
 
     auto schema = qp.db().find_schema(db::system_distributed_keyspace::NAME, db::system_distributed_keyspace::VIEW_BUILD_STATUS);
 
@@ -3115,7 +3115,7 @@ private:
 
 protected:
     virtual void check_for_built_views() override {
-        inject_failure("view_builder_check_for_built_views");
+        inject_failure_view("view_builder_check_for_built_views");
         for (auto it = _step.build_status.begin(); it != _step.build_status.end();) {
             // A view starts being built at token t1. Due to resharding, that may not necessarily be a
             // shard-owned token. We finish building the view when the next_token to build is just before
@@ -3131,7 +3131,7 @@ protected:
         }
     }
     virtual void load_views_to_build() override {
-        inject_failure("view_builder_load_views");
+        inject_failure_view("view_builder_load_views");
         for (auto&& vs : _step.build_status) {
             if (_step.current_token() >= vs.next_token) {
                 if (partition_key_matches(_builder.get_db().as_data_dictionary(), *_step.reader.schema(), *vs.view->view_info(), _step.current_key)) {
@@ -3179,7 +3179,7 @@ public:
     }
 
     stop_iteration consume_new_partition(const dht::decorated_key& dk) {
-        inject_failure("view_builder_consume_new_partition");
+        inject_failure_view("view_builder_consume_new_partition");
         if (dk.key().is_empty()) {
             on_internal_error(vlogger, format("Trying to consume empty partition key {}", dk));
         }
@@ -3191,12 +3191,12 @@ public:
     }
 
     stop_iteration consume(tombstone) {
-        inject_failure("view_builder_consume_tombstone");
+        inject_failure_view("view_builder_consume_tombstone");
         return stop_iteration::no;
     }
 
     stop_iteration consume(static_row&& sr, tombstone, bool) {
-        inject_failure("view_builder_consume_static_row");
+        inject_failure_view("view_builder_consume_static_row");
         if (_views_to_build.empty() || _builder._as.abort_requested()) {
             return stop_iteration::yes;
         }
@@ -3206,7 +3206,7 @@ public:
     }
 
     stop_iteration consume(clustering_row&& cr, row_tombstone, bool is_live) {
-        inject_failure("view_builder_consume_clustering_row");
+        inject_failure_view("view_builder_consume_clustering_row");
         if (!is_live) {
             return stop_iteration::no;
         }
@@ -3231,12 +3231,12 @@ public:
     }
 
     stop_iteration consume(range_tombstone_change&&) {
-        inject_failure("view_builder_consume_range_tombstone");
+        inject_failure_view("view_builder_consume_range_tombstone");
         return stop_iteration::no;
     }
 
     void flush_fragments() {
-        inject_failure("view_builder_flush_fragments");
+        inject_failure_view("view_builder_flush_fragments");
         _builder._as.check();
         if (!_fragments.empty()) {
             _fragments.emplace_front(*reader().schema(), permit(), partition_start(get_current_key(), tombstone()));
@@ -3257,7 +3257,7 @@ public:
     }
 
     stop_iteration consume_end_of_partition() {
-        inject_failure("view_builder_consume_end_of_partition");
+        inject_failure_view("view_builder_consume_end_of_partition");
         utils::get_local_injector().inject("view_builder_consume_end_of_partition_delay", utils::wait_for_message(std::chrono::seconds(60))).get();
         flush_fragments();
         return stop_iteration(should_stop_consuming_end_of_partition());
@@ -3265,7 +3265,7 @@ public:
 
     // Must be called in a seastar thread.
     built_views consume_end_of_stream() {
-        inject_failure("view_builder_consume_end_of_stream");
+        inject_failure_view("view_builder_consume_end_of_stream");
         if (vlogger.is_enabled(log_level::debug)) {
             auto view_names = _views_to_build | std::views::transform([](auto v) {
                         return v->cf_name();
@@ -3292,7 +3292,7 @@ public:
 
 // Called in the context of a seastar::thread.
 void view_builder::execute(build_step& step, exponential_backoff_retry r) {
-    inject_failure("dont_start_build_step");
+    inject_failure_view("dont_start_build_step");
     gc_clock::time_point now = gc_clock::now();
     auto compaction_state = make_lw_shared<compact_for_query_state>(
             *step.reader.schema(),
@@ -3358,7 +3358,7 @@ future<> view_builder::maybe_mark_view_as_built(view_ptr view, dht::token next_t
                 return result && shard_complete;
             }).then([this, view, next_token = std::move(next_token)] (bool built) {
         if (built) {
-            inject_failure("view_builder_mark_view_as_built");
+            inject_failure_view("view_builder_mark_view_as_built");
             return container().invoke_on_all([view_id = view->id()] (view_builder& builder) {
                 if (builder._built_views.erase(view_id) == 0 || this_shard_id() != 0) {
                     return make_ready_future<>();

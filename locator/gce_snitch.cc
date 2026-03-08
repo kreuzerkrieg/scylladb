@@ -164,7 +164,7 @@ future<sstring> gce_snitch::read_property_file() {
 }
 
 using registry_default = class_registrator<i_endpoint_snitch, gce_snitch, const snitch_config&>;
-static registry_default registrator_default("org.apache.cassandra.locator.GoogleCloudSnitch");
-static registry_default registrator_default_short_name("GoogleCloudSnitch");
+static registry_default registrator_default_gce("org.apache.cassandra.locator.GoogleCloudSnitch");
+static registry_default registrator_default_gce_short_name("GoogleCloudSnitch");
 
 } // namespace locator

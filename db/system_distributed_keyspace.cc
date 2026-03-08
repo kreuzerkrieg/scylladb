@@ -42,7 +42,7 @@ extern logging::logger cdc_log;
 
 namespace db {
 namespace {
-    const auto set_wait_for_sync_to_commitlog = schema_builder::register_schema_initializer([](schema_builder& builder) {
+    const auto set_wait_for_sync_to_commitlog_sdk = schema_builder::register_schema_initializer([](schema_builder& builder) {
         if ((builder.ks_name() == system_distributed_keyspace::NAME_EVERYWHERE && builder.cf_name() == system_distributed_keyspace::CDC_GENERATIONS_V2) ||
             (builder.ks_name() == system_distributed_keyspace::NAME && builder.cf_name() == system_distributed_keyspace::CDC_TOPOLOGY_DESCRIPTION))
         {

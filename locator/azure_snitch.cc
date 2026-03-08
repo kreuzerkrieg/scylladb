@@ -146,7 +146,7 @@ future<sstring> azure_snitch::read_property_file() {
 }
 
 using registry_default = class_registrator<i_endpoint_snitch, azure_snitch, const snitch_config&>;
-static registry_default registrator_default("org.apache.cassandra.locator.AzureSnitch");
-static registry_default registrator_default_short_name("AzureSnitch");
+static registry_default registrator_default_azure("org.apache.cassandra.locator.AzureSnitch");
+static registry_default registrator_default_azure_short_name("AzureSnitch");
 
 } // namespace locator

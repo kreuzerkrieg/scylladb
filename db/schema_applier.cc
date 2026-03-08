@@ -522,7 +522,7 @@ static schema_diff_per_shard diff_table_or_view(sharded<service::storage_proxy>&
 // Note: we aim at providing enough concurrency to utilize
 // the cpu while operations are blocked on disk I/O
 // and or filesystem calls, e.g. fsync.
-constexpr size_t max_concurrent = 8;
+constexpr size_t max_concurrent_sa = 8;
 
 
 in_progress_types_storage_per_shard::in_progress_types_storage_per_shard(replica::database& db, const affected_keyspaces& affected_keyspaces, const affected_user_types& affected_types) : _stored_user_types(db.as_user_types_storage()) {
@@ -695,17 +695,17 @@ future<> schema_applier::merge_tables_and_views()
     });
 
     auto& db = _proxy.local().get_db();
-    co_await max_concurrent_for_each(local_views.dropped, max_concurrent, [&db, this] (schema_ptr& dt) -> future<> {
+    co_await max_concurrent_for_each(local_views.dropped, max_concurrent_sa, [&db, this] (schema_ptr& dt) -> future<> {
         auto uuid = dt->id();
         _affected_tables_and_views.table_shards.insert({uuid,
                 co_await replica::database::prepare_drop_table_on_all_shards(db, uuid)});
     });
-    co_await max_concurrent_for_each(local_tables.dropped, max_concurrent, [&db, this] (schema_ptr& dt) -> future<> {
+    co_await max_concurrent_for_each(local_tables.dropped, max_concurrent_sa, [&db, this] (schema_ptr& dt) -> future<> {
         auto uuid = dt->id();
         _affected_tables_and_views.table_shards.insert({uuid,
                 co_await replica::database::prepare_drop_table_on_all_shards(db, uuid)});
     });
-    co_await max_concurrent_for_each(local_cdc.dropped, max_concurrent, [&db, this] (schema_ptr& dt) -> future<> {
+    co_await max_concurrent_for_each(local_cdc.dropped, max_concurrent_sa, [&db, this] (schema_ptr& dt) -> future<> {
         auto uuid = dt->id();
         _affected_tables_and_views.table_shards.insert({uuid,
                 co_await replica::database::prepare_drop_table_on_all_shards(db, uuid)});
@@ -760,7 +760,7 @@ future<schema_diff_per_shard> schema_diff_per_shard::copy_from(replica::database
 static future<> notify_tables_and_views(service::migration_notifier& notifier, const affected_tables_and_views& diff) {
     auto it = diff.tables_and_views.local().columns_changed.cbegin();
     auto notify = [&] (auto& r, auto&& f) -> future<> {
-        co_await max_concurrent_for_each(r, max_concurrent, std::move(f));
+        co_await max_concurrent_for_each(r, max_concurrent_sa, std::move(f));
     };
 
     const auto& tables = diff.tables_and_views.local().tables;
@@ -1185,15 +1185,15 @@ future<> schema_applier::finalize_tables_and_views() {
     //
     // Drop column mapping entries for dropped tables since these will not be TTLed automatically
     // and will stay there forever if we don't clean them up manually
-    co_await max_concurrent_for_each(diff.tables_and_views.local().tables.created, max_concurrent, [this] (const schema_ptr& gs) -> future<> {
+    co_await max_concurrent_for_each(diff.tables_and_views.local().tables.created, max_concurrent_sa, [this] (const schema_ptr& gs) -> future<> {
         co_await store_column_mapping(_proxy, gs, false);
     });
-    co_await max_concurrent_for_each(diff.tables_and_views.local().tables.altered, max_concurrent, [this] (const schema_diff_per_shard::altered_schema& altered) -> future<> {
+    co_await max_concurrent_for_each(diff.tables_and_views.local().tables.altered, max_concurrent_sa, [this] (const schema_diff_per_shard::altered_schema& altered) -> future<> {
         co_await when_all_succeed(
             store_column_mapping(_proxy, altered.old_schema, true),
             store_column_mapping(_proxy, altered.new_schema, false));
     });
-    co_await max_concurrent_for_each(diff.tables_and_views.local().tables.dropped, max_concurrent, [this] (const schema_ptr& s) -> future<> {
+    co_await max_concurrent_for_each(diff.tables_and_views.local().tables.dropped, max_concurrent_sa, [this] (const schema_ptr& s) -> future<> {
         co_await drop_column_mapping(_sys_ks.local(), s->id(), s->version());
     });
 }

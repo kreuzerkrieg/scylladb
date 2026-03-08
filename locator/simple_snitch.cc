@@ -12,6 +12,6 @@
 
 namespace locator {
 using registry = class_registrator<i_endpoint_snitch, simple_snitch, const snitch_config&>;
-static registry registrator1("org.apache.cassandra.locator.SimpleSnitch");
-static registry registrator2("SimpleSnitch");
+static registry registrator1_ssnitch("org.apache.cassandra.locator.SimpleSnitch");
+static registry registrator2_ssnitch("SimpleSnitch");
 }

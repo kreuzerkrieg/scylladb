@@ -96,12 +96,12 @@ static logging::logger diff_logger("schema_diff");
 /** system.schema_* tables used to store keyspace/table/type attributes prior to C* 3.0 */
 namespace db {
 namespace {
-    const auto set_use_schema_commitlog = schema_builder::register_schema_initializer([](schema_builder& builder) {
+    const auto set_use_schema_commitlog_st = schema_builder::register_schema_initializer([](schema_builder& builder) {
         if (builder.ks_name() == schema_tables::NAME) {
             builder.enable_schema_commitlog();
         }
     });
-    const auto set_group0_table_options =
+    const auto set_group0_table_options_st =
         schema_builder::register_schema_initializer([](schema_builder& builder) {
             if (builder.ks_name() == schema_tables::NAME) {
                 // all schema tables are group0 tables
@@ -2085,7 +2085,7 @@ future<schema_ptr> create_table_from_name(sharded<service::storage_proxy>& proxy
 // Note: we aim at providing enough concurrency to utilize
 // the cpu while operations are blocked on disk I/O
 // and or filesystem calls, e.g. fsync.
-constexpr size_t max_concurrent = 8;
+constexpr size_t max_concurrent_st = 8;
 
 /**
  * Deserialize tables from low-level schema representation, all of them belong to the same keyspace
@@ -2096,7 +2096,7 @@ future<std::map<sstring, schema_ptr>> create_tables_from_tables_partition(sharde
 {
     auto tables = std::map<sstring, schema_ptr>();
     auto tables_with_cdc = std::map<sstring, schema_ptr>();
-    co_await max_concurrent_for_each(result->rows().begin(), result->rows().end(), max_concurrent, [&] (const query::result_set_row& row) -> future<> {
+    co_await max_concurrent_for_each(result->rows().begin(), result->rows().end(), max_concurrent_st, [&] (const query::result_set_row& row) -> future<> {
         schema_ptr cfm = co_await create_table_from_table_row(proxy, row);
         if (!cfm->cdc_options().enabled()) {
             tables.emplace(cfm->cf_name(), std::move(cfm));
@@ -2646,7 +2646,7 @@ static future<view_ptr> create_view_from_table_row(sharded<service::storage_prox
 future<std::vector<view_ptr>> create_views_from_schema_partition(sharded<service::storage_proxy>& proxy, const schema_result::mapped_type& result)
 {
     std::vector<view_ptr> views;
-    co_await max_concurrent_for_each(result->rows().begin(), result->rows().end(), max_concurrent, [&] (auto&& row) -> future<> {
+    co_await max_concurrent_for_each(result->rows().begin(), result->rows().end(), max_concurrent_st, [&] (auto&& row) -> future<> {
         auto v = co_await create_view_from_table_row(proxy, row);
         views.push_back(std::move(v));
     });

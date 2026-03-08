@@ -75,7 +75,7 @@ namespace {
             builder.set_use_null_sharder(true);
         }
     });
-    const auto set_wait_for_sync_to_commitlog = schema_builder::register_schema_initializer([](schema_builder& builder) {
+    const auto set_wait_for_sync_to_commitlog_sk = schema_builder::register_schema_initializer([](schema_builder& builder) {
         static const std::unordered_set<sstring> tables = {
             system_keyspace::PAXOS,
         };
@@ -83,7 +83,7 @@ namespace {
             builder.set_wait_for_sync_to_commitlog(true);
         }
     });
-    const auto set_use_schema_commitlog = schema_builder::register_schema_initializer([](schema_builder& builder) {
+    const auto set_use_schema_commitlog_sk = schema_builder::register_schema_initializer([](schema_builder& builder) {
         static const std::unordered_set<sstring> tables = {
             schema_tables::SCYLLA_TABLE_SCHEMA_HISTORY,
             system_keyspace::BROADCAST_KV_STORE,
@@ -102,7 +102,7 @@ namespace {
         }
     });
 
-    const auto set_group0_table_options =
+    const auto set_group0_table_options_sk =
         schema_builder::register_schema_initializer([](schema_builder& builder) {
             static const std::unordered_set<sstring> tables = {
                 // scylla_local may store a replicated tombstone related to schema

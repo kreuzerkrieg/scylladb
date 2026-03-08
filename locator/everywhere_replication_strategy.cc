@@ -51,6 +51,6 @@ sstring everywhere_replication_strategy::sanity_check_read_replicas(const effect
 
 // Note: signature must match the class_registry signature defined and used by abstract_replication_strategy::to_qualified_class_name
 using registry = class_registrator<abstract_replication_strategy, everywhere_replication_strategy, replication_strategy_params, const locator::topology*>;
-static registry registrator("org.apache.cassandra.locator.EverywhereStrategy");
-static registry registrator_short_name("EverywhereStrategy");
+static registry registrator_ers("org.apache.cassandra.locator.EverywhereStrategy");
+static registry registrator_ers_short_name("EverywhereStrategy");
 }
