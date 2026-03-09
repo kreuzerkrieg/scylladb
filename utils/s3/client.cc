@@ -791,10 +791,10 @@ private:
     sstring _source_object;
 };
 
-future<> client::copy_object(sstring source_object, sstring target_object, std::optional<size_t> part_size, std::optional<tag> tag, seastar::abort_source*) {
+future<> client::copy_object(sstring source_object, sstring target_object, std::optional<size_t> part_size, std::optional<tag> tag, seastar::abort_source* as) {
     if (!part_size)
-        co_return co_await copy_s3_object(shared_from_this(), std::move(source_object), std::move(target_object), tag, nullptr).copy();
-    co_return co_await copy_s3_object(shared_from_this(), std::move(source_object), std::move(target_object), part_size.value(), tag, nullptr).copy();
+        co_return co_await copy_s3_object(shared_from_this(), std::move(source_object), std::move(target_object), tag, as).copy();
+    co_return co_await copy_s3_object(shared_from_this(), std::move(source_object), std::move(target_object), part_size.value(), tag, as).copy();
 }
 
 class client::upload_sink_base : public multipart_upload, public data_sink_impl {

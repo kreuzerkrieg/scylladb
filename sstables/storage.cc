@@ -847,8 +847,48 @@ future<> object_storage_base::snapshot(const sstable& sst, sstring name) const {
 }
 
 future<> object_storage_base::clone(const sstable& sst, generation_type gen, bool leave_unsealed) const {
-    on_internal_error(sstlog, "Cloning S3 objects not implemented");
-    co_return;
+    sstlog.trace("clone sst: {} -> {} generation={}", sst.get_filename(), dst_dir, gen);
+    auto comps = sst.all_components();
+    co_await parallel_for_each(comps, [this, &sst, &dst_dir, dst_gen] (const auto& p) mutable -> future<> {
+        auto src = make_object_name(sst, p.first);
+        auto dst_sst = sst;
+        auto dst = filename(sst, dst_dir, dst_gen, comp);
+        if (co_await file_exists(dst)) {
+            future<bool> fut = co_await coroutine::as_future(same_file(src, dst));
+            if (fut.failed()) {
+                auto eptr = fut.get_exception();
+                sstlog.error("Error while linking SSTable: {} to {}: {}", src, dst, eptr);
+                co_await coroutine::return_exception_ptr(std::move(eptr));
+            }
+            auto same = fut.get();
+            if (!same) {
+                auto msg = format("Error while linking SSTable: {} to {}: File exists", src, dst);
+                sstlog.error("{}", msg);
+                co_await coroutine::return_exception(malformed_sstable_exception(msg));
+            }
+        }
+    });
+    // TemporaryTOC is always first, TOC is always last
+    auto dst = filename(sst, dst_dir, generation, component_type::TemporaryTOC);
+    co_await sst.sstable_write_io_check(idempotent_link_file, fmt::to_string(sst.filename(component_type::TOC)), std::move(dst));
+    co_await parallel_for_each(comps, [this, &sst, &dst_dir, generation, leave_unsealed] (auto p) {
+        // Skips the linking of TOC file if the destination will be left unsealed.
+        if (leave_unsealed && p.first == component_type::TOC) {
+            return make_ready_future<>();
+        }
+        auto src = filename(sst, _dir.native(), sst._generation, p.second);
+        auto dst = filename(sst, dst_dir, generation, p.second);
+        return sst.sstable_write_io_check(idempotent_link_file, std::move(src), std::move(dst));
+    });
+    co_await dir.sync(sst._write_error_handler);
+    auto dst_temp_toc = filename(sst, dst_dir, generation, component_type::TemporaryTOC);
+    if (!leave_unsealed) {
+        // Now that the source sstable is linked to dir, remove
+        // the TemporaryTOC file at the destination.
+        // This is bypassed if destination will be left unsealed.
+        co_await sst.sstable_write_io_check(remove_file, std::move(dst_temp_toc));
+    }
+    sstlog.trace("create_links: {} -> {} generation={}: done", sst.get_filename(), dst_dir, generation);
 }
 
 std::unique_ptr<sstables::storage> make_storage(sstables_manager& manager, const data_dictionary::storage_options& s_opts, sstable_state state) {
