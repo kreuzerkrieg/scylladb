@@ -5548,8 +5548,18 @@ future<> storage_service::restore_tablets(table_id table, sstring snap_name, sst
                 return std::make_tuple(std::move(updates), std::move(reason));
             }, false);
             wait.emplace_back(_topology_state_machine.event.wait([this, gid] {
+                slogger.info("FOOOOOO Waiting for event, gid: {}", gid.tablet);
                 auto& tmap = get_token_metadata().tablets().get_tablet_map(gid.table);
-                return !tmap.get_tablet_transition_info(gid.tablet);
+                slogger.info("FOOOOOO Tablet map is: {}", gid.tablet, tmap);
+                const auto* trinfo = tmap.get_tablet_transition_info(gid.tablet);
+                if (trinfo) {
+                    slogger.info("FOOOOOO Transition info exists, stage: {}, transition: {}, replica: {}, session: {}",
+                                 trinfo->stage,
+                                 trinfo->transition,
+                                 trinfo->pending_replica,
+                                 trinfo->session_id);
+                }
+                return !trinfo;
             }));
         });
         // Release tm before waiting, to avoid holding a stale token_metadata
