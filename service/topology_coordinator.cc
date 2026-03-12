@@ -1337,13 +1337,13 @@ class topology_coordinator : public endpoint_lifecycle_subscriber
     bool advance_in_background(locator::global_tablet_id gid, background_action_holder& holder, const char* name,
                                std::function<future<>()> action) {
         if (!holder || holder->failed()) {
-            rtlogger.debug("BOOOOOOOO Holder for {} exists: {}", gid, holder.has_value());
+            // rtlogger.debug("BOOOOOOOO Holder for {} exists: {}", gid, holder.has_value());
             if (action_failed(holder)) {
-                rtlogger.debug("BOOOOOOOO Holder for {} failed: {}", gid, holder->get_exception());
+                rtlogger.info("BOOOOOOOO Holder for {} failed: {}", gid, holder->get_exception());
                 // Prevent warnings about abandoned failed future. Logged below.
                 holder->ignore_ready_future();
             }
-            rtlogger.debug("BOOOOOOOO Creating new holder for {}", gid);
+            // rtlogger.debug("BOOOOOOOO Creating new holder for {}", gid);
             holder = futurize_invoke(action).then_wrapped([this, gid, name] (future<> f) {
                 if (f.failed()) {
                     auto ep = f.get_exception();
@@ -1974,7 +1974,7 @@ class topology_coordinator : public endpoint_lifecycle_subscriber
                     break;
                 case locator::tablet_transition_stage::restore: {
                     if (action_failed(tablet_state.restore)) {
-                        rtlogger.debug("Restore failed for {}, reason: {}", gid, tablet_state.restore->get_exception());
+                        rtlogger.info("Restore failed for {}, reason: {}", gid, tablet_state.restore->get_exception());
                         if (do_barrier()) {
                             updates.emplace_back(get_mutation_builder().del_transition(last_token).build());
                         }
