@@ -2013,7 +2013,7 @@ class topology_coordinator : public endpoint_lifecycle_subscriber
                             }
                         });
                     })) {
-                        rtlogger.debug("Clearing restore transition for {}", gid);
+                        rtlogger.info("Clearing restore transition for {}", gid);
                         updates.emplace_back(get_mutation_builder().del_transition(last_token).build());
                     }
                 }
