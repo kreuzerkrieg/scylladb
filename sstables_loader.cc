@@ -8,6 +8,7 @@
 
 #include <fmt/ranges.h>
 #include <seastar/core/coroutine.hh>
+#include <seastar/core/lowres_clock.hh>
 #include <seastar/core/map_reduce.hh>
 #include <seastar/core/shared_ptr.hh>
 #include <seastar/core/shared_mutex.hh>
@@ -860,13 +861,16 @@ sstables_loader::sstables_loader(sharded<replica::database>& db,
     tm.register_module("sstables_loader", _task_manager_module);
     ser::sstables_loader_rpc_verbs::register_restore_tablet(&_messaging, [this] (const rpc::client_info& cinfo, locator::global_tablet_id gid, sstring snap_name, sstring endpoint, sstring bucket) -> future<restore_result> {
         llog.info("Downloading sstables for tablet {} from {}@{}/{}", gid, snap_name, endpoint, bucket);
+        auto start = lowres_clock::now();
         try {
             co_await download_tablet_sstables(gid, snap_name, endpoint, bucket);
         } catch (...) {
-            llog.info("Error downloading sstables for tablet {}. Reason: {}", gid, std::current_exception());
+            auto elapsed_s = std::chrono::duration_cast<std::chrono::seconds>(lowres_clock::now() - start).count();
+            llog.info("Error downloading sstables for tablet {} after {}s. Reason: {}", gid, elapsed_s, std::current_exception());
             throw;
         }
-        llog.debug("Finished loading sstables for tablet {}", gid);
+        auto elapsed_s = std::chrono::duration_cast<std::chrono::seconds>(lowres_clock::now() - start).count();
+        llog.debug("Finished loading sstables for tablet {} elapsed={}s", gid, elapsed_s);
         co_return restore_result{};
     });
 }
@@ -908,20 +912,23 @@ future<> sstables_loader::download_tablet_sstables(locator::global_tablet_id tid
     auto tablet_range = tm.tablets().get_tablet_map(tid.table).get_token_range(tid.tablet);
     const auto& topo = tm.get_topology();
 
+    llog.debug("Querying snapshot_sstables for tablet {} snapshot={} ks={} cf={} dc={} rack={}",
+               tid, snap_name, s->ks_name(), s->cf_name(), topo.get_datacenter(), topo.get_rack());
     auto sst_infos = co_await _sys_dist_ks.get_snapshot_sstables(snap_name, s->ks_name(), s->cf_name(), topo.get_datacenter(), topo.get_rack());
-    llog.debug("{} SSTables found", sst_infos.size(), tid);
+    llog.debug("{} SSTables found for tablet {}", sst_infos.size(), tid);
     if (sst_infos.empty()) {
         throw std::runtime_error(format("No SSTables found in system_distributed.snapshot_sstables for {}", snap_name));
     }
 
     auto [ fully, partially ] = co_await get_sstables_for_tablet(sst_infos, tablet_range, [] (const auto& si) { return si.first_token; }, [] (const auto& si) { return si.last_token; });
     if (!partially.empty()) {
-        llog.debug("Sstable {} is partially contained", partially.front().sstable_id);
+        llog.debug("Sstable {} is partially contained for tablet {}", partially.front().sstable_id, tid);
         throw std::logic_error("sstables_partially_contained");
     }
-    llog.debug("{} SSTables owned by this node tablets", fully.size());
+    llog.debug("{} SSTables fully owned by tablet {}", fully.size(), tid);
     if (fully.empty()) {
         // It can happen that a tablet exists and contains no data. Just skip it
+        llog.debug("No SSTables to download for tablet {}, skipping", tid);
         co_return;
     }
 
@@ -931,6 +938,7 @@ future<> sstables_loader::download_tablet_sstables(locator::global_tablet_id tid
     for (const auto& e : fully) {
         toc_names_by_prefix[e.prefix].emplace_back(e.toc_name);
     }
+    llog.debug("Tablet {} has {} SSTables across {} prefixes to download", tid, fully.size(), toc_names_by_prefix.size());
 
     auto ep_type = _storage_manager.get_endpoint_type(endpoint);
     sstables::sstable_open_config cfg {
@@ -938,19 +946,34 @@ future<> sstables_loader::download_tablet_sstables(locator::global_tablet_id tid
     };
 
     // Download SSTables from each prefix separately, then download and attach them.
+    size_t prefix_idx = 0;
     for (auto& [prefix, toc_names] : toc_names_by_prefix) {
+        ++prefix_idx;
+        llog.debug("Tablet {} downloading {} SSTables from prefix {}/{} ({}) endpoint={}",
+                   tid, toc_names.size(), prefix_idx, toc_names_by_prefix.size(), prefix, endpoint);
+        auto download_start = lowres_clock::now();
         auto [_, sstables_on_shards] = co_await replica::distributed_loader::get_sstables_from_object_store(_db, s->ks_name(), s->cf_name(),
             std::move(toc_names), endpoint, ep_type, bucket, prefix, cfg, [&] { return nullptr; });
+        auto download_elapsed = std::chrono::duration_cast<std::chrono::seconds>(lowres_clock::now() - download_start).count();
+        llog.debug("Tablet {} prefix {}/{} download complete in {}s, starting map_reduce0 (download_sstable per shard)",
+                   tid, prefix_idx, toc_names_by_prefix.size(), download_elapsed);
 
+        auto map_reduce_start = lowres_clock::now();
         auto downloaded_ssts = co_await container().map_reduce0(
             [tid, &sstables_on_shards](auto& loader) -> future<std::vector<std::vector<minimal_sst_info>>> {
-                auto sst_chunk = std::move(sstables_on_shards[this_shard_id()]);
+                auto shard = this_shard_id();
+                auto sst_chunk = std::move(sstables_on_shards[shard]);
+                llog.debug("Tablet {} shard {} map_reduce0: processing {} SSTables", tid, shard, sst_chunk.size());
                 std::vector<std::vector<minimal_sst_info>> local_min_infos(smp::count);
                 co_await max_concurrent_for_each(sst_chunk, 16, [&loader, tid, &local_min_infos](const auto& sst) -> future<> {
+                    auto sst_gen = sst->generation();
+                    llog.debug("Tablet {} shard {} map_reduce0: downloading sst={}", tid, this_shard_id(), sst_gen);
                     auto& table = loader._db.local().find_column_family(tid.table);
                     auto min_info = co_await download_sstable(loader._db.local(), table, sst, llog);
+                    llog.debug("Tablet {} shard {} map_reduce0: downloaded sst={} -> target_shard={}", tid, this_shard_id(), sst_gen, min_info.shard);
                     local_min_infos[min_info.shard].emplace_back(std::move(min_info));
                 });
+                llog.debug("Tablet {} shard {} map_reduce0: done", tid, shard);
                 co_return local_min_infos;
             },
             std::vector<std::vector<minimal_sst_info>>(smp::count),
@@ -960,11 +983,19 @@ future<> sstables_loader::download_tablet_sstables(locator::global_tablet_id tid
                 }
                 return init;
             });
+        auto map_reduce_elapsed = std::chrono::duration_cast<std::chrono::seconds>(lowres_clock::now() - map_reduce_start).count();
+        llog.debug("Tablet {} map_reduce0 complete in {}s, starting invoke_on_all (attach_sstable)", tid, map_reduce_elapsed);
 
+        auto attach_start = lowres_clock::now();
         co_await container().invoke_on_all([tid, &downloaded_ssts] (auto& loader) -> future<> {
-            auto shard_ssts = std::move(downloaded_ssts[this_shard_id()]);
+            auto shard = this_shard_id();
+            auto shard_ssts = std::move(downloaded_ssts[shard]);
+            llog.debug("Tablet {} shard {} invoke_on_all: attaching {} SSTables", tid, shard, shard_ssts.size());
             co_await max_concurrent_for_each(shard_ssts, 16, [&loader, tid](const auto& min_info) -> future<> { co_await loader.attach_sstable(tid.table, min_info); });
+            llog.debug("Tablet {} shard {} invoke_on_all: done", tid, shard);
         });
+        auto attach_elapsed = std::chrono::duration_cast<std::chrono::seconds>(lowres_clock::now() - attach_start).count();
+        llog.debug("Tablet {} prefix {}/{} attach complete in {}s", tid, prefix_idx, toc_names_by_prefix.size(), attach_elapsed);
     }
 }
 

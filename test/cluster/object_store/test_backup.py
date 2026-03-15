@@ -13,7 +13,7 @@ import random
 
 from test.pylib.manager_client import ManagerClient
 from test.cluster.object_store.conftest import format_tuples
-from test.cluster.util import wait_for_cql_and_get_hosts, get_replication, new_test_keyspace
+from test.cluster.util import wait_for_cql_and_get_hosts, get_replication, new_test_keyspace, reconnect_driver
 from test.pylib.rest_client import read_barrier
 from test.pylib.util import unique_name, wait_all
 from cassandra.cluster import ConsistencyLevel
@@ -481,7 +481,7 @@ async def create_cluster(topology, rf_rack_valid_keyspaces, manager, logger, obj
         objconf = object_storage.create_endpoint_conf()
         cfg['object_storage_endpoints'] = objconf
 
-    cmd = ['--smp', '16', '-m', '16G', '--logger-log-level', 'sstables_loader=debug:raft_topology=debug']
+    cmd = ['--smp', '16', '-m', '16G', '--default-log-level','info','--logger-log-level', 'raft_topology=debug']
     servers = []
     host_ids = {}
 
@@ -749,7 +749,7 @@ async def test_restore_with_streaming_scopes(build_mode: str, manager: ManagerCl
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("topology", [
-        topo(rf = 3, nodes = 3, racks = 3, dcs = 1),
+        topo(rf = 3, nodes = 6, racks = 3, dcs = 1),
         # topo(rf = 2, nodes = 2, racks = 2, dcs = 1),
     ])
 async def test_restore_tablets(build_mode: str, manager: ManagerClient, s3_storage, topology):
@@ -759,7 +759,7 @@ async def test_restore_tablets(build_mode: str, manager: ManagerClient, s3_stora
 
     cql = manager.get_cql()
 
-    num_keys = 10_000_000
+    num_keys = 1_000_000
     min_tablet_count=64
 
     blob_schema = "CREATE TABLE {ks}.test ( pk blob primary key, value blob ){suffix};"
@@ -772,22 +772,28 @@ async def test_restore_tablets(build_mode: str, manager: ManagerClient, s3_stora
         rng = random.Random(42)
         def make_batches():
             for start in range(0, num_keys, batch_size):
-                batch = BatchStatement(batch_type=BatchType.UNLOGGED, consistency_level=ConsistencyLevel.ALL)
+                batch = BatchStatement(batch_type=BatchType.LOGGED, consistency_level=ConsistencyLevel.ALL)
                 for i in range(start, min(start + batch_size, num_keys)):
                     batch.add(insert_stmt, (rng.randbytes(128), rng.randbytes(1024)))
                 yield (batch, None)
 
         await asyncio.to_thread(execute_concurrent, cql, make_batches(), concurrency=500)
+        # await asyncio.gather(*(manager.api.repair(server.ip_addr, ks, "test") for server in servers))
+        await manager.api.repair(servers[2].ip_addr, ks, "test")
         snap_name, sstables = await take_snapshot(ks, servers, manager, logger)
         await asyncio.gather(*(do_backup(s, snap_name, f'{s.server_id}/{snap_name}', ks, 'test', s3_storage, manager, logger) for s in servers))
+
+    # Submit all restart commands at once and await all to finish
+    await asyncio.gather(*(manager.server_restart(server.server_id) for server in servers))
+    cql = await reconnect_driver(manager)
 
     async with new_test_keyspace(manager, f"WITH replication = {{'class': 'NetworkTopologyStrategy', 'replication_factor': {topology.rf}}}") as ks:
         await cql.run_async(blob_schema.format(ks=ks, suffix=f" WITH tablets = {{'min_tablet_count': {min_tablet_count}}}"))
 
-        logger.info(f'Restore cluster via {servers[1].ip_addr}')
+        logger.info(f'Restore cluster via {servers[0].ip_addr}')
         manifests = [ f'{s.server_id}/{snap_name}/manifest.json' for s in servers ]
-        tid = await manager.api.restore_tablets(servers[1].ip_addr, ks, 'test', snap_name, s3_storage.address, s3_storage.bucket_name, manifests)
-        status = await manager.api.wait_task(servers[1].ip_addr, tid)
+        tid = await manager.api.restore_tablets(servers[0].ip_addr, ks, 'test', snap_name, s3_storage.address, s3_storage.bucket_name, manifests)
+        status = await manager.api.wait_task(servers[0].ip_addr, tid)
         assert (status is not None) and (status['state'] == 'done', status)
 
         res = cql.execute(f"SELECT COUNT(*) FROM {ks}.test BYPASS CACHE USING TIMEOUT 600s;")

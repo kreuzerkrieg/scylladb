@@ -1316,6 +1316,8 @@ class topology_coordinator : public endpoint_lifecycle_subscriber
         utils::chunked_vector<canonical_mutation> repair_task_updates;
         service::session_id session_id;
         uint32_t repair_update_compaction_ctrl_retried = 0;
+        // Tracks when a background action was first launched, for diagnosing stuck tablets.
+        std::optional<lowres_clock::time_point> action_start_time;
     };
 
     std::unordered_map<locator::global_tablet_id, tablet_migration_state> _tablets;
@@ -1336,11 +1338,13 @@ class topology_coordinator : public endpoint_lifecycle_subscriber
     // Returns true iff background_action_holder reached the "executed successfully" state.
     bool advance_in_background(locator::global_tablet_id gid, background_action_holder& holder, const char* name,
                                std::function<future<>()> action) {
+        auto& tablet_state = _tablets[gid];
         if (!holder || holder->failed()) {
             if (action_failed(holder)) {
                 // Prevent warnings about abandoned failed future. Logged below.
                 holder->ignore_ready_future();
             }
+            tablet_state.action_start_time = lowres_clock::now();
             holder = futurize_invoke(action).then_wrapped([this, gid, name] (future<> f) {
                 if (f.failed()) {
                     auto ep = f.get_exception();
@@ -1351,7 +1355,9 @@ class topology_coordinator : public endpoint_lifecycle_subscriber
                 }
                 return f;
             }).finally([this, g = _async_gate.hold(), gid, name] () noexcept {
-                rtlogger.debug("{} for tablet {} resolved.", name, gid);
+                auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+                    lowres_clock::now() - _tablets[gid].action_start_time.value_or(lowres_clock::now())).count();
+                rtlogger.debug("{} for tablet {} resolved. elapsed={}s", name, gid, elapsed);
                 _tablets_ready = true;
                 _topo_sm.event.broadcast();
             });
@@ -1359,7 +1365,12 @@ class topology_coordinator : public endpoint_lifecycle_subscriber
         }
 
         if (!holder->available()) {
-            rtlogger.debug("Tablet {} still doing {}", gid, name);
+            auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+                lowres_clock::now() - tablet_state.action_start_time.value_or(lowres_clock::now())).count();
+            rtlogger.debug("Tablet {} still doing {} elapsed={}s", gid, name, elapsed);
+            if (elapsed > 300) {
+                rtlogger.warn("Tablet {} has been doing {} for {}s, may be stuck", gid, name, elapsed);
+            }
             return false;
         }
 
@@ -1990,8 +2001,19 @@ class topology_coordinator : public endpoint_lifecycle_subscriber
                         rtlogger.info("Restoring tablet={} from {} on {}", gid, config.snapshot_name, replicas);
                         co_await coroutine::parallel_for_each(replicas, [this, gid, cfg = std::move(config)] (locator::tablet_replica r) -> future<> {
                             if (!is_excluded(raft::server_id(r.host.uuid()))) {
-                                co_await ser::sstables_loader_rpc_verbs::send_restore_tablet(&_messaging, r.host, gid, cfg.snapshot_name, cfg.endpoint, cfg.bucket);
-                                rtlogger.debug("Tablet {} restored on {}", gid, r.host);
+                                rtlogger.debug("Sending restore RPC for tablet {} to replica {}:{}", gid, r.host, r.shard);
+                                auto rpc_start = lowres_clock::now();
+                                try {
+                                    co_await ser::sstables_loader_rpc_verbs::send_restore_tablet(&_messaging, r.host, gid, cfg.snapshot_name, cfg.endpoint, cfg.bucket);
+                                } catch (...) {
+                                    auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(lowres_clock::now() - rpc_start).count();
+                                    rtlogger.warn("Restore RPC for tablet {} to replica {}:{} failed after {}s: {}", gid, r.host, r.shard, elapsed, std::current_exception());
+                                    throw;
+                                }
+                                auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(lowres_clock::now() - rpc_start).count();
+                                rtlogger.debug("Tablet {} restored on {} elapsed={}s", gid, r.host, elapsed);
+                            } else {
+                                rtlogger.debug("Skipping excluded replica {}:{} for tablet {}", r.host, r.shard, gid);
                             }
                         });
                     })) {

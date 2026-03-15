@@ -19,6 +19,9 @@ future<minimal_sst_info> download_sstable(replica::database& db, replica::table&
     constexpr auto foptions = file_open_options{.extent_allocation_size_hint = 32_MiB, .sloppy_size = true};
     constexpr auto stream_options = file_output_stream_options{.buffer_size = 128_KiB, .write_behind = 10};
     auto components = sstable->all_components();
+    auto sst_gen = sstable->generation();
+
+    logger.debug("download_sstable: sst={} shard={} starting, {} components", sst_gen, this_shard_id(), components.size());
 
     // Move the TOC to the front to be processed first since `sstables::create_stream_sink` takes care
     // of creating behind the scene TemporaryTOC instead of usual one. This assures that in case of failure
@@ -50,10 +53,13 @@ future<minimal_sst_info> download_sstable(replica::database& db, replica::table&
     }
 
     auto gen = table.get_sstable_generation_generator()();
+    logger.debug("download_sstable: sst={} shard={} getting readable files", sst_gen, this_shard_id());
     auto files = co_await sstable->readable_file_for_all_components();
+    logger.debug("download_sstable: sst={} shard={} got readable files, iterating components", sst_gen, this_shard_id());
     for (auto it = components.cbegin(); it != components.cend(); ++it) {
         try {
             auto descriptor = sstable->get_descriptor(it->first);
+            logger.debug("download_sstable: sst={} shard={} component={} creating sink", sst_gen, this_shard_id(), it->first);
             auto sstable_sink =
                 sstables::create_stream_sink(table.schema(),
                                              table.get_sstables_manager(),
@@ -62,22 +68,27 @@ future<minimal_sst_info> download_sstable(replica::database& db, replica::table&
                                              sstables::sstable::component_basename(
                                                  table.schema()->ks_name(), table.schema()->cf_name(), descriptor.version, gen, descriptor.format, it->first),
                                              sstables::sstable_stream_sink_cfg{.last_component = std::next(it) == components.cend()});
+            logger.debug("download_sstable: sst={} shard={} component={} opening output", sst_gen, this_shard_id(), it->first);
             auto out = co_await sstable_sink->output(foptions, stream_options);
 
-            input_stream src(co_await [&it, sstable, f = files.at(it->first), &db, &table]() -> future<input_stream<char>> {
+            logger.debug("download_sstable: sst={} shard={} component={} creating input source", sst_gen, this_shard_id(), it->first);
+            input_stream src(co_await [&it, sstable, f = files.at(it->first), &db, &table, &logger, sst_gen]() -> future<input_stream<char>> {
                 const auto fis_options = file_input_stream_options{.buffer_size = 128_KiB, .read_ahead = 2};
 
                 if (it->first != sstables::component_type::Data) {
                     co_return input_stream<char>(
                         co_await sstable->get_storage().make_source(*sstable, it->first, f, 0, std::numeric_limits<size_t>::max(), fis_options));
                 }
+                logger.debug("download_sstable: sst={} shard={} component=Data requesting reader permit", sst_gen, this_shard_id());
                 auto permit = co_await db.obtain_reader_permit(table, "download_fully_contained_sstables", db::no_timeout, {});
+                logger.debug("download_sstable: sst={} shard={} component=Data obtained reader permit", sst_gen, this_shard_id());
                 co_return co_await (
                     sstable->get_compression()
                         ? sstable->data_stream(0, sstable->ondisk_data_size(), std::move(permit), nullptr, nullptr, sstables::sstable::raw_stream::yes)
                         : sstable->data_stream(0, sstable->data_size(), std::move(permit), nullptr, nullptr, sstables::sstable::raw_stream::no));
             }());
 
+            logger.debug("download_sstable: sst={} shard={} component={} starting copy", sst_gen, this_shard_id(), it->first);
             std::exception_ptr eptr;
             try {
                 co_await seastar::copy(src, out);
@@ -85,6 +96,7 @@ future<minimal_sst_info> download_sstable(replica::database& db, replica::table&
                 eptr = std::current_exception();
                 logger.info("Error downloading SSTable component {}. Reason: {}", it->first, eptr);
             }
+            logger.debug("download_sstable: sst={} shard={} component={} copy done, closing streams", sst_gen, this_shard_id(), it->first);
             co_await src.close();
             co_await out.close();
             if (eptr) {
@@ -96,7 +108,7 @@ future<minimal_sst_info> download_sstable(replica::database& db, replica::table&
                 if (shards.size() != 1) {
                     on_internal_error(logger, "Fully-contained sstable must belong to one shard only");
                 }
-                logger.debug("SSTable shards {}", fmt::join(shards, ", "));
+                logger.debug("download_sstable: sst={} shard={} complete, target_shard={}", sst_gen, this_shard_id(), shards.front());
                 co_return minimal_sst_info{shards.front(), gen, descriptor.version, descriptor.format};
             }
         } catch (...) {

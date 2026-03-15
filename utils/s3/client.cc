@@ -1226,6 +1226,7 @@ class client::chunked_download_source final : public seastar::data_source_impl {
     future<> make_filling_fiber() {
         seastar::http::experimental::no_retry_strategy no_retry;
         s3l.trace("Fiber starts cycle for object '{}'", _object_name);
+        logger::rate_limit retries_rate_limit(std::chrono::seconds(5));
         while (!_is_finished) {
             try {
                 if (!_is_finished && _buffers_size >= _max_buffers_size * _buffers_low_watermark) {
@@ -1343,6 +1344,7 @@ class client::chunked_download_source final : public seastar::data_source_impl {
                     _get_cv.broken(ex);
                     co_return;
                 }
+                s3l.log(log_level::warn, retries_rate_limit, "Fiber for object '{}' hit retryable error: {}", _object_name, ex);
             }
         }
         s3l.trace("Fiber for object '{}' completed", _object_name);
