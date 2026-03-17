@@ -91,12 +91,12 @@ future<minimal_sst_info> download_sstable(replica::database& db, replica::table&
             logger.debug("download_sstable: sst={} shard={} component={} starting copy", sst_gen, this_shard_id(), it->first);
             std::exception_ptr eptr;
             try {
-                // co_await seastar::copy(src, out);
-                while (true) {
-                    auto buff = co_await src.read();
-                    if (!buff){break;}
-                    co_await out.write(std::move(buff));
-                }
+                co_await seastar::copy(src, out);
+                // while (true) {
+                //     auto buff = co_await src.read();
+                //     if (!buff){break;}
+                //     co_await out.write(std::move(buff));
+                // }
             } catch (...) {
                 eptr = std::current_exception();
                 logger.info("Error downloading SSTable component {}. Reason: {}", it->first, eptr);
