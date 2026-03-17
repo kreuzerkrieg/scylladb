@@ -663,7 +663,7 @@ void test_download_data_source(const client_maker_function& client_maker, bool i
     auto close_client = deferred_close(*cln);
     auto delete_object = deferred_delete_object(cln, name);
 
-    static constexpr unsigned chunk_size = 1000;
+    static constexpr unsigned chunk_size = 1024;
     testlog.info("Preparation: Upload object");
     auto rnd = tests::random::get_bytes(chunk_size);
     {
@@ -677,11 +677,22 @@ void test_download_data_source(const client_maker_function& client_maker, bool i
     }
 
     testlog.info("Download object");
-    auto in = is_chunked ? input_stream<char>(cln->make_chunked_download_source(name, s3::full_range)) : input_stream<char>(cln->make_download_source(name, s3::full_range));
-    auto close = seastar::deferred_close(in);
-    for (unsigned ch = 0; ch < chunks; ch++) {
-        auto buf = in.read_exactly(chunk_size).get();
-        BOOST_REQUIRE_EQUAL(memcmp(buf.begin(), rnd.begin(), 1000), 0);
+    {
+        auto in = is_chunked ? input_stream<char>(cln->make_chunked_download_source(name, s3::full_range)) : input_stream<char>(cln->make_download_source(name, s3::full_range));
+        auto close = seastar::deferred_close(in);
+        for (unsigned ch = 0; ch < chunks; ch++) {
+            auto buf = in.read_exactly(chunk_size).get();
+            BOOST_REQUIRE_EQUAL(memcmp(buf.begin(), rnd.begin(), 1000), 0);
+        }
+    }
+
+    {
+        auto in = input_stream<char>(cln->make_chunked_download_source(name, s3::full_range));
+        auto close_in = seastar::deferred_close(in);
+        file f = open_file_dma(format("/tmp/{}", ::getpid()), open_flags::truncate | open_flags::create | open_flags::wo).get();
+        auto output = make_file_output_stream(std::move(f), file_output_stream_options{.buffer_size = 128_KiB, .write_behind = 10}).get();
+        auto close_out = seastar::deferred_close(output);
+        seastar::copy(in,output).get();
     }
 }
 
@@ -700,6 +711,89 @@ SEASTAR_THREAD_TEST_CASE(test_chunked_download_data_source_minio) {
 SEASTAR_THREAD_TEST_CASE(test_chunked_download_data_source_proxy) {
     test_download_data_source(make_proxy_client, true, 3 * 1024);
 }
+
+SEASTAR_THREAD_TEST_CASE(test_chunked_download_data_source_8k_minio) {
+    test_download_data_source(make_minio_client, true, 8);
+}
+
+// Reproduces the production scenario where small 8K SSTable components get
+// stuck during restore: many concurrent chunked downloads (mix of large and
+// small objects) share a tight memory semaphore, exercising the memory-wait
+// and watermark paths in the filling fiber.
+void test_concurrent_chunked_downloads_mixed_sizes(const client_maker_function& client_maker) {
+    const sstring bucket = tests::getenv_safe("S3_BUCKET_FOR_TEST");
+    const sstring prefix(fmt::format("test_mixed_sizes-{}", ::getpid()));
+
+    // Use a tight memory budget: in production the semaphore is shared across
+    // all concurrent downloads on a shard. 512KB is enough for a few 128KB
+    // socket buffers but forces contention when many fibers compete.
+    semaphore mem(512_KiB);
+    auto cln = client_maker(mem);
+    auto close_client = deferred_close(*cln);
+
+    // Create a mix of objects that mirrors production SSTable component sizes:
+    // several large objects (like Data/Index components) and several small 8KB
+    // objects (like Statistics, Filter, Scylla components).
+    struct test_object {
+        sstring name;
+        size_t size;
+    };
+
+    static constexpr size_t small_size = 8_KiB;
+    static constexpr size_t large_size = 2_MiB;
+    static constexpr int num_large = 30;
+    static constexpr int num_small = 60;
+
+    std::vector<test_object> objects;
+    objects.reserve(num_large + num_small);
+
+    // Upload all objects
+    for (int i = 0; i < num_large; ++i) {
+        auto name = fmt::format("/{}/{}/large-{}", bucket, prefix, i);
+        auto rnd = tests::random::get_bytes(large_size);
+        auto out = output_stream<char>(cln->make_upload_sink(name));
+        out.write(reinterpret_cast<char*>(rnd.begin()), rnd.size()).get();
+        out.flush().get();
+        out.close().get();
+        objects.push_back({name, large_size});
+    }
+    for (int i = 0; i < num_small; ++i) {
+        auto name = fmt::format("/{}/{}/small-{}", bucket, prefix, i);
+        auto rnd = tests::random::get_bytes(small_size);
+        cln->put_object(name, temporary_buffer<char>(reinterpret_cast<char*>(rnd.begin()), rnd.size())).get();
+        objects.push_back({name, small_size});
+    }
+
+    auto cleanup = seastar::defer([&] {
+        for (auto& obj : objects) {
+            cln->delete_object(obj.name).get();
+        }
+    });
+
+    // Download all objects concurrently, exactly like production does in
+    // download_tablet_sstables: max_concurrent_for_each(..., 16, ...) where
+    // each fiber opens a chunked download source, reads it fully, and closes
+    // it — all sharing the same tight memory semaphore.
+    seastar::max_concurrent_for_each(objects, 16, [&cln] (const test_object& obj) -> future<> {
+        auto in = input_stream<char>(cln->make_chunked_download_source(obj.name, s3::full_range));
+        size_t total = 0;
+        while (true) {
+            auto buf = co_await in.read();
+            if (buf.empty()) {
+                break;
+            }
+            total += buf.size();
+        }
+        co_await in.close();
+        BOOST_CHECK_EQUAL(total, obj.size);
+        // return make_ready_future<>();
+    }).get();
+}
+
+SEASTAR_THREAD_TEST_CASE(test_concurrent_chunked_downloads_mixed_sizes_minio) {
+    test_concurrent_chunked_downloads_mixed_sizes(make_minio_client);
+}
+
 
 void test_chunked_download_data_source(const client_maker_function& client_maker, size_t object_size) {
     const sstring base_name(fmt::format("test_object-{}", ::getpid()));
