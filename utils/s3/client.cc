@@ -1369,6 +1369,13 @@ public:
                 s3l.trace("get() for object '{}' popped buffer of {} bytes", _object_name, claimed_buff._buffer.size());
                 co_return std::move(claimed_buff._buffer);
             }
+            // The filling fiber has finished and all buffers have been consumed.
+            // Return EOS. This must be idempotent — callers (e.g. input_stream::read_exactly)
+            // may call get() again after EOS was already returned.
+            if (_is_finished) {
+                s3l.trace("get() for object '{}' returning EOS (finished, no buffers)", _object_name);
+                co_return temporary_buffer<char>{};
+            }
             _bg_fiber_cv.signal();
             s3l.trace("get() for object '{}' waiting for buffer", _object_name);
             co_await _get_cv.wait();
