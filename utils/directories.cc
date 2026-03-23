@@ -13,6 +13,8 @@
 #include "init.hh"
 #include "supervisor.hh"
 #include "directories.hh"
+
+#include "seastar/util/closeable.hh"
 #include "sstables/exceptions.hh"
 #include "sstables/open_info.hh"
 #include "utils/disk-error-handler.hh"

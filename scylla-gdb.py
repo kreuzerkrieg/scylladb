@@ -21,6 +21,12 @@ import socket
 import string
 import math
 
+try:
+    from gdb.FrameDecorator import FrameDecorator as _FrameDecoratorBase
+    _has_frame_decorator = True
+except ImportError:
+    _has_frame_decorator = False
+
 
 def align_up(ptr, alignment):
     res = ptr % alignment
@@ -6526,6 +6532,557 @@ class scylla_gdb_func_variant_member(gdb.Function):
     def invoke(self, obj):
         return std_variant(obj).get()
 
+class scylla_coro_backtrace(gdb.Command):
+    """ Display a human-readable backtrace of the coroutine chain.
+
+    Takes a task pointer (or defaults to the reactor's current task) and walks
+    the seastar coroutine chain via waiting_task(), presenting the logical
+    coroutine call stack in a familiar backtrace format.
+
+    Unlike `scylla fiber`, which shows raw task pointers and vtable symbols,
+    this command presents coroutine backtraces like regular stack traces:
+    function names, source file locations, suspension point indices, and
+    coroutine frame addresses.
+
+    Example:
+
+    (gdb) scylla coro-backtrace
+    Coroutine backtrace (current task on shard 0):
+    #0  sstables::parse<unsigned int, ...>(...) at sstables/sstables.cc:352
+        [frame 0x601008e8e970, suspend point 2]
+    #1  sstables::parse(schema const&, ...) at sstables/sstables.cc:570
+        [frame 0x6010092acf10, suspend point 0]
+    #2  sstables::sstable::read_statistics(...) at sstables/sstables.cc:618
+        [frame 0x601009301a80, suspend point 1]
+    ---
+
+    (gdb) scylla coro-backtrace 0x601008e8e970
+    (gdb) scylla coro-backtrace seastar::local_engine->_current_task
+    (gdb) scylla coro-backtrace --max-depth 5 0x601008e8e970
+
+    Invoke `scylla coro-backtrace --help` for more information.
+    """
+
+    def __init__(self):
+        gdb.Command.__init__(self, 'scylla coro-backtrace', gdb.COMMAND_USER, gdb.COMPLETE_EXPRESSION, True)
+
+    @staticmethod
+    def _is_coroutine_task(ptr):
+        """Check if the task at `ptr` is a seastar coroutine (promise_type).
+
+        Returns the vtable symbol string if it is, or None otherwise.
+        """
+        try:
+            vptr_type = _vptr_type()
+            maybe_vptr = int(gdb.Value(ptr).reinterpret_cast(vptr_type).dereference())
+            sym = resolve(maybe_vptr, False)
+            if sym and 'coroutine_traits_base' in sym:
+                return sym
+            return None
+        except gdb.MemoryError:
+            return None
+
+    @staticmethod
+    def _get_resume_fn(promise_ptr):
+        """Given a pointer to the promise_type (== task*), get the resume function address.
+
+        The coroutine frame layout is:
+          offset -2*sizeof(ptr): __resume_fn
+          offset -1*sizeof(ptr): __destroy_fn
+          offset 0:              promise_type (which is the task*)
+
+        So resume_fn = *(promise_ptr - 2).
+        """
+        vptr_type = _vptr_type()
+        frame_start = gdb.Value(promise_ptr).reinterpret_cast(vptr_type) - 2
+        return int(frame_start.dereference())
+
+    @staticmethod
+    def _resolve_coroutine_info(promise_ptr):
+        """Resolve the coroutine function name, file, and line from the resume function.
+
+        Returns a dict with keys: func_name, file, line, frame_addr, coro_index
+        """
+        info = {
+            'func_name': '<unknown coroutine>',
+            'file': None,
+            'line': None,
+            'frame_addr': promise_ptr,
+            'coro_index': None,
+        }
+
+        try:
+            resume_fn = scylla_coro_backtrace._get_resume_fn(promise_ptr)
+            block = gdb.block_for_pc(resume_fn)
+            if block and block.function:
+                func = block.function
+                info['func_name'] = func.print_name
+                if func.symtab:
+                    info['file'] = func.symtab.filename
+                info['line'] = func.line
+
+            # Try to read __coro_index from the typed coroutine frame.
+            if block:
+                try:
+                    coro_ty = block['__coro_frame'].type.pointer()
+                    vptr_type = _vptr_type()
+                    frame_start = gdb.Value(promise_ptr).reinterpret_cast(vptr_type) - 2
+                    typed_frame = frame_start.cast(coro_ty).dereference()
+                    coro_index = int(typed_frame['__coro_index'])
+                    info['coro_index'] = coro_index
+                except (gdb.error, KeyError, ValueError):
+                    pass
+        except (gdb.error, gdb.MemoryError):
+            pass
+
+        return info
+
+    _task_symbol_matcher = None
+
+    @classmethod
+    def _is_any_task(cls, ptr):
+        """Check if ptr points to any seastar task (not just coroutines).
+
+        Returns the symbol name if it is, or None otherwise.
+        """
+        if cls._task_symbol_matcher is None:
+            cls._task_symbol_matcher = task_symbol_matcher()
+        try:
+            vptr_type = _vptr_type()
+            maybe_vptr = int(gdb.Value(ptr).reinterpret_cast(vptr_type).dereference())
+            sym = resolve(maybe_vptr, False)
+            if sym and cls._task_symbol_matcher(sym):
+                return sym
+            return None
+        except gdb.MemoryError:
+            return None
+
+    @staticmethod
+    def _get_waiting_task(promise_ptr):
+        """Follow the waiting_task() chain from a task pointer.
+
+        The coroutine promise_type layout (inherits from seastar::task):
+          [vtable_ptr]
+          [task fields: _resume_point, _sg, ...]
+          [_promise: seastar::promise<T>]
+            [promise_base: _future, _state, _task]
+
+        The _task field in promise_base points to the next task waiting on
+        this coroutine's result. We compute the offset to _task by examining
+        the promise_base type layout.
+
+        For non-coroutine tasks (continuations), we scan for embedded task
+        pointers using the same strategy as scylla fiber.
+        """
+        vptr_type = _vptr_type()
+        ptr_size = vptr_type.sizeof
+
+        # Strategy 1: Try to compute the exact offset to _task via type info.
+        # promise_base layout: { _future (ptr), _state (ptr), _task (ptr), ... }
+        # The _task field offset within promise_base is known.
+        # The promise_base is embedded within promise<T>, which is the _promise
+        # field of the coroutine's promise_type.
+        try:
+            promise_base_type = gdb.lookup_type('seastar::internal::promise_base')
+            task_offset_in_promise_base = get_field_offset(promise_base_type, '_task')
+            if task_offset_in_promise_base is not None:
+                # Scan the promise_type object for a region that looks like
+                # promise_base by checking known field offsets.
+                # The promise_base starts with: _future (ptr), _state (ptr), _task (ptr)
+                # We look for the _task field at _future + _state + task_offset.
+                # Since promise_base is embedded at some offset within the promise_type,
+                # we scan for it.
+                for base_offset in range(ptr_size, 256, ptr_size):
+                    try:
+                        # Read the candidate _task pointer at base_offset + task_offset_in_promise_base
+                        task_addr = promise_ptr + base_offset + task_offset_in_promise_base
+                        candidate = int(gdb.Value(task_addr).reinterpret_cast(vptr_type).dereference())
+                        if candidate == 0:
+                            # Check if this could be promise_base by verifying _future and _state
+                            # are plausible pointer values (or null). If _task is null, this
+                            # coroutine has no waiter yet.
+                            future_ptr = int(gdb.Value(promise_ptr + base_offset).reinterpret_cast(vptr_type).dereference())
+                            state_ptr = int(gdb.Value(promise_ptr + base_offset + ptr_size).reinterpret_cast(vptr_type).dereference())
+                            # If both _future and _state look like valid pointers (or null),
+                            # and _task is null, this is likely the end of the chain.
+                            if state_ptr != 0:
+                                return None
+                            continue
+                        # Verify the candidate is actually a task
+                        sym = scylla_coro_backtrace._is_any_task(candidate)
+                        if sym is not None:
+                            return candidate
+                    except gdb.MemoryError:
+                        break
+        except (gdb.error, RuntimeError):
+            pass
+
+        # Strategy 2: Fallback - scan the object for any task pointer.
+        try:
+            for offset in range(ptr_size, 256, ptr_size):
+                try:
+                    candidate = int(gdb.Value(promise_ptr + offset).reinterpret_cast(vptr_type).dereference())
+                    if candidate == 0:
+                        continue
+                    sym = scylla_coro_backtrace._is_any_task(candidate)
+                    if sym is not None:
+                        return candidate
+                except gdb.MemoryError:
+                    break
+        except (gdb.error, RuntimeError):
+            pass
+
+        return None
+
+    def invoke(self, arg, for_tty):
+        parser = argparse.ArgumentParser(description="scylla coro-backtrace")
+        parser.add_argument("-d", "--max-depth", action="store", type=int, default=50,
+                help="Maximum depth of the coroutine chain to walk (default: 50)")
+        parser.add_argument("--all-tasks", action="store_true", default=False,
+                help="Also show non-coroutine tasks in the chain (continuations, lambda_task, etc.)")
+        parser.add_argument("task", nargs="?", default=None,
+                help="An expression evaluating to a seastar::task* (default: current task)")
+
+        try:
+            args = parser.parse_args(arg.split() if arg.strip() else [])
+        except SystemExit:
+            return
+
+        # Determine the starting task pointer
+        if args.task:
+            try:
+                task_ptr = int(gdb.parse_and_eval(args.task))
+            except gdb.error as e:
+                gdb.write("Error: cannot evaluate '{}': {}\n".format(args.task, e))
+                return
+        else:
+            try:
+                task_ptr = int(gdb.parse_and_eval("'seastar'::local_engine->_current_task"))
+                if task_ptr == 0:
+                    gdb.write("No current task is running on this shard.\n")
+                    gdb.write("Hint: provide a task pointer explicitly, e.g.: scylla coro-backtrace 0x<addr>\n")
+                    return
+            except gdb.error:
+                gdb.write("Error: cannot access reactor's current task.\n")
+                gdb.write("Hint: provide a task pointer explicitly, e.g.: scylla coro-backtrace 0x<addr>\n")
+                return
+
+        # Determine current shard for display
+        try:
+            shard = int(gdb.parse_and_eval("'seastar'::local_engine->_id"))
+        except gdb.error:
+            shard = None
+
+        shard_str = " on shard {}".format(shard) if shard is not None else ""
+
+        # Walk the coroutine chain
+        frame_num = 0
+        visited = set()
+        current = task_ptr
+        frames = []
+
+        while current and current != 0 and frame_num < args.max_depth:
+            if current in visited:
+                gdb.write("Warning: loop detected at 0x{:x}, stopping.\n".format(current))
+                break
+            visited.add(current)
+
+            sym = self._is_coroutine_task(current)
+            if sym is not None:
+                # This is a coroutine task
+                info = self._resolve_coroutine_info(current)
+                frames.append(('coroutine', current, info))
+            elif args.all_tasks:
+                # Non-coroutine task, show if requested
+                try:
+                    vptr_type = _vptr_type()
+                    maybe_vptr = int(gdb.Value(current).reinterpret_cast(vptr_type).dereference())
+                    task_sym = resolve(maybe_vptr, False)
+                    if task_sym:
+                        frames.append(('task', current, {'symbol': task_sym.strip()}))
+                    else:
+                        frames.append(('task', current, {'symbol': '<unknown task>'}))
+                except gdb.MemoryError:
+                    frames.append(('task', current, {'symbol': '<unreadable>'}))
+
+            next_task = self._get_waiting_task(current)
+            current = next_task
+            frame_num += 1
+
+        if not frames:
+            gdb.write("No coroutine frames found starting from 0x{:x}.\n".format(task_ptr))
+            gdb.write("The task may not be a coroutine, or the chain could not be walked.\n")
+            gdb.write("Hint: try `scylla fiber 0x{:x}` for the general continuation chain walker.\n".format(task_ptr))
+            return
+
+        # Print the backtrace
+        if args.task:
+            gdb.write("Coroutine backtrace (task 0x{:x}{}):\n".format(task_ptr, shard_str))
+        else:
+            gdb.write("Coroutine backtrace (current task{}):\n".format(shard_str))
+
+        for i, (kind, ptr, info) in enumerate(frames):
+            if kind == 'coroutine':
+                location = ""
+                if info['file'] and info['line']:
+                    location = " at {}:{}".format(info['file'], info['line'])
+                elif info['file']:
+                    location = " at {}".format(info['file'])
+
+                gdb.write("#{:<3d} {}{}\n".format(i, info['func_name'], location))
+
+                details = "     [frame 0x{:x}".format(ptr)
+                if info['coro_index'] is not None:
+                    details += ", suspend point {}".format(info['coro_index'])
+                details += "]\n"
+                gdb.write(details)
+            else:
+                gdb.write("#{:<3d} <{}> at 0x{:x}\n".format(i, info['symbol'], ptr))
+
+        if frame_num >= args.max_depth:
+            gdb.write("... truncated at depth {} (use --max-depth to increase)\n".format(args.max_depth))
+
+        gdb.write("---\n")
+
+
+# ---------------------------------------------------------------------------
+# Frame filter: inject awaiting coroutine chain into GDB backtrace / CLion UI
+# ---------------------------------------------------------------------------
+#
+# When a breakpoint is hit inside a coroutine, the normal `bt` shows:
+#
+#   #0  inner_function()
+#   ...
+#   #N  my_coroutine() [clone .resume]
+#   #N+1 promise_type::run_and_dispose()
+#   #N+2 reactor::task_queue::run_tasks()
+#   #N+3 reactor::task_queue_group::run_some_tasks()
+#   ...
+#
+# With the frame filter enabled, the awaiting coroutine chain is injected:
+#
+#   #0  inner_function()
+#   ...
+#   #N  my_coroutine() [clone .resume]
+#   #N+1 promise_type::run_and_dispose()
+#   #N+2 reactor::task_queue::run_tasks()
+#   #N+3 parent_coroutine() [awaiting, suspend #2]      <-- synthetic
+#   #N+4 grandparent_coroutine() [awaiting, suspend #0] <-- synthetic
+#   #N+5 reactor::task_queue_group::run_some_tasks()
+#   ...
+#
+# CLion reads the backtrace via GDB/MI (-stack-list-frames) which respects
+# frame filters, so the synthetic frames appear in the Call Stack panel.
+#
+# Enable:   scylla coro-bt-filter enable   (already on by default)
+# Disable:  scylla coro-bt-filter disable
+# Status:   scylla coro-bt-filter status
+
+if _has_frame_decorator:
+    class SeastarCoroFrameDecorator(_FrameDecoratorBase):
+        """Synthetic frame decorator representing an awaiting coroutine.
+
+        Overrides function name, source location, and address to display the
+        coroutine that is waiting for the currently executing coroutine.
+        The underlying inferior_frame() delegates to a real frame (the reactor
+        dispatch frame) so that GDB internals don't crash, but all display
+        methods return the coroutine's info.
+        """
+
+        def __init__(self, base, func_name, filename, line, resume_addr, coro_index):
+            super().__init__(base)
+            self._func_name = func_name
+            self._filename = filename
+            self._line = line
+            self._resume_addr = resume_addr
+            self._coro_index = coro_index
+
+        def function(self):
+            tag = " [awaiting"
+            if self._coro_index is not None:
+                tag += ", suspend #{}".format(self._coro_index)
+            tag += "]"
+            return self._func_name + tag
+
+        def address(self):
+            return self._resume_addr
+
+        def filename(self):
+            return self._filename
+
+        def line(self):
+            return self._line
+
+        def frame_args(self):
+            # No stack arguments available for a suspended coroutine.
+            return []
+
+        def frame_locals(self):
+            # Locals live in the coroutine frame on the heap, not on the stack.
+            return []
+
+
+    class _SeastarCoroFilterIterator:
+        """Iterator that injects synthetic coroutine frames into the backtrace.
+
+        Walks the real frame iterator looking for the reactor dispatch
+        boundary (run_some_tasks). When found, it queries the current
+        task's waiting chain and inserts synthetic frames before
+        run_some_tasks.
+        """
+
+        def __init__(self, input_iter):
+            self._input_iter = input_iter
+            self._queue = []
+            self._injected = False
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            # Drain queued synthetic frames first.
+            if self._queue:
+                return self._queue.pop(0)
+
+            decorator = next(self._input_iter)
+
+            # Only attempt injection once per backtrace.
+            if not self._injected:
+                try:
+                    frame = decorator.inferior_frame()
+                    if frame:
+                        name = frame.name()
+                        if name and 'run_some_tasks' in name:
+                            self._injected = True
+                            synth = self._build_waiter_chain(decorator)
+                            if synth:
+                                # Queue: [synth_1, synth_2, ..., real_run_some_tasks]
+                                self._queue.extend(synth)
+                                self._queue.append(decorator)
+                                return self._queue.pop(0)
+                except (gdb.error, RuntimeError, AttributeError):
+                    pass
+
+            return decorator
+
+        @staticmethod
+        def _build_waiter_chain(base_decorator):
+            """Walk the awaiting coroutine chain and return synthetic decorators."""
+            frames = []
+            try:
+                task_ptr = int(gdb.parse_and_eval(
+                    "'seastar'::local_engine->_current_task"))
+                if task_ptr == 0:
+                    return frames
+
+                current = task_ptr
+                visited = set()
+
+                for _ in range(50):  # depth limit
+                    next_task = scylla_coro_backtrace._get_waiting_task(current)
+                    if not next_task or next_task == 0 or next_task in visited:
+                        break
+                    visited.add(next_task)
+
+                    if scylla_coro_backtrace._is_coroutine_task(next_task):
+                        info = scylla_coro_backtrace._resolve_coroutine_info(
+                            next_task)
+                        try:
+                            resume_addr = scylla_coro_backtrace._get_resume_fn(
+                                next_task)
+                        except (gdb.error, gdb.MemoryError):
+                            resume_addr = 0
+                        frames.append(SeastarCoroFrameDecorator(
+                            base_decorator,
+                            info['func_name'],
+                            info.get('file'),
+                            info.get('line'),
+                            resume_addr,
+                            info.get('coro_index'),
+                        ))
+
+                    current = next_task
+            except (gdb.error, gdb.MemoryError, RuntimeError):
+                pass
+
+            return frames
+
+
+    class SeastarCoroFrameFilter:
+        """GDB frame filter that injects awaiting coroutine frames into bt.
+
+        When enabled, the awaiting coroutine chain appears as additional
+        frames in GDB's ``bt`` output and in IDE call stack panels
+        (CLion, VS Code, etc.) that use GDB/MI.
+        """
+
+        def __init__(self):
+            self.name = "SeastarCoroutineFilter"
+            self.priority = 100
+            self.enabled = True  # on by default for CLion / IDE integration
+            gdb.frame_filters[self.name] = self
+
+        def filter(self, frame_iter):
+            if not self.enabled:
+                return frame_iter
+            return _SeastarCoroFilterIterator(frame_iter)
+
+
+# Eagerly create the filter so it is active as soon as scylla-gdb.py is sourced.
+if _has_frame_decorator:
+    _seastar_coro_frame_filter = SeastarCoroFrameFilter()
+else:
+    _seastar_coro_frame_filter = None
+
+
+class scylla_coro_bt_filter(gdb.Command):
+    """Enable or disable the coroutine backtrace frame filter.
+
+    The filter is ENABLED by default when scylla-gdb.py is sourced.
+    Coroutines awaiting the currently executing coroutine are injected
+    as synthetic frames into GDB's backtrace, making them visible in
+    CLion's Call Stack panel and in ``bt`` output.
+
+    Usage:
+        scylla coro-bt-filter enable
+        scylla coro-bt-filter disable
+        scylla coro-bt-filter status
+
+    To disable automatically, add to your .gdbinit or CLion GDB
+    startup commands:
+        scylla coro-bt-filter disable
+    """
+
+    def __init__(self):
+        gdb.Command.__init__(self, 'scylla coro-bt-filter',
+                             gdb.COMMAND_USER, gdb.COMPLETE_NONE, True)
+
+    def invoke(self, arg, for_tty):
+        global _seastar_coro_frame_filter
+
+        if not _has_frame_decorator:
+            gdb.write("Error: gdb.FrameDecorator is not available.\n")
+            gdb.write("The coroutine frame filter requires GDB 7.7 or later.\n")
+            return
+
+        if _seastar_coro_frame_filter is None:
+            _seastar_coro_frame_filter = SeastarCoroFrameFilter()
+
+        arg = arg.strip().lower()
+        if arg == 'enable':
+            _seastar_coro_frame_filter.enabled = True
+            gdb.write("Coroutine backtrace frame filter: enabled.\n")
+            gdb.write("Awaiting coroutines will appear in `bt` and IDE call stacks.\n")
+        elif arg == 'disable':
+            _seastar_coro_frame_filter.enabled = False
+            gdb.write("Coroutine backtrace frame filter: disabled.\n")
+        elif arg == 'status':
+            state = "enabled" if _seastar_coro_frame_filter.enabled else "disabled"
+            gdb.write("Coroutine backtrace frame filter: {}.\n".format(state))
+        else:
+            gdb.write("Usage: scylla coro-bt-filter [enable|disable|status]\n")
+
+
 class scylla_gdb_func_coro_frame(gdb.Function):
     """Given a seastar::task* pointing to a coroutine task, convert it to a pointer to the coroutine frame.
 
@@ -6625,6 +7182,8 @@ scylla_tasks()
 scylla_task_queues()
 scylla_io_queues()
 scylla_fiber()
+scylla_coro_backtrace()
+scylla_coro_bt_filter()
 scylla_find()
 scylla_task_histogram()
 scylla_active_sstables()
