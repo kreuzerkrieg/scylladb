@@ -87,7 +87,7 @@ private:
     sharded<db::view::view_building_worker>& _view_building_worker;
     shared_ptr<task_manager_module> _task_manager_module;
     sstables::storage_manager& _storage_manager;
-    db::system_distributed_keyspace& _sys_dist_ks;
+    sharded<db::system_distributed_keyspace>& _sys_dist_ks;
     seastar::scheduling_group _sched_group;
 
     // Note that this is obviously only valid for the current shard. Users of
@@ -105,7 +105,7 @@ private:
 
     future<seastar::shared_ptr<const locator::effective_replication_map>> await_topology_quiesced_and_get_erm(table_id table_id);
     future<> download_tablet_sstables(locator::global_tablet_id tid, sstring snap_name, sstring endpoint, sstring bucket);
-    future<> attach_sstable(table_id tid, const minimal_sst_info& min_info) const;
+    future<sstables::shared_sstable> attach_sstable(table_id tid, const minimal_sst_info& min_info) const;
 
 public:
     sstables_loader(sharded<replica::database>& db,
@@ -115,7 +115,7 @@ public:
             sharded<db::view::view_building_worker>& vbw,
             tasks::task_manager& tm,
             sstables::storage_manager& sstm,
-            db::system_distributed_keyspace& sys_dist_ks,
+            sharded<db::system_distributed_keyspace>& sys_dist_ks,
             seastar::scheduling_group sg);
 
     future<> stop();

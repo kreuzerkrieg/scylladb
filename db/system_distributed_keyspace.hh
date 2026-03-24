@@ -48,6 +48,7 @@ struct snapshot_sstable_entry {
     dht::token last_token;
     sstring toc_name;
     sstring prefix;
+    bool downloaded{false};
 };
 
 class system_distributed_keyspace {
@@ -79,6 +80,8 @@ public:
     /* This table is used by the backup and restore code to store per-sstable metadata.
      * The data the coordinator node puts in this table comes from the snapshot manifests. */
     static constexpr auto SNAPSHOT_SSTABLES = "snapshot_sstables";
+
+    static constexpr uint64_t SNAPSHOT_SSTABLES_TTL_SECONDS = std::chrono::seconds(std::chrono::days(3)).count();
 
     /* Information required to modify/query some system_distributed tables, passed from the caller. */
     struct context {
@@ -128,13 +131,21 @@ public:
     /* Inserts a single SSTable entry for a given snapshot, keyspace, table, datacenter,
      * and rack. The row is written with the specified TTL (in seconds). Uses consistency
      * level `EACH_QUORUM` by default.*/
-    future<> insert_snapshot_sstable(sstring snapshot_name, sstring ks, sstring table, sstring dc, sstring rack, sstables::sstable_id sstable_id, dht::token first_token, dht::token last_token, sstring toc_name, sstring prefix, db::consistency_level cl = db::consistency_level::EACH_QUORUM);
+    future<> insert_snapshot_sstable(sstring snapshot_name, sstring ks, sstring table, sstring dc, sstring rack, sstables::sstable_id sstable_id, dht::token first_token, dht::token last_token, sstring toc_name, sstring prefix, bool downloaded, db::consistency_level cl = db::consistency_level::EACH_QUORUM);
     
     /* Retrieves all SSTable entries for a given snapshot, keyspace, table, datacenter, and rack.
      * If `start_token` and `end_token` are provided, only entries whose `first_token` is in the range [`start_token`, `end_token`] will be returned.
      * Returns a vector of `snapshot_sstable_entry` structs containing `sstable_id`, `first_token`, `last_token`,
      * `toc_name`, and `prefix`. Uses consistency level `LOCAL_QUORUM` by default. */
     future<utils::chunked_vector<snapshot_sstable_entry>> get_snapshot_sstables(sstring snapshot_name, sstring ks, sstring table, sstring dc, sstring rack, db::consistency_level cl = db::consistency_level::LOCAL_QUORUM, std::optional<dht::token> start_token = std::nullopt, std::optional<dht::token> end_token = std::nullopt) const;
+    future<> update_sstable_download_status(sstring snapshot_name,
+                                            sstring ks,
+                                            sstring table,
+                                            sstring dc,
+                                            sstring rack,
+                                            sstables::sstable_id sstable_id,
+                                            dht::token start_token,
+                                            bool downloaded) const;
 
 private:
     future<> create_tables(std::vector<schema_ptr> tables);

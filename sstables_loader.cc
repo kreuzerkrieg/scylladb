@@ -11,6 +11,7 @@
 #include <seastar/core/map_reduce.hh>
 #include <seastar/core/shared_ptr.hh>
 #include <seastar/core/shared_mutex.hh>
+#include <seastar/util/short_streams.hh>
 #include <seastar/core/units.hh>
 #include <seastar/coroutine/maybe_yield.hh>
 #include <seastar/coroutine/switch_to.hh>
@@ -37,7 +38,6 @@
 
 #include "sstables/object_storage_client.hh"
 #include "utils/rjson.hh"
-#include "db/system_distributed_keyspace.hh"
 
 #include <cfloat>
 #include <algorithm>
@@ -856,7 +856,7 @@ sstables_loader::sstables_loader(sharded<replica::database>& db,
         sharded<db::view::view_building_worker>& vbw,
         tasks::task_manager& tm,
         sstables::storage_manager& sstm,
-        db::system_distributed_keyspace& sys_dist_ks,
+        sharded<db::system_distributed_keyspace>& sys_dist_ks,
         seastar::scheduling_group sg)
     : _db(db)
     , _ss(ss)
@@ -900,7 +900,7 @@ future<tasks::task_id> sstables_loader::download_new_sstables(sstring ks_name, s
     co_return task->id();
 }
 
-future<> sstables_loader::attach_sstable(table_id tid, const minimal_sst_info& min_info) const {
+future<sstables::shared_sstable> sstables_loader::attach_sstable(table_id tid, const minimal_sst_info& min_info) const {
     auto& db = _db.local();
     auto& table = db.find_column_family(tid);
     llog.debug("Adding downloaded SSTables to the table {} on shard {}", table.schema()->cf_name(), this_shard_id());
@@ -920,6 +920,7 @@ future<> sstables_loader::attach_sstable(table_id tid, const minimal_sst_info& m
             co_await loading_sst->seal_sstable(writer_cfg.backup);
         }
     });
+    co_return sst;
 }
 
 future<> sstables_loader::download_tablet_sstables(locator::global_tablet_id tid, sstring snap_name, sstring endpoint, sstring bucket) {
@@ -927,8 +928,12 @@ future<> sstables_loader::download_tablet_sstables(locator::global_tablet_id tid
     const auto& tm = _db.local().get_token_metadata();
     auto tablet_range = tm.tablets().get_tablet_map(tid.table).get_token_range(tid.tablet);
     const auto& topo = tm.get_topology();
+    auto keyspace_name = s->ks_name();
+    auto table_name = s->cf_name();
+    auto datacenter = topo.get_datacenter();
+    auto rack = topo.get_rack();
 
-    auto sst_infos = co_await _sys_dist_ks.get_snapshot_sstables(snap_name, s->ks_name(), s->cf_name(), topo.get_datacenter(), topo.get_rack(),
+    auto sst_infos = co_await _sys_dist_ks.local().get_snapshot_sstables(snap_name, keyspace_name, table_name, datacenter, rack,
             db::consistency_level::LOCAL_QUORUM, tablet_range.start().transform([] (auto& v) { return v.value(); }), tablet_range.end().transform([] (auto& v) { return v.value(); }));
     llog.debug("{} SSTables found for tablet {}", sst_infos.size(), tid);
     if (sst_infos.empty()) {
@@ -1000,10 +1005,24 @@ future<> sstables_loader::download_tablet_sstables(locator::global_tablet_id tid
             return init;
         });
 
-    co_await container().invoke_on_all([tid, &downloaded_ssts] (auto& loader) -> future<> {
-        auto shard_ssts = std::move(downloaded_ssts[this_shard_id()]);
-        co_await max_concurrent_for_each(shard_ssts, 16, [&loader, tid](const auto& min_info) -> future<> { co_await loader.attach_sstable(tid.table, min_info); });
-    });
+    co_await container().invoke_on_all(
+        [this, tid, &downloaded_ssts, snap_name, keyspace_name, table_name, datacenter, rack](auto& loader) -> future<> {
+            auto shard_ssts = std::move(downloaded_ssts[this_shard_id()]);
+            co_await max_concurrent_for_each(shard_ssts, 16, [this, &loader, tid, snap_name, keyspace_name, table_name, datacenter, rack](const auto& min_info) -> future<> {
+                sstables::shared_sstable attached_sst = co_await loader.attach_sstable(tid.table, min_info);
+                if (!attached_sst->sstable_identifier()) {
+                    on_internal_error(llog, "table identifier is required");
+                }
+                co_await _sys_dist_ks.local().update_sstable_download_status(snap_name,
+                                                                             keyspace_name,
+                                                                             table_name,
+                                                                             datacenter,
+                                                                             rack,
+                                                                             *attached_sst->sstable_identifier(),
+                                                                             attached_sst->get_first_decorated_key().token(),
+                                                                             true);
+            });
+        });
 }
 
 future<std::vector<tablet_sstable_collection>> get_sstables_for_tablets_for_tests(const std::vector<sstables::shared_sstable>& sstables,
@@ -1053,7 +1072,7 @@ static future<size_t> process_manifest(input_stream<char>& is, sstring keyspace,
         // Insert the snapshot sstable metadata into system_distributed.snapshot_sstables with a TTL of 3 days, that should be enough
         // for any snapshot restore operation to complete, and after that the metadata will be automatically cleaned up from the table
         co_await sys_dist_ks.insert_snapshot_sstable(snapshot_name, keyspace, table, datacenter, rack, id, first_token, last_token,
-                                                    toc_name, prefix, cl);
+                                                    toc_name, prefix, false, cl);
     }
 
     co_return tablet_count;
@@ -1091,6 +1110,20 @@ class sstables_loader::tablet_restore_task_impl : public tasks::task_manager::ta
     sstring _snap_name;
     sstring _endpoint;
     sstring _bucket;
+    tasks::task_manager::task::progress _progress;
+    named_gate _gate{"progress_updater"};
+    timer<seastar::lowres_clock> _progress_update_timer;
+
+    future<> update_progress() {
+        const auto& tm = _loader.local()._db.local().get_token_metadata();
+        auto s = _loader.local()._db.local().find_schema(_tid);
+        const auto& topo = tm.get_topology();
+        auto sst_infos = co_await _loader.local()._sys_dist_ks.local().get_snapshot_sstables(
+            _snap_name, s->ks_name(), s->cf_name(), topo.get_datacenter(), topo.get_rack(), db::consistency_level::LOCAL_QUORUM);
+        _progress.total = sst_infos.size();
+        _progress.completed =
+            std::accumulate(sst_infos.begin(), sst_infos.end(), 0ULL, [](size_t acc, const auto& si) { return acc + (si.downloaded ? 1 : 0); });
+    }
 
 public:
     tablet_restore_task_impl(tasks::task_manager::module_ptr module, sharded<sstables_loader>& loader, sstring ks,
@@ -1101,8 +1134,15 @@ public:
         , _snap_name(std::move(snap_name))
         , _endpoint(std::move(endpoint))
         , _bucket(std::move(bucket))
+        , _progress_update_timer([this] {
+            auto gh = _gate.hold();
+            std::ignore = update_progress().finally([this, gh = std::move(gh)] {
+                _progress_update_timer.rearm(lowres_clock::now() + 5s);
+            });
+        })
     {
-        _status.progress_units = "batches";
+        _status.progress_units = "sstables";
+        _progress_update_timer.arm(lowres_clock::now());
     }
 
     virtual std::string type() const override {
@@ -1121,14 +1161,29 @@ public:
         return tasks::is_abortable::no;
     }
 
+    future<tasks::task_manager::task::progress> get_progress() const override {
+        co_return _progress;
+    }
+
 protected:
     virtual future<> run() override {
-        co_await _loader.local()._ss.local().restore_tablets(_tid, _snap_name, _endpoint, _bucket);
+        std::exception_ptr ex;
+        try {
+            co_await _loader.local()._ss.local().restore_tablets(_tid, _snap_name, _endpoint, _bucket);
+        } catch (...) {
+            ex = std::current_exception();
+        }
+        co_await update_progress();
+        _progress_update_timer.cancel();
+        co_await _gate.close();
+        if (ex) {
+            std::rethrow_exception(ex);
+        }
     }
 };
 
 future<tasks::task_id> sstables_loader::restore_tablets(table_id tid, sstring keyspace, sstring table, sstring snap_name, sstring endpoint, sstring bucket, utils::chunked_vector<sstring> manifests) {
-    co_await populate_snapshot_sstables_from_manifests(_storage_manager, _sys_dist_ks, keyspace, table, endpoint, bucket, snap_name, std::move(manifests));
+    co_await populate_snapshot_sstables_from_manifests(_storage_manager, _sys_dist_ks.local(), keyspace, table, endpoint, bucket, snap_name, std::move(manifests));
     auto task = co_await _task_manager_module->make_and_start_task<tablet_restore_task_impl>({}, container(), keyspace, tid, std::move(snap_name), std::move(endpoint), std::move(bucket));
     co_return task->id();
 }
