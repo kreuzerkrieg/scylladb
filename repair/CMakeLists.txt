@@ -9,10 +9,11 @@ target_include_directories(repair
     ${CMAKE_SOURCE_DIR})
 target_link_libraries(repair
   PUBLIC
-    idl
     absl::headers
     Seastar::seastar
-    xxHash::xxhash)
+    xxHash::xxhash
+  PRIVATE
+    idl)
 if (Scylla_USE_PRECOMPILED_HEADER_USE)
   target_precompile_headers(repair REUSE_FROM scylla-precompiled-header)
 endif()

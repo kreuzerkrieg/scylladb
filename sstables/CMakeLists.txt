@@ -34,10 +34,10 @@ target_include_directories(sstables
     ${CMAKE_SOURCE_DIR})
 target_link_libraries(sstables
   PUBLIC
-    idl
     Seastar::seastar
     xxHash::xxhash
   PRIVATE
+    idl
     readers
     tracing
     absl::headers
