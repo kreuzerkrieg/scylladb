@@ -62,25 +62,25 @@ function(add_scylla_test name)
   target_include_directories(${target}
     PRIVATE
       ${CMAKE_SOURCE_DIR})
-  target_link_libraries(${target}
-    PRIVATE
-      test-lib
-      Seastar::seastar
-      xxHash::xxhash)
   if(kind STREQUAL "SEASTAR")
     target_link_libraries(${target}
       PRIVATE
-        Seastar::seastar_testing)
-    # SEASTAR_TESTING_MAIN is provided by add_compile_definitions() in
-    # the top-level CMakeLists.txt, matching configure.py's global define.
+        test-lib
+        Seastar::seastar
+        Seastar::seastar_testing
+        xxHash::xxhash)
   elseif(kind STREQUAL "BOOST")
     target_link_libraries(${target}
       PRIVATE
+        test-lib-core
         Boost::unit_test_framework)
   elseif(kind STREQUAL "UNIT")
     target_link_libraries(${target}
       PRIVATE
-        Seastar::seastar_testing)
+        test-lib
+        Seastar::seastar
+        Seastar::seastar_testing
+        xxHash::xxhash)
   else()
     message(FATAL_ERROR "unknown test KIND: ${kind}")
   endif()

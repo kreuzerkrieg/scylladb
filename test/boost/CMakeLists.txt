@@ -1,11 +1,18 @@
 add_scylla_test(UUID_test
-  KIND BOOST)
+  KIND BOOST
+  LIBRARIES
+    scylla-main
+    utils)
 add_scylla_test(url_parse_test
-  KIND BOOST)
+  KIND BOOST
+  LIBRARIES utils)
 add_scylla_test(advanced_rpc_compressor_test
   KIND SEASTAR)
 add_scylla_test(allocation_strategy_test
-  KIND BOOST)
+  KIND BOOST
+  LIBRARIES
+    scylla-main
+    utils)
 add_scylla_test(alternator_unit_test
   KIND SEASTAR
   LIBRARIES alternator)
@@ -15,7 +22,8 @@ add_scylla_test(auth_passwords_test
   KIND SEASTAR
   LIBRARIES auth)
 add_scylla_test(auth_resource_test
-  KIND BOOST)
+  KIND BOOST
+  LIBRARIES test-lib)
 add_scylla_test(big_decimal_test
   KIND BOOST
   LIBRARIES utils)
@@ -30,13 +38,18 @@ add_scylla_test(btree_test
   KIND SEASTAR)
 add_scylla_test(bytes_ostream_test
   KIND BOOST
-  LIBRARIES Seastar::seastar_testing)
+  LIBRARIES
+    absl::headers
+    scylla-main
+    utils
+    Seastar::seastar_testing)
 add_scylla_test(cache_mutation_reader_test
   KIND SEASTAR)
 add_scylla_test(cached_file_test
   KIND SEASTAR)
 add_scylla_test(caching_options_test
-  KIND BOOST)
+  KIND BOOST
+  LIBRARIES test-lib)
 add_scylla_test(canonical_mutation_test
   KIND SEASTAR)
 add_scylla_test(cartesian_product_test
@@ -44,7 +57,13 @@ add_scylla_test(cartesian_product_test
 add_scylla_test(cell_locker_test
   KIND SEASTAR)
 add_scylla_test(checksum_utils_test
-  KIND BOOST)
+  KIND BOOST
+  LIBRARIES
+    test-lib
+    scylla-main
+    utils
+    libdeflate::libdeflate
+    ZLIB::ZLIB)
 add_scylla_test(chunked_managed_vector_test
   KIND SEASTAR)
 add_scylla_test(chunked_vector_test
@@ -58,8 +77,12 @@ add_scylla_test(comparable_bytes_test
   LIBRARIES types)
 add_scylla_test(compound_test
   KIND SEASTAR)
-add_scylla_test(compress_test
-  KIND BOOST)
+add_scylla_test(bti_node_sink_test
+  KIND BOOST
+  LIBRARIES
+    Seastar::seastar_testing
+    sstables
+    test-lib)
 add_scylla_test(config_test
   KIND SEASTAR)
 add_scylla_test(continuous_data_consumer_test
@@ -68,7 +91,9 @@ add_scylla_test(counter_test
   KIND SEASTAR)
 add_scylla_test(cql_auth_syntax_test
   KIND BOOST
-  LIBRARIES cql3)
+  LIBRARIES
+    cql3
+    test-lib)
 add_scylla_test(crc_test
   KIND BOOST)
 add_scylla_test(dict_trainer_test
@@ -78,7 +103,8 @@ add_scylla_test(dirty_memory_manager_test
 add_scylla_test(double_decker_test
   KIND SEASTAR)
 add_scylla_test(duration_test
-  KIND BOOST)
+  KIND BOOST
+  LIBRARIES types)
 add_scylla_test(dynamic_bitset_test
   KIND BOOST
   LIBRARIES utils)
@@ -104,7 +130,9 @@ add_scylla_test(exceptions_optimized_test
   KIND SEASTAR)
 add_scylla_test(expr_test
   KIND BOOST
-  LIBRARIES cql3)
+  LIBRARIES
+    cql3
+    test-lib)
 add_scylla_test(flush_queue_test
   KIND SEASTAR)
 add_scylla_test(fragmented_temporary_buffer_test
@@ -123,7 +151,10 @@ add_scylla_test(hint_test
   KIND SEASTAR)
 add_scylla_test(idl_test
   KIND BOOST
-  LIBRARIES idl)
+  LIBRARIES
+    absl::headers
+    scylla-main
+    idl)
 add_scylla_test(incremental_compaction_test
   KIND SEASTAR)
 add_scylla_test(index_reader_test
@@ -135,10 +166,10 @@ add_scylla_test(intrusive_array_test
   KIND SEASTAR)
 add_scylla_test(json_test
   KIND BOOST
-  LIBRARIES cql3)
+  LIBRARIES test-lib)
 add_scylla_test(keys_test
   KIND BOOST
-  LIBRARIES idl schema)
+  LIBRARIES test-lib)
 add_scylla_test(like_matcher_test
   KIND BOOST
   LIBRARIES utils)
@@ -157,16 +188,25 @@ add_scylla_test(logalloc_standard_allocator_segment_pool_backend_test
 add_scylla_test(logalloc_test
   KIND SEASTAR)
 add_scylla_test(lru_string_map_test
-  KIND BOOST)
+  KIND BOOST
+  LIBRARIES
+    absl::headers
+    absl::raw_hash_set)
 add_scylla_test(managed_bytes_test
   KIND BOOST
-  LIBRARIES Seastar::seastar_testing)
+  LIBRARIES
+    scylla-main
+    utils
+    Seastar::seastar_testing)
 add_scylla_test(managed_vector_test
   KIND SEASTAR)
 add_scylla_test(map_difference_test
   KIND BOOST)
 add_scylla_test(murmur_hash_test
-  KIND BOOST)
+  KIND BOOST
+  LIBRARIES
+    scylla-main
+    utils)
 add_scylla_test(mutation_fragment_test
   KIND SEASTAR)
 add_scylla_test(mutation_query_test
@@ -178,17 +218,20 @@ add_scylla_test(mutation_test
 add_scylla_test(mvcc_test
   KIND SEASTAR)
 add_scylla_test(nonwrapping_interval_test
-  KIND BOOST)
+  KIND BOOST
+  LIBRARIES test-lib)
 add_scylla_test(observable_test
   KIND BOOST)
 add_scylla_test(partitioner_test
   KIND SEASTAR)
 add_scylla_test(pretty_printers_test
-  KIND BOOST)
+  KIND BOOST
+  LIBRARIES utils)
 add_scylla_test(radix_tree_test
   KIND SEASTAR)
 add_scylla_test(range_tombstone_list_test
-  KIND BOOST)
+  KIND BOOST
+  LIBRARIES test-lib)
 add_scylla_test(rate_limiter_test
   KIND SEASTAR)
 add_scylla_test(recent_entries_map_test
@@ -213,7 +256,8 @@ add_scylla_test(gcp_object_storage_test
   KIND SEASTAR
   LIBRARIES scylla_encryption)
 add_scylla_test(aws_errors_test
-  KIND BOOST)
+  KIND BOOST
+  LIBRARIES utils)
 add_scylla_test(aws_error_injection_test
   KIND SEASTAR)
 add_scylla_test(schema_changes_test
@@ -222,7 +266,8 @@ add_scylla_test(schema_loader_test
   KIND SEASTAR
   LIBRARIES tools)
 add_scylla_test(serialization_test
-  KIND BOOST)
+  KIND BOOST
+  LIBRARIES test-lib)
 add_scylla_test(serialized_action_test
   KIND SEASTAR)
 add_scylla_test(service_level_controller_test
@@ -240,7 +285,8 @@ add_scylla_test(sstable_conforms_to_mutation_source_test
 add_scylla_test(sstable_datafile_test
   KIND SEASTAR)
 add_scylla_test(sstable_generation_test
-  KIND BOOST)
+  KIND BOOST
+  LIBRARIES test-lib)
 add_scylla_test(sstable_inexact_index_test
   KIND SEASTAR)
 add_scylla_test(sstable_move_test
@@ -259,7 +305,7 @@ add_scylla_test(stream_compressor_test
   KIND BOOST
   LIBRARIES
     Seastar::seastar_testing
-    utils)
+    test-lib)
 add_scylla_test(string_format_test
   KIND BOOST)
 add_scylla_test(summary_test
@@ -276,14 +322,18 @@ add_scylla_test(transport_test
   KIND SEASTAR)
 add_scylla_test(bti_index_test
   KIND SEASTAR)
-add_scylla_test(bti_node_sink_test
-  KIND BOOST)
 add_scylla_test(bti_key_translation_test
-  KIND BOOST)
+  KIND BOOST
+  LIBRARIES
+    Seastar::seastar_testing
+    test-lib)
 add_scylla_test(trie_traversal_test
   KIND SEASTAR)
 add_scylla_test(trie_writer_test
-  KIND BOOST)
+  KIND BOOST
+  LIBRARIES
+    Seastar::seastar_testing
+    test-lib)
 add_scylla_test(types_test
   KIND SEASTAR)
 add_scylla_test(unique_view_test
@@ -305,7 +355,8 @@ add_scylla_test(wasm_alloc_test
 add_scylla_test(wasm_test
   KIND SEASTAR)
 add_scylla_test(wrapping_interval_test
-  KIND BOOST)
+  KIND BOOST
+  LIBRARIES test-lib)
 add_scylla_test(address_map_test
   KIND SEASTAR)
 add_scylla_test(object_storage_upload_test

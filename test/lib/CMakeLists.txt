@@ -1,13 +1,31 @@
-add_library(test-lib STATIC)
-target_sources(test-lib
-  PUBLIC
+# test-lib-core: minimal test infrastructure for lightweight (BOOST) tests.
+# Provides the boost test tree lister, logging, and basic test utilities
+# without pulling in Scylla's full codebase.
+add_library(test-lib-core STATIC)
+target_sources(test-lib-core
+  PRIVATE
     boost_test_tree_lister.cc
     boost_tree_lister_injector.cc
+    exception_utils.cc
+    log.cc)
+target_include_directories(test-lib-core
+  PUBLIC
+    ${CMAKE_SOURCE_DIR})
+target_link_libraries(test-lib-core
+  PUBLIC
+    Seastar::seastar
+    xxHash::xxhash
+  PRIVATE
+    Boost::regex
+    Boost::unit_test_framework)
+
+# test-lib: full test infrastructure for SEASTAR tests that need the
+# complete Scylla environment (cql_test_env, mutation helpers, etc.).
+add_library(test-lib STATIC)
+target_sources(test-lib
   PRIVATE
     cql_assertions.cc
     dummy_sharder.cc
-    exception_utils.cc
-    log.cc
     test_utils.cc
     tmpdir.cc
     cql_test_env.cc
@@ -33,10 +51,9 @@ target_include_directories(test-lib
     ${CMAKE_SOURCE_DIR})
 target_link_libraries(test-lib
   PUBLIC
+    test-lib-core
     scylla-main
     replica
-    Seastar::seastar
-    xxHash::xxhash
   PRIVATE
     audit
     auth

@@ -13,7 +13,9 @@ add_scylla_test(message
   KIND SEASTAR)
 add_scylla_test(partition_data_test
   KIND BOOST
-  LIBRARIES Seastar::seastar_testing)
+  LIBRARIES
+    Seastar::seastar_testing
+    test-lib)
 add_scylla_test(row_locker_test
   KIND SEASTAR)
 add_scylla_test(sstable_scan_footprint_test
