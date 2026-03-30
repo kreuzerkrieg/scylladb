@@ -424,7 +424,7 @@ set(scylla_libs
     service
     sstables
     streaming
-    test-perf
+    scylla-perf
     tools
     tracing
     transport
