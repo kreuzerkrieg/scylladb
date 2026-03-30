@@ -44,8 +44,7 @@ target_link_libraries(test-perf
     test-lib
     Seastar::seastar_perf_testing
     JsonCpp::JsonCpp
-    xxHash::xxhash
-    wasmtime_bindings)
+    xxHash::xxhash)
 
 # scylla-perf: perf infrastructure linked into the scylla binary.
 # Mirrors configure.py's scylla_perfs list — includes only the specific
@@ -85,8 +84,7 @@ target_link_libraries(scylla-perf
     absl::headers
     Seastar::seastar_testing
     JsonCpp::JsonCpp
-    xxHash::xxhash
-    wasmtime_bindings)
+    xxHash::xxhash)
 
 add_library(perf-lib OBJECT perf.cc)
 target_include_directories(perf-lib

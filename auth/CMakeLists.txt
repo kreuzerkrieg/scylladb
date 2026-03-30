@@ -39,7 +39,6 @@ target_link_libraries(scylla_auth
     cql3
     idl
     ldap
-    wasmtime_bindings
     libxcrypt::libxcrypt)
 
 add_whole_archive(auth scylla_auth)

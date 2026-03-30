@@ -23,7 +23,6 @@ target_link_libraries(replica
   PUBLIC
     db
     absl::headers
-    wasmtime_bindings
     Seastar::seastar
     xxHash::xxhash
   PRIVATE

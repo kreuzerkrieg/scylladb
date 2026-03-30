@@ -134,7 +134,6 @@ target_include_directories(cql3
 target_link_libraries(cql3
   PUBLIC
     idl
-    wasmtime_bindings
     Seastar::seastar
     absl::headers
     xxHash::xxhash

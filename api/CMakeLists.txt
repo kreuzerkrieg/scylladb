@@ -105,7 +105,6 @@ target_link_libraries(api
     xxHash::xxhash
   PRIVATE
     idl
-    wasmtime_bindings
     absl::headers)
 
 if (Scylla_USE_PRECOMPILED_HEADER_USE)
