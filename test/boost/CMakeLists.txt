@@ -1,7 +1,7 @@
 add_scylla_test(UUID_test
   KIND BOOST
   LIBRARIES
-    scylla-main
+    scylla-core
     utils)
 add_scylla_test(url_parse_test
   KIND BOOST
@@ -10,9 +10,7 @@ add_scylla_test(advanced_rpc_compressor_test
   KIND SEASTAR)
 add_scylla_test(allocation_strategy_test
   KIND BOOST
-  LIBRARIES
-    scylla-main
-    utils)
+  LIBRARIES utils)
 add_scylla_test(alternator_unit_test
   KIND SEASTAR
   LIBRARIES alternator)
@@ -40,7 +38,7 @@ add_scylla_test(bytes_ostream_test
   KIND BOOST
   LIBRARIES
     absl::headers
-    scylla-main
+    scylla-core
     utils
     Seastar::seastar_testing)
 add_scylla_test(cache_mutation_reader_test
@@ -60,7 +58,6 @@ add_scylla_test(checksum_utils_test
   KIND BOOST
   LIBRARIES
     test-lib
-    scylla-main
     utils
     libdeflate::libdeflate
     ZLIB::ZLIB)
@@ -153,7 +150,7 @@ add_scylla_test(idl_test
   KIND BOOST
   LIBRARIES
     absl::headers
-    scylla-main
+    scylla-core
     idl)
 add_scylla_test(incremental_compaction_test
   KIND SEASTAR)
@@ -195,7 +192,7 @@ add_scylla_test(lru_string_map_test
 add_scylla_test(managed_bytes_test
   KIND BOOST
   LIBRARIES
-    scylla-main
+    scylla-core
     utils
     Seastar::seastar_testing)
 add_scylla_test(managed_vector_test
@@ -205,7 +202,7 @@ add_scylla_test(map_difference_test
 add_scylla_test(murmur_hash_test
   KIND BOOST
   LIBRARIES
-    scylla-main
+    scylla-core
     utils)
 add_scylla_test(mutation_fragment_test
   KIND SEASTAR)
@@ -346,7 +343,7 @@ add_scylla_test(utf8_test
 add_scylla_test(vint_serialization_test
   KIND BOOST
    LIBRARIES
-     scylla-main
+     scylla-core
      utils)
 add_scylla_test(virtual_table_mutation_source_test
   KIND SEASTAR)

@@ -273,14 +273,42 @@ else()
   set(Scylla_USE_PRECOMPILED_HEADER_USE OFF)
 endif()
 
+# scylla-core: lightweight foundational types (bytes, vint, serializer,
+# clocks) that have no heavy dependencies.  Test targets that only need
+# these symbols can link scylla-core instead of the full scylla-main,
+# avoiding the transitive pull of db → cql3 → … and all their objects.
+#
+# NOTE: this introduces a production/test symbol boundary — BOOST tests
+# linked against scylla-core see only the subset of symbols defined here,
+# not the full scylla-main graph.  This is intentional for CMake build
+# performance (fewer objects to compile and link per test binary) and
+# mirrors what configure.py already does: those tests never required the
+# full scylla-main in configure.py either.  If a BOOST test starts
+# needing symbols beyond scylla-core, switch it back to scylla-main (or
+# to test-lib for SEASTAR tests) rather than expanding scylla-core.
+add_library(scylla-core STATIC)
+target_sources(scylla-core
+  PRIVATE
+    bytes.cc
+    clocks-impl.cc
+    serializer.cc
+    vint-serialization.cc)
+target_include_directories(scylla-core
+  PUBLIC
+    ${CMAKE_SOURCE_DIR})
+target_link_libraries(scylla-core
+  PUBLIC
+    Seastar::seastar
+    xxHash::xxhash
+  PRIVATE
+    absl::headers)
+
 add_library(scylla-main STATIC)
 
 target_sources(scylla-main
   PRIVATE
     absl-flat_hash_map.cc
-    bytes.cc
     client_data.cc
-    clocks-impl.cc
     sstable_dict_autotrainer.cc
     exceptions/exceptions.cc
     debug.cc
@@ -296,7 +324,6 @@ target_sources(scylla-main
     tombstone_gc.cc
     reader_concurrency_semaphore.cc
     reader_concurrency_semaphore_group.cc
-    serializer.cc
     service/direct_failure_detector/failure_detector.cc
     sstables_loader.cc
     table_helper.cc
@@ -304,9 +331,10 @@ target_sources(scylla-main
     tasks/task_manager.cc
     timeout_config.cc
     unimplemented.cc
-    validation.cc
-    vint-serialization.cc)
+    validation.cc)
 target_link_libraries(scylla-main
+  PUBLIC
+    scylla-core
   PRIVATE
     db
     absl::headers
