@@ -11,7 +11,7 @@ function(add_perf_test name)
       ${CMAKE_SOURCE_DIR})
   target_link_libraries(${name}
     PRIVATE
-      perf-lib
+      test-perf
       test-lib
       Seastar::seastar_perf_testing
       Seastar::seastar
@@ -47,53 +47,31 @@ target_link_libraries(test-perf
     xxHash::xxhash)
 
 # scylla-perf: perf infrastructure linked into the scylla binary.
-# Mirrors configure.py's scylla_perfs list — includes only the specific
-# test/lib sources that perf code needs, NOT the full test-lib (which would
-# pull in 16 unnecessary test-only files like boost_test_tree_lister,
-# mutation_assertions, KMS fixtures, etc.).
-add_library(scylla-perf STATIC)
-target_sources(scylla-perf
-  PRIVATE
-    perf_alternator.cc
-    perf_fast_forward.cc
-    perf_row_cache_update.cc
-    perf_simple_query.cc
-    perf_cql_raw.cc
-    perf_sstable.cc
-    perf_tablets.cc
-    tablet_load_balancing.cc
-    perf.cc
-    ${CMAKE_SOURCE_DIR}/test/lib/cql_test_env.cc
-    ${CMAKE_SOURCE_DIR}/test/lib/log.cc
-    ${CMAKE_SOURCE_DIR}/test/lib/test_services.cc
-    ${CMAKE_SOURCE_DIR}/test/lib/test_utils.cc
-    ${CMAKE_SOURCE_DIR}/test/lib/tmpdir.cc
-    ${CMAKE_SOURCE_DIR}/test/lib/key_utils.cc
-    ${CMAKE_SOURCE_DIR}/test/lib/random_schema.cc
-    ${CMAKE_SOURCE_DIR}/test/lib/data_model.cc
-    ${CMAKE_SOURCE_DIR}/test/lib/eventually.cc
-    ${CMAKE_SOURCE_DIR}/seastar/tests/perf/linux_perf_event.cc)
+# Links test-perf and test-lib instead of duplicating their sources.
+# The linker only pulls object files that resolve pending symbols from
+# static libraries, so test-only objects (boost_test_tree_lister,
+# mutation_assertions, etc.) won't be included in the scylla binary.
+#
+# CAVEAT: because scylla-perf is INTERFACE, test-lib and test-perf
+# appear in the scylla binary's link graph.  Any translation unit in
+# those libraries that acquires a global constructor or static
+# initializer will be silently pulled into the production binary.
+# Keep test-lib and test-perf free of such side effects, or move the
+# offending TU out of the library.
+add_library(scylla-perf INTERFACE)
 target_include_directories(scylla-perf
-  PUBLIC
+  INTERFACE
     ${CMAKE_SOURCE_DIR}
     ${CMAKE_BINARY_DIR}/gen)
 target_link_libraries(scylla-perf
-  PRIVATE
+  INTERFACE
+    test-perf
+    test-lib
     scylla-main
     idl
     absl::headers
     Seastar::seastar_testing
     JsonCpp::JsonCpp
-    xxHash::xxhash)
-
-add_library(perf-lib OBJECT perf.cc)
-target_include_directories(perf-lib
-  PUBLIC
-    ${CMAKE_SOURCE_DIR})
-target_link_libraries(perf-lib
-  PUBLIC
-    Seastar::seastar
-  PRIVATE
     xxHash::xxhash)
 
 add_perf_test(logalloc)
