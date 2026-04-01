@@ -220,8 +220,12 @@ private:
             table.schema(), table.get_storage_options(), min_info._generation, sstables::sstable_state::normal, min_info._version, min_info._format);
         sst->set_sstable_level(0);
         auto units = co_await sst_manager.dir_semaphore().get_units(1);
+        // Object storage SSTables always have a regular TOC; the
+        // sealed/unsealed state is tracked via the registry, not via
+        // a TemporaryTOC file.
+        const bool is_object_storage = table.get_storage_options().is_object_storage_type();
         sstables::sstable_open_config cfg {
-            .unsealed_sstable = true,
+            .unsealed_sstable = !is_object_storage,
             .ignore_component_digest_mismatch = db.get_config().ignore_component_digest_mismatch(),
         };
         co_await sst->load(table.get_effective_replication_map()->get_sharder(*table.schema()), cfg);

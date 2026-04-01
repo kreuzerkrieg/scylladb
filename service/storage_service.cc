@@ -4872,8 +4872,14 @@ future<> storage_service::clone_locally_tablet_storage(locator::global_tablet_id
         // will still point to leaving replica at this stage in migration. If node goes down,
         // SSTables will be loaded at pending replica and migration is retried, so correctness
         // wise, we're good.
+        //
+        // For object storage, cloned SSTables always have a regular TOC — the
+        // sealed/unsealed distinction is tracked via the SSTable registry, not
+        // via a TemporaryTOC file.  Trying to read TemporaryTOC from S3 would
+        // result in a 404.
+        const bool is_object_storage = t.get_storage_options().is_object_storage_type();
         auto cfg = sstables::sstable_open_config{ .current_shard_as_sstable_owner = true,
-                                                  .unsealed_sstable = leave_unsealed,
+                                                  .unsealed_sstable = leave_unsealed && !is_object_storage,
                                                   .ignore_component_digest_mismatch = ignore_digest_mismatch };
         co_await sst->load(sharder, cfg);
         co_return sst;
