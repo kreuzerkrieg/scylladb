@@ -9,7 +9,7 @@ from test.pylib.manager_client import ManagerClient
 from test.pylib.rest_client import inject_error_one_shot, read_barrier
 from test.pylib.tablets import get_tablet_replica, get_all_tablet_replicas, get_tablet_count
 from test.pylib.util import wait_for
-from test.cluster.util import new_test_keyspace, create_new_test_keyspace
+from test.cluster.util import new_test_keyspace, create_new_test_keyspace, make_cfg, make_ks_opts
 
 import pytest
 import asyncio
@@ -35,7 +35,7 @@ async def disable_injection_on(manager, error_name, servers):
 
 @pytest.mark.asyncio
 @pytest.mark.skip_mode(mode='release', reason='error injections are not supported in release mode')
-async def test_tablet_merge_simple(manager: ManagerClient):
+async def test_tablet_merge_simple(manager: ManagerClient, tablet_storage):
     logger.info("Bootstrapping cluster")
     cmdline = [
         '--logger-log-level', 'storage_service=debug',
@@ -43,14 +43,15 @@ async def test_tablet_merge_simple(manager: ManagerClient):
         '--logger-log-level', 'load_balancer=debug',
         '--target-tablet-size-in-bytes', '30000',
     ]
-    servers = [await manager.server_add(config={
+    cfg = make_cfg(tablet_storage, extra={
         'tablet_load_stats_refresh_interval_in_seconds': 1
-    }, cmdline=cmdline)]
+    })
+    servers = [await manager.server_add(config=cfg, cmdline=cmdline)]
 
     await manager.disable_tablet_balancing()
 
     cql = manager.get_cql()
-    async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 1} AND tablets = {'initial': 1}") as ks:
+    async with new_test_keyspace(manager, make_ks_opts(tablet_storage, rf=1, initial_tablets=1)) as ks:
         await cql.run_async(f"CREATE TABLE {ks}.test (pk int PRIMARY KEY, c blob) WITH gc_grace_seconds=0 AND bloom_filter_fp_chance=1;")
 
         # Initial average table size of 400k (1 tablet), so triggers some splits.
@@ -77,7 +78,7 @@ async def test_tablet_merge_simple(manager: ManagerClient):
         assert tablet_count == 1
 
         logger.info("Adding new server")
-        servers.append(await manager.server_add(cmdline=cmdline))
+        servers.append(await manager.server_add(config=cfg, cmdline=cmdline))
         s1_host_id = await manager.get_host_id(servers[1].server_id)
 
         # Increases the chance of tablet migration concurrent with split
@@ -179,7 +180,7 @@ async def test_tablet_merge_simple(manager: ManagerClient):
 # Multiple cycles of split and merge, with topology changes in parallel and RF > 1.
 @pytest.mark.asyncio
 @pytest.mark.skip_mode(mode='release', reason='error injections are not supported in release mode')
-async def test_tablet_split_and_merge_with_concurrent_topology_changes(manager: ManagerClient):
+async def test_tablet_split_and_merge_with_concurrent_topology_changes(manager: ManagerClient, tablet_storage):
     logger.info("Bootstrapping cluster")
     cmdline = [
         '--logger-log-level', 'storage_service=info',
@@ -189,15 +190,15 @@ async def test_tablet_split_and_merge_with_concurrent_topology_changes(manager: 
         '--logger-log-level', 'load_balancer=info',
         '--target-tablet-size-in-bytes', '30000',
     ]
-    config = {
+    config = make_cfg(tablet_storage, extra={
         'tablet_load_stats_refresh_interval_in_seconds': 1
-    }
+    })
     servers = [await manager.server_add(config=config, cmdline=cmdline),
                await manager.server_add(config=config, cmdline=cmdline),
                await manager.server_add(config=config, cmdline=cmdline)]
 
     cql = manager.get_cql()
-    async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 1} AND tablets = {'initial': 1}") as ks:
+    async with new_test_keyspace(manager, make_ks_opts(tablet_storage, rf=1, initial_tablets=1)) as ks:
         await cql.run_async(f"CREATE TABLE {ks}.test (pk int PRIMARY KEY, c blob) WITH gc_grace_seconds=0 AND bloom_filter_fp_chance=1;")
 
         async def perform_topology_ops():
@@ -207,7 +208,7 @@ async def test_tablet_split_and_merge_with_concurrent_topology_changes(manager: 
             await manager.decommission_node(server_id_to_decommission)
             servers.pop()
             logger.info("Adding new server")
-            servers.append(await manager.server_add(cmdline=cmdline))
+            servers.append(await manager.server_add(config=config, cmdline=cmdline))
             logger.info("Completed topology ops")
 
         for cycle in range(2):
@@ -325,9 +326,9 @@ async def test_tablet_split_and_merge_with_concurrent_topology_changes(manager: 
 @pytest.mark.parametrize("racks", [2, 3])
 @pytest.mark.asyncio
 @pytest.mark.skip_mode(mode='release', reason='error injections are not supported in release mode')
-async def test_tablet_merge_cross_rack_migrations(manager: ManagerClient, racks):
+async def test_tablet_merge_cross_rack_migrations(manager: ManagerClient, racks, tablet_storage):
     cmdline = ['--target-tablet-size-in-bytes', '30000',]
-    config = {'tablet_load_stats_refresh_interval_in_seconds': 1}
+    config = make_cfg(tablet_storage, extra={'tablet_load_stats_refresh_interval_in_seconds': 1})
     servers = []
     rf = racks
     for rack_id in range(0, racks):
@@ -335,7 +336,7 @@ async def test_tablet_merge_cross_rack_migrations(manager: ManagerClient, racks)
         servers.extend(await manager.servers_add(3, config=config, cmdline=cmdline, property_file={'dc': 'mydc', 'rack': rack}))
 
     cql = manager.get_cql()
-    ks = await create_new_test_keyspace(cql, f"WITH replication = {{'class': 'NetworkTopologyStrategy', 'replication_factor': {rf}}} AND tablets = {{'initial': 1}}")
+    ks = await create_new_test_keyspace(cql, make_ks_opts(tablet_storage, rf=rf, initial_tablets=1))
     await cql.run_async(f"CREATE TABLE {ks}.test (pk int PRIMARY KEY, c blob) WITH compression = {{'sstable_compression': ''}};")
 
     await inject_error_on(manager, "forbid_cross_rack_migration_attempt", servers)
