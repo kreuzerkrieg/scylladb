@@ -376,13 +376,13 @@ future<> stream_blob_handler(replica::database& db,
             auto desc = sstables::parse_path(std::filesystem::path(meta.filename.c_str()), table.schema()->ks_name(), table.schema()->cf_name());
             co_await load_sstable_for_tablet(meta.ops_id, db, *vbw, meta.table, sstable_state(meta), std::move(desc), meta.dst_shard_id);
         } else {
-        co_await fstream->flush();
-        co_await fstream->close();
-        fstream_closed = true;
+            co_await fstream->flush();
+            co_await fstream->close();
+            fstream_closed = true;
 
-        may_inject_error(meta, inject_errors, "flush_and_close");
+            may_inject_error(meta, inject_errors, "flush_and_close");
 
-        co_await finish(store_result::ok);
+            co_await finish(store_result::ok);
         }
 
         // Send status code and close the sink
@@ -629,24 +629,24 @@ tablet_stream_files(netw::messaging_service& ms, std::list<stream_blob_info> sou
             auto send_data_to_peer = [&] () mutable -> future<> {
                 try {
                     if (!clone_descriptor_mode) {
-                    while (!got_error_from_peer) {
-                        may_inject_error(meta, inject_errors, "read_data");
-                        auto buf = co_await fstream->read_up_to(file_stream_buffer_size);
-                        if (buf.size() == 0) {
-                            break;
+                        while (!got_error_from_peer) {
+                            may_inject_error(meta, inject_errors, "read_data");
+                            auto buf = co_await fstream->read_up_to(file_stream_buffer_size);
+                            if (buf.size() == 0) {
+                                break;
+                            }
+                            streaming::stream_blob_data data(std::move(buf));
+                            auto data_size = data.size();
+                            stream_blob_cmd_data cmd_data(streaming::stream_blob_cmd::data, std::move(data));
+                            co_await coroutine::parallel_for_each(ss, [&] (sink_and_source& s) mutable -> future<> {
+                                total_size += data_size;
+                                ops_total_size += data_size;
+                                blogger.trace("fstream[{}] Master sending file={} to node={} chunk_size={}",
+                                    ops_id, filename, s.node, data_size);
+                                may_inject_error(meta, inject_errors, "tx_data");
+                                co_await s.sink(cmd_data);
+                            });
                         }
-                        streaming::stream_blob_data data(std::move(buf));
-                        auto data_size = data.size();
-                        stream_blob_cmd_data cmd_data(streaming::stream_blob_cmd::data, std::move(data));
-                        co_await coroutine::parallel_for_each(ss, [&] (sink_and_source& s) mutable -> future<> {
-                            total_size += data_size;
-                            ops_total_size += data_size;
-                            blogger.trace("fstream[{}] Master sending file={} to node={} chunk_size={}",
-                                ops_id, filename, s.node, data_size);
-                            may_inject_error(meta, inject_errors, "tx_data");
-                            co_await s.sink(cmd_data);
-                        });
-                    }
                     }
                 } catch (...) {
                     sender_error = std::current_exception();
@@ -822,73 +822,74 @@ future<stream_files_response> tablet_stream_files_handler(replica::database& db,
             info.filename = sstables::sstable::component_basename(schema->ks_name(), schema->cf_name(), desc.version, desc.generation, desc.format, desc.component);
         }
     } else {
-    auto reader = co_await db.obtain_reader_permit(table, "tablet_file_streaming", db::no_timeout, {});
+        auto reader = co_await db.obtain_reader_permit(table, "tablet_file_streaming", db::no_timeout, {});
 
-    if (table.uses_logstor()) {
-        auto segments = co_await table.take_logstor_snapshot(req.range);
-        for (auto& seg : segments) {
-            auto& info = files.emplace_back();
-            info.filename = format("logstor_segment_{}", seg.segment_id); // used only for logging
-            info.fops = file_ops::stream_logstor_segments;
-            info.source = [seg = std::move(seg)](const file_input_stream_options& options) {
-                return seg.source(options);
-            };
-        }
-        blogger.debug("stream_logstor_segments[{}] Started sending segment_nr={} range={}",
-                req.ops_id, segments.size(), req.range);
-    } else {
-        auto sstables = co_await table.take_storage_snapshot(req.range);
-        co_await utils::get_local_injector().inject("order_sstables_for_streaming", [&sstables] (auto& handler) -> future<> {
-            if (sstables.size() == 3) {
-                // make sure the sstables are ordered so that the sstable containing shadowed data is streamed last
-                const std::string_view shadowed_file = handler.template get<std::string_view>("shadowed_file").value();
-                for (int index: {0, 1}) {
-                    if (sstables[index].sst->component_basename(component_type::Data) == shadowed_file) {
-                        std::swap(sstables[index], sstables[2]);
-                    }
-                }
-            }
-            return make_ready_future<>();
-        });
-
-        auto& sst_gen = table.get_sstable_generation_generator();
-
-        for (auto& sst_snapshot : sstables) {
-            auto& sst = sst_snapshot.sst;
-            // stable state (across files) is a must for load to work on destination
-            auto sst_state = sst->state();
-
-            auto sources = co_await create_stream_sources(sst_snapshot, reader);
-            auto newgen = fmt::to_string(sst_gen());
-
-            for (auto&& s : sources) {
-                auto oldname = s->component_basename();
-                auto newname = get_sstable_name_with_generation(req.ops_id, oldname, newgen);
-
-                blogger.debug("fstream[{}] Get name oldname={}, newname={}", req.ops_id, oldname, newname);
-
+        if (table.uses_logstor()) {
+            auto segments = co_await table.take_logstor_snapshot(req.range);
+            for (auto& seg : segments) {
                 auto& info = files.emplace_back();
-                info.fops = file_ops::stream_sstables;
-                info.sstable_state = sst_state;
-                info.filename = std::move(newname);
-                info.source = [s = std::move(s)](const file_input_stream_options& options) {
-                    return s->input(options);
+                info.filename = format("logstor_segment_{}", seg.segment_id); // used only for logging
+                info.fops = file_ops::stream_logstor_segments;
+                info.source = [seg = std::move(seg)](const file_input_stream_options& options) {
+                    return seg.source(options);
                 };
             }
-            // ensure we mark the end of each component sequence.
-            if (!files.empty()) {
-                files.back().fops = file_ops::load_sstables;
-            }
-        }
-        sstable_nr = sstables.size();
-        // Release reference to sstables to be streamed here. Since one sstable is streamed at a time,
-        // a sstable - that has been compacted - can have its space released from disk right after
-        // that sstable's content has been fully streamed.
-        sstables.clear();
+            blogger.debug("stream_logstor_segments[{}] Started sending segment_nr={} range={}",
+                    req.ops_id, segments.size(), req.range);
+        } else {
+            auto sstables = co_await table.take_storage_snapshot(req.range);
+            co_await utils::get_local_injector().inject("order_sstables_for_streaming", [&sstables] (auto& handler) -> future<> {
+                if (sstables.size() == 3) {
+                    // make sure the sstables are ordered so that the sstable containing shadowed data is streamed last
+                    const std::string_view shadowed_file = handler.template get<std::string_view>("shadowed_file").value();
+                    for (int index: {0, 1}) {
+                        if (sstables[index].sst->component_basename(component_type::Data) == shadowed_file) {
+                            std::swap(sstables[index], sstables[2]);
+                        }
+                    }
+                }
+                return make_ready_future<>();
+            });
 
-        blogger.debug("stream_sstables[{}] Started sending sstable_nr={} files_nr={} files={} range={}",
-                req.ops_id, sstable_nr, files.size(), files, req.range);
-    }
+            auto& sst_gen = table.get_sstable_generation_generator();
+
+            for (auto& sst_snapshot : sstables) {
+                auto& sst = sst_snapshot.sst;
+                // stable state (across files) is a must for load to work on destination
+                auto sst_state = sst->state();
+
+                auto sources = co_await create_stream_sources(sst_snapshot, reader);
+                auto newgen = fmt::to_string(sst_gen());
+
+                for (auto&& s : sources) {
+                    auto oldname = s->component_basename();
+                    auto newname = get_sstable_name_with_generation(req.ops_id, oldname, newgen);
+
+                    blogger.debug("fstream[{}] Get name oldname={}, newname={}", req.ops_id, oldname, newname);
+
+                    auto& info = files.emplace_back();
+                    info.fops = file_ops::stream_sstables;
+                    info.sstable_state = sst_state;
+                    info.filename = std::move(newname);
+                    info.source.emplace([s = std::move(s)](const file_input_stream_options& options) {
+                        return s->input(options);
+                    });
+                }
+                // ensure we mark the end of each component sequence.
+                if (!files.empty()) {
+                    files.back().fops = file_ops::load_sstables;
+                }
+            }
+            sstable_nr = sstables.size();
+
+            // Release reference to sstables to be streamed here. Since one sstable is streamed at a time,
+            // a sstable - that has been compacted - can have its space released from disk right after
+            // that sstable's content has been fully streamed.
+            sstables.clear();
+
+            blogger.debug("stream_sstables[{}] Started sending sstable_nr={} files_nr={} files={} range={}",
+                    req.ops_id, sstable_nr, files.size(), files, req.range);
+        }
     }
     if (files.empty()) {
         co_return resp;
