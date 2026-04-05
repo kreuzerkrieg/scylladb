@@ -41,10 +41,24 @@ using file_stream_id = utils::tagged_uuid<struct file_stream_id_tag>;
 //
 // - The file_ops::load_sstables is used to stream a sstable file and
 // ask the receiver to load the sstable into the system.
+//
+// - The file_ops::clone_sstables is used for object-storage tables to
+// send a zero-byte descriptor (no data payload) whose filename the
+// receiver uses to load a server-side-copied SSTable.
+//
+// Version safety for clone_sstables: this enum value is not version-gated
+// in the STREAM_BLOB verb itself.  Instead, clone_sstables descriptors are
+// only produced by the clone path in tablet_stream_files_handler(), which
+// is reached through the TABLET_STREAM_FILES verb whose
+// clone_based_object_storage_streaming field is IDL-version-gated to 6.1.0
+// (see idl/streaming.idl.hh).  An older peer that does not understand
+// clone_sstables will never receive it, because the older peer's
+// TABLET_STREAM_FILES request will deserialise the field as false.
 enum class file_ops : uint16_t {
     stream_sstables,
     load_sstables,
     stream_logstor_segments,
+    clone_sstables,
 };
 
 // For STREAM_BLOB verb
@@ -115,7 +129,8 @@ struct stream_blob_info {
     sstring filename;
     streaming::file_ops fops;
     std::optional<sstables::sstable_state> sstable_state;
-    stream_blob_source_fn source;
+    // clone_sstables does not transfer file bytes, so source is not needed.
+    std::optional<stream_blob_source_fn> source;
 
     friend inline std::ostream& operator<<(std::ostream& os, const stream_blob_info& x) {
         return os << x.filename;
@@ -134,7 +149,8 @@ future<> stream_blob_handler(replica::database& db,
         rpc::sink<streaming::stream_blob_cmd_data> sink,
         rpc::source<streaming::stream_blob_cmd_data> source,
         stream_blob_create_output_fn,
-        bool may_inject_errors = false
+        bool may_inject_errors = false,
+        db::view::view_building_worker* vbw = nullptr
         );
 
 // For TABLET_STREAM_FILES
@@ -163,6 +179,7 @@ public:
     dht::token_range range;
     std::vector<streaming::node_and_shard> targets;
     service::frozen_topology_guard topo_guard;
+    bool clone_based_object_storage_streaming = false;
 };
 
 class stream_files_response {

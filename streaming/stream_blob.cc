@@ -53,8 +53,32 @@ static future<> load_sstable_for_tablet(const file_stream_id& ops_id, replica::d
         auto erm = t.get_effective_replication_map();
         auto& sstm = t.get_sstables_manager();
         auto sst = sstm.make_sstable(t.schema(), t.get_storage_options(), desc.generation, state, desc.version, desc.format);
-        sstables::sstable_open_config cfg { .unsealed_sstable = true,
-                                               .ignore_component_digest_mismatch = db.get_config().ignore_component_digest_mismatch() };
+        // For object-storage tables, cloning always produces a regular TOC object
+        // (not TemporaryTOC); the sealed/unsealed distinction is maintained in the
+        // SSTable registry as "creating" vs "sealed", not via the filesystem
+        // TemporaryTOC convention.  Ensure a "creating" registry entry exists on
+        // this (target) node before seal_sstable() can promote it to "sealed".
+        //
+        // In multi-node production the source's clone() writes to its own local
+        // registry, so no entry exists on the target yet and the INSERT below is
+        // always fresh.  In single-node tests, source and target share the same
+        // process, so the source's clone() already inserted the entry; the
+        // unconditional upsert merely re-writes "creating" with the same value.
+        //
+        // An unconditional INSERT is safe even under concurrent retries:
+        // two "creating" upserts are harmless, and if a previous attempt has
+        // already sealed the entry, seal_sstable() below will overwrite the
+        // status to "sealed" again regardless.
+        const bool is_object_storage = t.get_storage_options().is_object_storage_type();
+        if (is_object_storage) {
+            sstables::entry_descriptor reg_desc(desc.generation, desc.version, desc.format, sstables::component_type::TOC);
+            co_await sstm.sstables_registry().create_entry(t.schema()->id(), "creating", state, std::move(reg_desc));
+        }
+        sstables::sstable_open_config cfg {
+                // Filesystem clones leave a TemporaryTOC; object-storage clones leave
+                // a regular TOC and track sealed/unsealed state via the registry.
+                .unsealed_sstable = !is_object_storage,
+                .ignore_component_digest_mismatch = db.get_config().ignore_component_digest_mismatch() };
         co_await sst->load(erm->get_sharder(*t.schema()), cfg);
         auto on_add = [sst, &sstm] (sstables::shared_sstable loading_sst) -> future<> {
             if (loading_sst == sst) {
@@ -228,7 +252,8 @@ future<> stream_blob_handler(replica::database& db,
         rpc::sink<streaming::stream_blob_cmd_data> sink,
         rpc::source<streaming::stream_blob_cmd_data> source,
         stream_blob_create_output_fn create_output,
-        bool inject_errors) {
+        bool inject_errors,
+        db::view::view_building_worker* vbw) {
     bool fstream_closed = false;
     bool sink_closed = false;
     bool status_sent = false;
@@ -253,7 +278,8 @@ future<> stream_blob_handler(replica::database& db,
         // Reject any file_ops that is not support by this node
         if (meta.fops != streaming::file_ops::stream_sstables &&
             meta.fops != streaming::file_ops::load_sstables &&
-            meta.fops != streaming::file_ops::stream_logstor_segments) {
+            meta.fops != streaming::file_ops::stream_logstor_segments &&
+            meta.fops != streaming::file_ops::clone_sstables) {
             auto msg = format("fstream[{}] Unsupported file_ops={} peer={} file={}",
                     meta.ops_id, int(meta.fops), from, meta.filename);
             blogger.warn("{}", msg);
@@ -263,9 +289,12 @@ future<> stream_blob_handler(replica::database& db,
         blogger.debug("fstream[{}] Follower started peer={} file={}",
                 meta.ops_id, from, meta.filename);
 
-        auto [f, out] = co_await create_output(db, meta);
-        finish = std::move(f);
-        fstream = std::move(out);
+        const bool clone_descriptor_mode = meta.fops == streaming::file_ops::clone_sstables;
+        if (!clone_descriptor_mode) {
+            auto [f, out] = co_await create_output(db, meta);
+            finish = std::move(f);
+            fstream = std::move(out);
+        }
 
         bool got_end_of_stream = false;
         for (;;) {
@@ -304,7 +333,11 @@ future<> stream_blob_handler(replica::database& db,
                     total_size += data->size();
                     blogger.trace("fstream[{}] Follower received data from peer={} data={}", meta.ops_id, from, data->size());
                     status->check_valid_stream();
-                    if (!data->empty()) {
+                    if (clone_descriptor_mode && !data->empty()) {
+                        throw std::runtime_error(format("fstream[{}] Unexpected data for clone stream from peer={} file={}",
+                                meta.ops_id, from, meta.filename));
+                    }
+                    if (!clone_descriptor_mode && !data->empty()) {
                         co_await fstream->write((char*)data->data(), data->size());
                     }
                 }
@@ -331,6 +364,18 @@ future<> stream_blob_handler(replica::database& db,
         }
 
         status->check_valid_stream();
+        if (clone_descriptor_mode) {
+            if (!vbw) {
+                throw std::runtime_error(format("fstream[{}] clone_sstables requires view building worker", meta.ops_id));
+            }
+            auto& table = db.find_column_family(meta.table);
+            // meta.filename is a bare basename produced by component_basename()
+            // (e.g. "me-<gen>-big-TOC.db").  parse_path extracts the entry_descriptor
+            // from the filename component alone when ks/cf are supplied; the directory
+            // path is only consulted when ks/cf are not provided.
+            auto desc = sstables::parse_path(std::filesystem::path(meta.filename.c_str()), table.schema()->ks_name(), table.schema()->cf_name());
+            co_await load_sstable_for_tablet(meta.ops_id, db, *vbw, meta.table, sstable_state(meta), std::move(desc), meta.dst_shard_id);
+        } else {
         co_await fstream->flush();
         co_await fstream->close();
         fstream_closed = true;
@@ -338,6 +383,7 @@ future<> stream_blob_handler(replica::database& db,
         may_inject_error(meta, inject_errors, "flush_and_close");
 
         co_await finish(store_result::ok);
+        }
 
         // Send status code and close the sink
         co_await sink(streaming::stream_blob_cmd_data(streaming::stream_blob_cmd::ok));
@@ -479,7 +525,7 @@ future<> stream_blob_handler(replica::database& db, db::view::view_building_work
         } else {
             throw std::runtime_error(format("Unexpected file_ops={} in stream_blob_handler", int(meta.fops)));
         }
-    });
+    }, false, &vbw);
 }
 
 // Get a new sstable name using the new generation
@@ -549,11 +595,17 @@ tablet_stream_files(netw::messaging_service& ms, std::list<stream_blob_info> sou
         auto& filename = info.filename;
         std::optional<input_stream<char>> fstream;
         bool fstream_closed = false;
+        const bool clone_descriptor_mode = info.fops == file_ops::clone_sstables;
         try {
             meta.fops = info.fops;
             meta.filename = info.filename;
             meta.sstable_state = info.sstable_state;
-            fstream = co_await info.source(stream_options);
+            if (!clone_descriptor_mode) {
+                if (!info.source) {
+                    throw std::runtime_error(format("fstream[{}] Missing source for streamed file={}", ops_id, filename));
+                }
+                fstream = co_await (*info.source)(stream_options);
+            }
         } catch (...) {
             blogger.warn("fstream[{}] Master failed sources={} targets={} error={}",
                 ops_id, sources, targets, std::current_exception());
@@ -576,6 +628,7 @@ tablet_stream_files(netw::messaging_service& ms, std::list<stream_blob_info> sou
             // This fiber sends data to peer node
             auto send_data_to_peer = [&] () mutable -> future<> {
                 try {
+                    if (!clone_descriptor_mode) {
                     while (!got_error_from_peer) {
                         may_inject_error(meta, inject_errors, "read_data");
                         auto buf = co_await fstream->read_up_to(file_stream_buffer_size);
@@ -593,6 +646,7 @@ tablet_stream_files(netw::messaging_service& ms, std::list<stream_blob_info> sou
                             may_inject_error(meta, inject_errors, "tx_data");
                             co_await s.sink(cmd_data);
                         });
+                    }
                     }
                 } catch (...) {
                     sender_error = std::current_exception();
@@ -743,6 +797,31 @@ future<stream_files_response> tablet_stream_files_handler(replica::database& db,
     stream_files_response resp;
     auto& table = db.find_column_family(req.table);
     auto files = std::list<stream_blob_info>();
+    size_t sstable_nr = 0;
+    // Kept for post-stream source-registry cleanup in the clone path.
+    utils::chunked_vector<sstables::entry_descriptor> cloned_descs;
+
+    if (req.clone_based_object_storage_streaming && table.get_storage_options().is_object_storage_type() && req.range.end()) {
+        auto& tmap = table.get_effective_replication_map()->get_token_metadata().tablets().get_tablet_map(req.table);
+        auto tid = tmap.get_tablet_id(req.range.end()->value());
+        cloned_descs = co_await table.clone_tablet_storage(tid, true);
+        sstable_nr = cloned_descs.size();
+
+        // Unlike the regular streaming path which sends one STREAM_BLOB RPC per
+        // component file (Data, Index, Filter, …) with the last one marked
+        // load_sstables to trigger loading, the clone path sends one
+        // clone_sstables message per SSTable (always with TOC component).  The
+        // receiver's load_sstable_for_tablet() loads the full SSTable from
+        // object storage by its TOC — no individual component transfer is needed
+        // since the server-side copy already placed all components.
+        auto schema = table.schema();
+        for (const auto& desc : cloned_descs) {
+            auto& info = files.emplace_back();
+            info.fops = file_ops::clone_sstables;
+            info.sstable_state = desc.state;
+            info.filename = sstables::sstable::component_basename(schema->ks_name(), schema->cf_name(), desc.version, desc.generation, desc.format, desc.component);
+        }
+    } else {
     auto reader = co_await db.obtain_reader_permit(table, "tablet_file_streaming", db::no_timeout, {});
 
     if (table.uses_logstor()) {
@@ -801,7 +880,7 @@ future<stream_files_response> tablet_stream_files_handler(replica::database& db,
                 files.back().fops = file_ops::load_sstables;
             }
         }
-        auto sstable_nr = sstables.size();
+        sstable_nr = sstables.size();
         // Release reference to sstables to be streamed here. Since one sstable is streamed at a time,
         // a sstable - that has been compacted - can have its space released from disk right after
         // that sstable's content has been fully streamed.
@@ -810,18 +889,56 @@ future<stream_files_response> tablet_stream_files_handler(replica::database& db,
         blogger.debug("stream_sstables[{}] Started sending sstable_nr={} files_nr={} files={} range={}",
                 req.ops_id, sstable_nr, files.size(), files, req.range);
     }
+    }
     if (files.empty()) {
         co_return resp;
     }
     co_await utils::get_local_injector().inject("wait_before_tablet_stream_files_after_snapshot", utils::wait_for_message(std::chrono::seconds(60)));
     auto ops_start_time = std::chrono::steady_clock::now();
     auto files_nr = files.size();
-    size_t stream_bytes = co_await tablet_stream_files(ms, std::move(files), req.targets, req.table, req.ops_id, req.topo_guard);
+
+    std::exception_ptr streaming_error;
+    size_t stream_bytes = 0;
+    try {
+        stream_bytes = co_await tablet_stream_files(ms, std::move(files), req.targets, req.table, req.ops_id, req.topo_guard);
+    } catch (...) {
+        streaming_error = std::current_exception();
+    }
+
+    // Unregister the source-side "creating" entries produced by clone_tablet_storage().
+    // The underlying S3/GCS objects were server-side copied; on success they are
+    // owned by the target node, on failure they become orphaned — either way the
+    // source-side registry rows must be removed to avoid accumulating stale
+    // "creating" entries.  The orphaned objects are harmless and will be
+    // re-cloned on a subsequent migration attempt.
+    if (!cloned_descs.empty()) {
+        auto& sstm = table.get_sstables_manager();
+        auto table_owner = table.schema()->id();
+        for (const auto& desc : cloned_descs) {
+            try {
+                co_await sstm.sstables_registry().delete_entry(table_owner, desc.generation);
+            } catch (...) {
+                blogger.warn("stream_sstables[{}] Failed to unregister cloned generation {} from source registry: {}",
+                        req.ops_id, desc.generation, std::current_exception());
+            }
+        }
+    }
+
+    if (streaming_error) {
+        std::rethrow_exception(streaming_error);
+    }
+
     resp.stream_bytes = stream_bytes;
     auto duration = std::chrono::steady_clock::now() - ops_start_time;
-    blogger.info("stream_{}[{}] Finished sending files_nr={} range={} stream_bytes={} stream_time={} stream_bw={}",
-            table.uses_logstor() ? "logstor_segments" : "sstables",
-            req.ops_id, files_nr, req.range, stream_bytes, duration, get_bw(stream_bytes, ops_start_time));
+    if (!cloned_descs.empty()) {
+        blogger.info("stream_sstables[{}] Finished clone-based streaming sstable_nr={} files_nr={} range={} stream_time={} (server-side copy, no bytes transferred)",
+                req.ops_id, sstable_nr, files_nr, req.range, duration);
+    } else {
+        blogger.info("stream_{}[{}] Finished sending files_nr={} range={} stream_bytes={} stream_time={} stream_bw={}",
+                table.uses_logstor() ? "logstor_segments" : "sstables",
+                req.ops_id, files_nr, req.range, stream_bytes, duration, get_bw(stream_bytes, ops_start_time));
+    }
+
     co_return resp;
 }
 
@@ -851,6 +968,7 @@ future<stream_files_response> tablet_stream_files(const file_stream_id& ops_id,
             req.range = range;
             req.targets = std::vector<node_and_shard>{node_and_shard{dst_host, dst_shard_id}};
             req.topo_guard = topo_guard;
+            req.clone_based_object_storage_streaming = table.get_storage_options().is_object_storage_type();
             resp = co_await ser::streaming_rpc_verbs::send_tablet_stream_files(&ms, src_host, as, req);
         } catch (...) {
             error = std::current_exception();

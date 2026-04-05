@@ -84,6 +84,7 @@ enum class stream_blob_cmd : uint8_t {
 enum class file_ops : uint16_t {
     stream_sstables,
     load_sstables,
+    clone_sstables,
 };
 
 class stream_blob_data {
@@ -118,6 +119,7 @@ class stream_files_request {
     dht::token_range range;
     std::vector<streaming::node_and_shard> targets;
     service::frozen_topology_guard topo_guard;
+    bool clone_based_object_storage_streaming [[version 6.1.0]];
 };
 
 class stream_files_response {
