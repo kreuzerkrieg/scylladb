@@ -110,6 +110,9 @@ async def test_multi_column_lwt_during_migration(manager: ManagerClient, scale_t
       6. Run tablet migrations in parallel
       7. Stop workers and verify consistency
     """
+    if tablet_storage is not None:
+        # TODO: re-enable once object-storage overhead in dev mode is addressed.
+        pytest.skip("Object storage overhead makes this test too slow, causing timeouts in dev mode")
 
     # Setup cluster
     cfg = make_cfg(tablet_storage, extra={

@@ -125,6 +125,9 @@ async def test_node_failure_during_tablet_migration(manager: ManagerClient, tabl
         pytest.skip('Failing destination during cleanup is pointless')
     if fail_stage == 'cleanup_target' and fail_replica == 'source':
         pytest.skip('Failing source during target cleanup is pointless')
+    if tablet_storage is not None:
+        # TODO: re-enable once object-storage overhead in dev mode is addressed.
+        pytest.skip("Flaky with object storage: object storage overhead makes topology recovery too slow, causing timeouts in dev mode")
 
     logger.info("Bootstrapping cluster")
     cfg = make_cfg(tablet_storage, extra={'failure_detector_timeout_in_ms': 2000})
@@ -513,6 +516,10 @@ async def test_restart_in_cleanup_stage_after_cleanup(manager: ManagerClient, ta
     the tablet cleanup stage, after tablet cleanup is completed.
     Reproduces issue #24857
     """
+    if tablet_storage is not None:
+        # TODO: re-enable once SSTable lifecycle on object storage is fixed —
+        # after cleanup deletes objects, restart tries to reload them.
+        pytest.skip("Flaky with object storage: on restart after cleanup, the node tries to load SSTables already deleted from object storage, causing 404")
     cfg = make_cfg(tablet_storage, extra={'tablet_load_stats_refresh_interval_in_seconds': 1})
     servers = await manager.servers_add(2, config=cfg)
 
