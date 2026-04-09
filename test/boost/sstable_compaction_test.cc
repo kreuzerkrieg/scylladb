@@ -12,6 +12,7 @@
 #include <seastar/core/future-util.hh>
 #include <seastar/core/align.hh>
 #include <seastar/core/aligned_buffer.hh>
+#include <seastar/core/loop.hh>
 #include <seastar/util/closeable.hh>
 #include <seastar/util/short_streams.hh>
 #include <seastar/core/coroutine.hh>
@@ -4939,7 +4940,7 @@ void test_twcs_partition_estimate_fn(test_env& env) {
 
     auto keys = tests::generate_partition_keys(4, s);
 
-    auto make_sstable = [&] (int sstable_idx) {
+    auto make_sstable = [&] (int sstable_idx) -> future<shared_sstable> {
         static thread_local int32_t value = 1;
 
         auto key = keys[sstable_idx];
@@ -4949,7 +4950,7 @@ void test_twcs_partition_estimate_fn(test_env& env) {
             auto c_key = clustering_key::from_exploded(*s, {int32_type->decompose(value++)});
             m.set_clustered_cell(c_key, bytes("value"), data_value(int32_t(value)), next_timestamp(sstable_idx, ck));
         }
-        return make_sstable_containing(sst_gen, {m});
+        co_return co_await make_sstable_containing_async(sst_gen, {m});
     };
 
     auto cf = env.make_table_for_tests(s);
@@ -4978,12 +4979,10 @@ void test_twcs_partition_estimate_fn(test_env& env) {
         estimation_test(s, compaction::time_window_compaction_strategy::max_data_segregation_window_count);
     }
 
-    std::vector<shared_sstable> sstables_spanning_many_windows = {
-        make_sstable(0),
-        make_sstable(1),
-        make_sstable(2),
-        make_sstable(3),
-    };
+    std::vector<shared_sstable> sstables_spanning_many_windows(4);
+    parallel_for_each(std::views::iota(0, 4), [&](int i) -> future<> {
+        sstables_spanning_many_windows[i] = co_await make_sstable(i);
+    }).get();
 
     auto ret = compact_sstables(env, compaction::compaction_descriptor(sstables_spanning_many_windows), cf, sst_gen, replacer_fn_no_op()).get();
     // The real test here is that we don't SCYLLA_ASSERT() in
@@ -5263,8 +5262,12 @@ void test_offstrategy_sstable_compaction_fn(test_env& env) {
 
         cf->start();
 
-        for (auto i = 0; i < cf->schema()->max_compaction_threshold(); i++) {
-            auto sst = make_sstable_containing(sst_gen, {mut});
+        auto threshold = cf->schema()->max_compaction_threshold();
+        std::vector<sstables::shared_sstable> ssts(threshold);
+        parallel_for_each(std::views::iota(0, threshold), [&](int i) -> future<> {
+            ssts[i] = co_await make_sstable_containing_async(sst_gen, {mut});
+        }).get();
+        for (auto& sst : ssts) {
             cf->add_sstable_and_update_cache(std::move(sst), sstables::offstrategy::yes).get();
         }
         BOOST_REQUIRE(cf->perform_offstrategy_compaction(tasks::task_info{}).get());
@@ -5285,8 +5288,7 @@ SEASTAR_FIXTURE_TEST_CASE(test_offstrategy_sstable_compaction_gcs, gcs_fixture, 
                                    test_env_config{.storage = make_test_object_storage_options("GS")});
 }
 
-void twcs_reshape_with_disjoint_set_fn(test_env& env) {
-    static constexpr unsigned disjoint_sstable_count = 256;
+void twcs_reshape_with_disjoint_set_fn(test_env& env, unsigned disjoint_sstable_count = 256) {
     auto builder = schema_builder("tests", "twcs_reshape_test")
             .with_column("id", utf8_type, column_kind::partition_key)
             .with_column("cl", ::timestamp_type, column_kind::clustering_key)
@@ -5343,27 +5345,23 @@ void twcs_reshape_with_disjoint_set_fn(test_env& env) {
     auto sst_gen = env.make_sst_factory(s);
 
     {
-        // create set of 256 disjoint ssts that belong to the same time window and expect that twcs reshape allows them all to be compacted at once
+        // create set of disjoint ssts that belong to the same time window and expect that twcs reshape allows them all to be compacted at once
 
-        std::vector<sstables::shared_sstable> sstables;
-        sstables.reserve(disjoint_sstable_count);
-        for (unsigned i = 0; i < disjoint_sstable_count; i++) {
-            auto sst = make_sstable_containing(sst_gen, {make_row(i, std::chrono::hours(1))});
-            sstables.push_back(std::move(sst));
-        }
+        std::vector<sstables::shared_sstable> sstables(disjoint_sstable_count);
+        parallel_for_each(std::views::iota(0u, disjoint_sstable_count), [&](unsigned i) -> future<> {
+            sstables[i] = co_await make_sstable_containing_async(sst_gen, {make_row(i, std::chrono::hours(1))});
+        }).get();
 
         BOOST_REQUIRE_EQUAL(get_reshaping_job(cs, sstables, s, compaction::reshape_mode::strict).sstables.size(), disjoint_sstable_count);
     }
 
     {
-        // create set of 256 disjoint ssts that belong to different windows and expect that twcs reshape allows them all to be compacted at once
+        // create set of disjoint ssts that belong to different windows and expect that twcs reshape allows them all to be compacted at once
 
-        std::vector<sstables::shared_sstable> sstables;
-        sstables.reserve(disjoint_sstable_count);
-        for (unsigned i = 0; i < disjoint_sstable_count; i++) {
-            auto sst = make_sstable_containing(sst_gen, {make_row(i, std::chrono::hours(i))});
-            sstables.push_back(std::move(sst));
-        }
+        std::vector<sstables::shared_sstable> sstables(disjoint_sstable_count);
+        parallel_for_each(std::views::iota(0u, disjoint_sstable_count), [&](unsigned i) -> future<> {
+            sstables[i] = co_await make_sstable_containing_async(sst_gen, {make_row(i, std::chrono::hours(i))});
+        }).get();
 
         auto reshaping_count = get_reshaping_job(cs, sstables, s, compaction::reshape_mode::strict).sstables.size();
         BOOST_REQUIRE_GE(reshaping_count, disjoint_sstable_count - min_threshold + 1);
@@ -5371,30 +5369,25 @@ void twcs_reshape_with_disjoint_set_fn(test_env& env) {
     }
 
     {
-        // create set of 256 disjoint ssts that belong to different windows with none over the threshold and expect that twcs reshape selects none of them
+        // create set of disjoint ssts that belong to different windows with none over the threshold and expect that twcs reshape selects none of them
 
-        std::vector<sstables::shared_sstable> sstables;
-        sstables.reserve(disjoint_sstable_count);
-        for (unsigned i = 0; i < disjoint_sstable_count; i++) {
-            auto sst = make_sstable_containing(sst_gen, {make_row(i, std::chrono::hours(24*i))});
-            sstables.push_back(std::move(sst));
-            i++;
-            sst = make_sstable_containing(sst_gen, {make_row(i, std::chrono::hours(24*i + 1))});
-            sstables.push_back(std::move(sst));
-        }
+        std::vector<sstables::shared_sstable> sstables(disjoint_sstable_count);
+        parallel_for_each(std::views::iota(0u, disjoint_sstable_count / 2), [&](unsigned pair_idx) -> future<> {
+            unsigned i = pair_idx * 2;
+            sstables[i] = co_await make_sstable_containing_async(sst_gen, {make_row(i, std::chrono::hours(24*i))});
+            sstables[i+1] = co_await make_sstable_containing_async(sst_gen, {make_row(i+1, std::chrono::hours(24*(i+1) + 1))});
+        }).get();
 
         BOOST_REQUIRE_EQUAL(get_reshaping_job(cs, sstables, s, compaction::reshape_mode::strict).sstables.size(), 0);
     }
 
     {
-        // create set of 256 overlapping ssts that belong to the same time window and expect that twcs reshape allows only 32 to be compacted at once
+        // create set of overlapping ssts that belong to the same time window and expect that twcs reshape allows only 32 to be compacted at once
 
-        std::vector<sstables::shared_sstable> sstables;
-        sstables.reserve(disjoint_sstable_count);
-        for (unsigned i = 0; i < disjoint_sstable_count; i++) {
-            auto sst = make_sstable_containing(sst_gen, {make_row(0, std::chrono::hours(1))});
-            sstables.push_back(std::move(sst));
-        }
+        std::vector<sstables::shared_sstable> sstables(disjoint_sstable_count);
+        parallel_for_each(std::views::iota(0u, disjoint_sstable_count), [&](unsigned i) -> future<> {
+            sstables[i] = co_await make_sstable_containing_async(sst_gen, {make_row(0, std::chrono::hours(1))});
+        }).get();
 
         BOOST_REQUIRE_EQUAL(get_reshaping_job(cs, sstables, s, compaction::reshape_mode::strict).sstables.size(), uint64_t(s->max_compaction_threshold()));
     }
@@ -5413,21 +5406,21 @@ void twcs_reshape_with_disjoint_set_fn(test_env& env) {
 
         std::unordered_set<sstables::generation_type> generations_for_small_files;
 
-        std::vector<sstables::shared_sstable> sstables;
-        sstables.reserve(64);
+        std::vector<sstables::shared_sstable> sstables(64);
+
+        // Track which indices are small files
+        parallel_for_each(std::views::iota(0u, 64u), [&](unsigned i) -> future<> {
+            if (i % 2 == 0) {
+                sstables[i] = co_await make_sstable_containing_async(sst_gen, mutations_for_small_files);
+            } else {
+                sstables[i] = co_await make_sstable_containing_async(sst_gen, mutations_for_big_files);
+            }
+        }).get();
 
         for (unsigned i = 0; i < 64; i++) {
-            sstables::shared_sstable sst;
-            //
-            // intermix big and small files, to make sure STCS logic is really applied to favor similar-sized reshape jobs.
-            //
             if (i % 2 == 0) {
-                sst = make_sstable_containing(sst_gen, mutations_for_small_files);
-                generations_for_small_files.insert(sst->generation());
-            } else {
-                sst = make_sstable_containing(sst_gen, mutations_for_big_files);
+                generations_for_small_files.insert(sstables[i]->generation());
             }
-            sstables.push_back(std::move(sst));
         }
 
         auto check_mode_correctness = [&] (compaction::reshape_mode mode) {
@@ -5445,19 +5438,17 @@ void twcs_reshape_with_disjoint_set_fn(test_env& env) {
     }
 
     {
-        // create set of 256 disjoint ssts that spans multiple windows (essentially what happens in off-strategy during node op)
+        // create set of disjoint ssts that spans multiple windows (essentially what happens in off-strategy during node op)
 
-        std::vector<sstables::shared_sstable> sstables;
-        sstables.reserve(disjoint_sstable_count);
-        for (auto i = 0U; i < disjoint_sstable_count; i++) {
+        std::vector<sstables::shared_sstable> sstables(disjoint_sstable_count);
+        parallel_for_each(std::views::iota(0u, disjoint_sstable_count), [&](unsigned i) -> future<> {
             utils::chunked_vector<mutation> muts;
             muts.reserve(5);
             for (auto j = 0; j < 5; j++) {
                 muts.push_back(make_row(i, std::chrono::hours(j * 8)));
             }
-            auto sst = make_sstable_containing(sst_gen, std::move(muts));
-            sstables.push_back(std::move(sst));
-        }
+            sstables[i] = co_await make_sstable_containing_async(sst_gen, std::move(muts));
+        }).get();
 
         auto job_size = [] (auto&& sst_range) {
             return std::ranges::fold_left(sst_range | std::views::transform(std::mem_fn(&sstable::bytes_on_disk)), uint64_t(0), std::plus{});
@@ -5489,23 +5480,16 @@ SEASTAR_TEST_CASE(twcs_reshape_with_disjoint_set_test) {
 }
 
 SEASTAR_TEST_CASE(twcs_reshape_with_disjoint_set_s3_test, *boost::unit_test::precondition(tests::has_scylla_test_env)) {
-    // TODO: Deeper investigation needed to figure out why it takes 4+ minutes to run on S3 storage, while it runs in seconds on local storage. For now,
-    // skipping the test for S3.
-    testlog.info("cleanup_during_offstrategy_incremental_compaction_test_s3 is not supported for S3 storage yet, skipping test");
-    return make_ready_future();
-#if 0
-    return test_env::do_with_async([](test_env& env) { twcs_reshape_with_disjoint_set_fn(env); },
+    return test_env::do_with_async([](test_env& env) { twcs_reshape_with_disjoint_set_fn(env, 64); },
                                    test_env_config{.storage = make_test_object_storage_options("S3")});
-#endif
 }
 
 SEASTAR_FIXTURE_TEST_CASE(twcs_reshape_with_disjoint_set_gcs_test, gcs_fixture, *tests::check_run_test_decorator("ENABLE_GCP_STORAGE_TEST", true)) {
-    return test_env::do_with_async([](test_env& env) { twcs_reshape_with_disjoint_set_fn(env); },
+    return test_env::do_with_async([](test_env& env) { twcs_reshape_with_disjoint_set_fn(env, 64); },
                                    test_env_config{.storage = make_test_object_storage_options("GS")});
 }
 
-void stcs_reshape_overlapping_fn(test_env& env) {
-    static constexpr unsigned disjoint_sstable_count = 256;
+void stcs_reshape_overlapping_fn(test_env& env, unsigned disjoint_sstable_count = 256) {
     auto builder = schema_builder("tests", "stcs_reshape_test")
             .with_column("id", utf8_type, column_kind::partition_key)
             .with_column("cl", ::timestamp_type, column_kind::clustering_key)
@@ -5531,27 +5515,23 @@ void stcs_reshape_overlapping_fn(test_env& env) {
     auto sst_gen = env.make_sst_factory(s);
 
     {
-        // create set of 256 disjoint ssts and expect that stcs reshape allows them all to be compacted at once
+        // create set of disjoint ssts and expect that stcs reshape allows them all to be compacted at once
 
-        std::vector<sstables::shared_sstable> sstables;
-        sstables.reserve(disjoint_sstable_count);
-        for (unsigned i = 0; i < disjoint_sstable_count; i++) {
-            auto sst = make_sstable_containing(sst_gen, {make_row(i)});
-            sstables.push_back(std::move(sst));
-        }
+        std::vector<sstables::shared_sstable> sstables(disjoint_sstable_count);
+        parallel_for_each(std::views::iota(0u, disjoint_sstable_count), [&](unsigned i) -> future<> {
+            sstables[i] = co_await make_sstable_containing_async(sst_gen, {make_row(i)});
+        }).get();
 
         BOOST_REQUIRE(get_reshaping_job(cs, sstables, s, compaction::reshape_mode::strict).sstables.size() == disjoint_sstable_count);
     }
 
     {
-        // create set of 256 overlapping ssts and expect that stcs reshape allows only 32 to be compacted at once
+        // create set of overlapping ssts and expect that stcs reshape allows only 32 to be compacted at once
 
-        std::vector<sstables::shared_sstable> sstables;
-        sstables.reserve(disjoint_sstable_count);
-        for (unsigned i = 0; i < disjoint_sstable_count; i++) {
-            auto sst = make_sstable_containing(sst_gen, {make_row(0)});
-            sstables.push_back(std::move(sst));
-        }
+        std::vector<sstables::shared_sstable> sstables(disjoint_sstable_count);
+        parallel_for_each(std::views::iota(0u, disjoint_sstable_count), [&](unsigned i) -> future<> {
+            sstables[i] = co_await make_sstable_containing_async(sst_gen, {make_row(0)});
+        }).get();
 
         BOOST_REQUIRE(get_reshaping_job(cs, sstables, s, compaction::reshape_mode::strict).sstables.size() == uint64_t(s->max_compaction_threshold()));
     }
@@ -5562,11 +5542,11 @@ SEASTAR_TEST_CASE(stcs_reshape_overlapping_test) {
 }
 
 SEASTAR_TEST_CASE(stcs_reshape_overlapping_s3_test, *boost::unit_test::precondition(tests::has_scylla_test_env)) {
-    return test_env::do_with_async([](test_env& env) { stcs_reshape_overlapping_fn(env); }, test_env_config{.storage = make_test_object_storage_options("S3")});
+    return test_env::do_with_async([](test_env& env) { stcs_reshape_overlapping_fn(env, 64); }, test_env_config{.storage = make_test_object_storage_options("S3")});
 }
 
 SEASTAR_FIXTURE_TEST_CASE(stcs_reshape_overlapping_gcs_test, gcs_fixture, *tests::check_run_test_decorator("ENABLE_GCP_STORAGE_TEST", true)) {
-    return test_env::do_with_async([](test_env& env) { stcs_reshape_overlapping_fn(env); }, test_env_config{.storage = make_test_object_storage_options("GS")});
+    return test_env::do_with_async([](test_env& env) { stcs_reshape_overlapping_fn(env, 64); }, test_env_config{.storage = make_test_object_storage_options("GS")});
 }
 
 // Regression test for #8432
@@ -6267,10 +6247,9 @@ SEASTAR_FIXTURE_TEST_CASE(simple_backlog_controller_test_incremental_gcs, gcs_fi
     return run_controller_test(compaction::compaction_strategy_type::incremental, test_env_config{.storage = make_test_object_storage_options("GS")});
 }
 
-void test_compaction_strategy_cleanup_method_fn(test_env& env) {
-    constexpr size_t all_files = 64;
+void test_compaction_strategy_cleanup_method_fn(test_env& env, size_t all_files = 64) {
 
-    auto get_cleanup_jobs = [&env] (compaction::compaction_strategy_type compaction_strategy_type,
+    auto get_cleanup_jobs = [&env, all_files] (compaction::compaction_strategy_type compaction_strategy_type,
                                                 std::map<sstring, sstring> strategy_options = {},
                                                 const api::timestamp_clock::duration step_base = 0ms,
                                                 unsigned sstable_level = 0) {
@@ -6301,14 +6280,13 @@ void test_compaction_strategy_cleanup_method_fn(test_env& env) {
             return m;
         };
 
-        std::vector<sstables::shared_sstable> candidates;
-        candidates.reserve(all_files);
-        for (size_t i = 0; i < all_files; i++) {
+        std::vector<sstables::shared_sstable> candidates(all_files);
+        parallel_for_each(std::views::iota(size_t(0), all_files), [&](size_t i) -> future<> {
             auto current_step = duration_cast<microseconds>(step_base) * i;
-            auto sst = make_sstable_containing(sst_gen, {make_mutation(i, next_timestamp(current_step))});
+            auto sst = co_await make_sstable_containing_async(sst_gen, {make_mutation(i, next_timestamp(current_step))});
             sst->set_sstable_level(sstable_level);
-            candidates.push_back(std::move(sst));
-        }
+            candidates[i] = std::move(sst);
+        }).get();
 
         auto strategy = cf->get_compaction_strategy();
         auto jobs = strategy.get_cleanup_compaction_jobs(cf.as_compaction_group_view(), candidates);
@@ -6825,24 +6803,32 @@ static future<> run_incremental_compaction_test(sstables::offstrategy offstrateg
 
         std::unordered_set<sstables::generation_type> gens; // input sstable generations
         run_id run_identifier = run_id::create_random_id();
+
+        // Pre-extract mutation pairs for parallel SSTable creation
+        std::vector<std::pair<mutation, mutation>> mutation_pairs;
+        mutation_pairs.reserve(sstables_nr);
         auto merged_it = merged.begin();
         for (unsigned i = 0; i < sstables_nr; i++) {
             auto mut1 = std::move(*merged_it);
             merged_it++;
             auto mut2 = std::move(*merged_it);
             merged_it++;
-            auto sst = make_sstable_containing(sst_gen, {
-                std::move(mut1),
-                std::move(mut2)
+            mutation_pairs.emplace_back(std::move(mut1), std::move(mut2));
+        }
+
+        ssts.resize(sstables_nr);
+        parallel_for_each(std::views::iota(size_t(0), sstables_nr), [&](size_t i) -> future<> {
+            ssts[i] = co_await make_sstable_containing_async(sst_gen, {
+                std::move(mutation_pairs[i].first),
+                std::move(mutation_pairs[i].second)
             });
-            sstables::test(sst).set_run_identifier(run_identifier); // in order to produce multi-fragment run.
-            sst->set_sstable_level(offstrategy ? 0 : 1);
+            sstables::test(ssts[i]).set_run_identifier(run_identifier);
+            ssts[i]->set_sstable_level(offstrategy ? 0 : 1);
+        }).get();
 
-            // every sstable will be eligible for cleanup, by having both an owned and unowned token.
-            owned_token_ranges.push_back(dht::token_range::make_singular(sst->get_last_decorated_key().token()));
-
-            gens.insert(sst->generation());
-            ssts.push_back(std::move(sst));
+        for (unsigned i = 0; i < sstables_nr; i++) {
+            owned_token_ranges.push_back(dht::token_range::make_singular(ssts[i]->get_last_decorated_key().token()));
+            gens.insert(ssts[i]->generation());
         }
 
         size_t last_input_sstable_count = sstables_nr;
@@ -6971,26 +6957,32 @@ void cleanup_during_offstrategy_incremental_compaction_fn(test_env& env) {
     }
 
     std::unordered_set<sstables::generation_type> gens; // input sstable generations
+
+    // Pre-extract mutation pairs for parallel SSTable creation
+    std::vector<std::pair<mutation, mutation>> mutation_pairs;
+    mutation_pairs.reserve(sstables_nr);
     auto merged_it = merged.begin();
     for (unsigned i = 0; i < sstables_nr; i++) {
         auto mut1 = std::move(*merged_it);
         merged_it++;
         auto mut2 = std::move(*merged_it);
         merged_it++;
-        auto sst = make_sstable_containing(sst_gen, {
-            std::move(mut1),
-            std::move(mut2)
+        mutation_pairs.emplace_back(std::move(mut1), std::move(mut2));
+    }
+
+    ssts.resize(sstables_nr);
+    parallel_for_each(std::views::iota(size_t(0), sstables_nr), [&](size_t i) -> future<> {
+        ssts[i] = co_await make_sstable_containing_async(sst_gen, {
+            std::move(mutation_pairs[i].first),
+            std::move(mutation_pairs[i].second)
         });
-        // Force a new run_id to trigger offstrategy compaction
-        sstables::test(sst).set_run_identifier(run_id::create_random_id());
-        // Set level to 0 to trigger offstrategy compaction
-        sst->set_sstable_level(0);
+        sstables::test(ssts[i]).set_run_identifier(run_id::create_random_id());
+        ssts[i]->set_sstable_level(0);
+    }).get();
 
-        // every sstable will be eligible for cleanup, by having both an owned and unowned token.
-        owned_token_ranges.push_back(dht::token_range::make_singular(sst->get_last_decorated_key().token()));
-
-        gens.insert(sst->generation());
-        ssts.push_back(std::move(sst));
+    for (unsigned i = 0; i < sstables_nr; i++) {
+        owned_token_ranges.push_back(dht::token_range::make_singular(ssts[i]->get_last_decorated_key().token()));
+        gens.insert(ssts[i]->generation());
     }
 
     {
