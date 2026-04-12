@@ -836,6 +836,17 @@ future<stream_files_response> tablet_stream_files_handler(replica::database& db,
             info.filename = sst->component_basename(sstables::component_type::TOC);
         }
     } else {
+        // Log when we fall back from clone to byte-streaming for object-storage
+        // tables.  In a mixed-version cluster an older peer deserialises
+        // clone_based_object_storage_streaming as false, so the request arrives
+        // with the flag cleared.  An unbounded range (no endpoint) also prevents
+        // the clone path because we cannot resolve a tablet id.
+        if (table.get_storage_options().is_object_storage_type()) {
+            blogger.warn("stream_sstables[{}] Falling back to byte-streaming for object-storage table {}.{} "
+                    "(clone_based={}, range_end={})",
+                    req.ops_id, req.keyspace_name, req.table_name,
+                    req.clone_based_object_storage_streaming, bool(req.range.end()));
+        }
         auto reader = co_await db.obtain_reader_permit(table, "tablet_file_streaming", db::no_timeout, {});
         is_logstor_table = table.uses_logstor();
 
