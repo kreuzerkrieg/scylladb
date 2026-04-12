@@ -23,20 +23,20 @@
 using namespace sstables;
 using namespace std::chrono_literals;
 
-lw_shared_ptr<replica::memtable> make_memtable(schema_ptr s, const utils::chunked_vector<mutation>& muts) {
+static future<lw_shared_ptr<replica::memtable>> make_memtable_async(schema_ptr s, const utils::chunked_vector<mutation>& muts) {
     auto mt = make_lw_shared<replica::memtable>(s);
 
-    std::size_t i{0};
     for (auto&& m : muts) {
         mt->apply(m);
         // Give the reactor some time to breathe
-        if (++i == 10) {
-            seastar::thread::yield();
-            i = 0;
-        }
+        co_await coroutine::maybe_yield();
     }
 
-    return mt;
+    co_return mt;
+}
+
+lw_shared_ptr<replica::memtable> make_memtable(schema_ptr s, const utils::chunked_vector<mutation>& muts) {
+    return make_memtable_async(s, muts).get();
 }
 
 std::vector<replica::memtable*> active_memtables(replica::table& t) {
@@ -51,23 +51,28 @@ sstables::shared_sstable make_sstable_containing(std::function<sstables::shared_
     return make_sstable_containing(sst_factory(), std::move(mt));
 }
 
-sstables::shared_sstable make_sstable_containing(sstables::shared_sstable sst, lw_shared_ptr<replica::memtable> mt) {
-    write_memtable_to_sstable(*mt, sst).get();
+future<sstables::shared_sstable> make_sstable_containing_async(sstables::shared_sstable sst, lw_shared_ptr<replica::memtable> mt) {
+    co_await write_memtable_to_sstable(*mt, sst);
     sstable_open_config cfg { .load_first_and_last_position_metadata = true };
-    sst->open_data(cfg).get();
-    return sst;
+    co_await sst->open_data(cfg);
+    co_return sst;
+}
+
+sstables::shared_sstable make_sstable_containing(sstables::shared_sstable sst, lw_shared_ptr<replica::memtable> mt) {
+    return make_sstable_containing_async(std::move(sst), std::move(mt)).get();
 }
 
 sstables::shared_sstable make_sstable_containing(std::function<sstables::shared_sstable()> sst_factory, utils::chunked_vector<mutation> muts, validate do_validate) {
     return make_sstable_containing(sst_factory(), std::move(muts), do_validate);
 }
 
-sstables::shared_sstable make_sstable_containing(sstables::shared_sstable sst, utils::chunked_vector<mutation> muts, validate do_validate) {
+future<sstables::shared_sstable> make_sstable_containing_async(sstables::shared_sstable sst, utils::chunked_vector<mutation> muts, validate do_validate) {
     schema_ptr s = muts[0].schema();
-    make_sstable_containing(sst, make_memtable(s, muts));
+    co_await make_sstable_containing_async(sst, co_await make_memtable_async(s, muts));
 
     if (do_validate) {
-        tests::reader_concurrency_semaphore_wrapper semaphore;
+        reader_concurrency_semaphore sem(
+            reader_concurrency_semaphore::no_limits{}, "make_sstable_containing_async", reader_concurrency_semaphore::register_metrics::no);
 
         std::set<mutation, mutation_decorated_key_less_comparator> merged;
         for (auto&& m : muts) {
@@ -79,16 +84,29 @@ sstables::shared_sstable make_sstable_containing(sstables::shared_sstable sst, u
                 old.value().apply(std::move(m));
                 merged.insert(std::move(old));
             }
+            co_await coroutine::maybe_yield();
         }
 
         // validate the sstable
-        auto rd = assert_that(sst->as_mutation_source().make_mutation_reader(s, semaphore.make_permit()));
+        auto rd = sst->as_mutation_source().make_mutation_reader(s, sem.make_tracking_only_permit(nullptr, "test", db::no_timeout, {}));
         for (auto&& m : merged) {
-            rd.produces(m);
+            auto mo = co_await read_mutation_from_mutation_reader(rd);
+            BOOST_REQUIRE(mo);
+            assert_that(*mo).is_equal_to_compacted(m);
+            co_await coroutine::maybe_yield();
         }
-        rd.produces_end_of_stream();
+        co_await rd.close();
+        co_await sem.stop();
     }
-    return sst;
+    co_return sst;
+}
+
+sstables::shared_sstable make_sstable_containing(sstables::shared_sstable sst, utils::chunked_vector<mutation> muts, validate do_validate) {
+    return make_sstable_containing_async(sst, std::move(muts), do_validate).get();
+}
+
+future<sstables::shared_sstable> make_sstable_containing_async(std::function<sstables::shared_sstable()> sst_factory, utils::chunked_vector<mutation> muts, validate do_validate) {
+    co_return co_await make_sstable_containing_async(sst_factory(), std::move(muts), do_validate);
 }
 
 shared_sstable make_sstable_easy(test_env& env, mutation_reader rd, sstable_writer_config cfg,

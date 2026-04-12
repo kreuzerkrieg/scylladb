@@ -32,6 +32,11 @@ sstables::shared_sstable make_sstable_containing(sstables::shared_sstable sst, l
 sstables::shared_sstable make_sstable_containing(std::function<sstables::shared_sstable()> sst_factory, utils::chunked_vector<mutation> muts, validate do_validate = validate::yes);
 sstables::shared_sstable make_sstable_containing(sstables::shared_sstable sst, utils::chunked_vector<mutation> muts, validate do_validate = validate::yes);
 
+// Async overloads — can be used directly in parallel_for_each lambdas
+// without wrapping in seastar::async.
+future<sstables::shared_sstable> make_sstable_containing_async(sstables::shared_sstable sst, utils::chunked_vector<mutation> muts, validate do_validate = validate::yes);
+future<sstables::shared_sstable> make_sstable_containing_async(std::function<sstables::shared_sstable()> sst_factory, utils::chunked_vector<mutation> muts, validate do_validate = validate::yes);
+
 namespace sstables {
 
 using sstable_ptr = shared_sstable;
