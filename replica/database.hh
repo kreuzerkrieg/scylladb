@@ -1413,6 +1413,22 @@ public:
     // If leave_unsealead is set, all the destination sstables will be left unsealed.
     future<utils::chunked_vector<sstables::entry_descriptor>> clone_tablet_storage(locator::tablet_id tid, bool leave_unsealed);
 
+    // Result of take_tablet_sstable_snapshot_for_clone().
+    struct tablet_sstable_snapshot {
+        // Descriptors of the original SSTables (with source generation).
+        utils::chunked_vector<sstables::entry_descriptor> descs;
+        // Held shared_sstable references prevent compaction from deleting the
+        // underlying S3 objects while the target node clones them.
+        utils::chunked_vector<sstables::shared_sstable> sstables;
+    };
+
+    // Takes a snapshot of the SSTables for a given tablet, returning their
+    // descriptors and holding shared_sstable references to prevent the
+    // underlying objects from being deleted by compaction during streaming.
+    // Memtable is flushed first so that the snapshot covers all data written
+    // up to the point it was taken.
+    future<tablet_sstable_snapshot> take_tablet_sstable_snapshot_for_clone(locator::tablet_id tid);
+
     tombstone_gc_state get_tombstone_gc_state() const;
 
     friend class compaction_group;

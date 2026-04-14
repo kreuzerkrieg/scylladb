@@ -52,53 +52,64 @@ static future<> load_sstable_for_tablet(const file_stream_id& ops_id, replica::d
         replica::table& t = db.find_column_family(id);
         auto erm = t.get_effective_replication_map();
         auto& sstm = t.get_sstables_manager();
-        auto sst = sstm.make_sstable(t.schema(), t.get_storage_options(), desc.generation, state, desc.version, desc.format);
-        // For object-storage tables, cloning always produces a regular TOC object
-        // (not TemporaryTOC); the sealed/unsealed distinction is maintained in the
-        // SSTable registry as "creating" vs "sealed", not via the filesystem
-        // TemporaryTOC convention.  Ensure a "creating" registry entry exists on
-        // this (target) node before seal_sstable() can promote it to "sealed".
-        //
-        // In multi-node production the source's clone() writes to its own local
-        // registry, so no entry exists on the target yet and the INSERT below is
-        // always fresh.  In single-node tests, source and target share the same
-        // process, so the source's clone() already inserted the entry; the
-        // unconditional upsert merely re-writes "creating" with the same value.
-        //
-        // An unconditional INSERT is safe even under concurrent retries:
-        // two "creating" upserts are harmless, and if a previous attempt has
-        // already sealed the entry, seal_sstable() below will overwrite the
-        // status to "sealed" again regardless.
         const bool is_object_storage = t.get_storage_options().is_object_storage_type();
-        if (is_object_storage) {
-            sstables::entry_descriptor reg_desc(desc.generation, desc.version, desc.format, sstables::component_type::TOC);
-            co_await sstm.sstables_registry().create_entry(t.schema()->id(), "creating", state, std::move(reg_desc));
-        }
-        sstables::sstable_open_config cfg {
-                // Filesystem clones leave a TemporaryTOC; object-storage clones leave
-                // a regular TOC and track sealed/unsealed state via the registry.
-                .unsealed_sstable = !is_object_storage,
-                .ignore_component_digest_mismatch = db.get_config().ignore_component_digest_mismatch() };
-        co_await sst->load(erm->get_sharder(*t.schema()), cfg);
-        auto on_add = [sst, &sstm] (sstables::shared_sstable loading_sst) -> future<> {
-            if (loading_sst == sst) {
-                auto cfg = sstm.configure_writer(sst->get_origin());
-                co_await loading_sst->seal_sstable(cfg.backup);
-            }
-            co_return;
-        };
-        auto new_sstables = co_await t.add_new_sstable_and_update_cache(sst, on_add);
-        blogger.info("stream_sstables[{}] Loaded sstable {} successfully", ops_id, sst->toc_filename());
 
-        if (state == sstables::sstable_state::staging) {
-            // If the sstable is in staging state, register it to view building worker
-            // to generate view updates from it.
-            // But because the tablet is still in migration process, register the sstable
-            // to the view building worker, which will create a view building task for it,
-            // so then, the view building coordinator can decide to process it once the migration
-            // is finished.
-            // (Instead of registering the sstable to view update generator which may process it immediately.)
-            co_await sharded_vbw.local().register_staging_sstable_tasks(new_sstables, t.schema()->id());
+        if (is_object_storage) {
+            // Target-side clone: we received the *original* SSTable descriptor
+            // from the source node. The source holds shared_sstable references to
+            // prevent the underlying S3 objects from being deleted by compaction.
+            //
+            // We create a temporary SSTable object for the source generation, read
+            // its TOC to discover components, then clone (S3 server-side copy) to a
+            // new generation owned by this node. The clone() call also creates the
+            // registry entry on this node.
+            auto src_sst = sstm.make_sstable(t.schema(), t.get_storage_options(), desc.generation, state, desc.version, desc.format);
+            co_await src_sst->read_toc();
+
+            auto new_generation = t.get_sstable_generation_generator()();
+            co_await src_sst->clone(new_generation, /*leave_unsealed=*/true);
+
+            // Now load the cloned SSTable with the new generation.
+            auto sst = sstm.make_sstable(t.schema(), t.get_storage_options(), new_generation, state, desc.version, desc.format);
+            sstables::sstable_open_config cfg {
+                    .unsealed_sstable = false,
+                    .ignore_component_digest_mismatch = db.get_config().ignore_component_digest_mismatch() };
+            co_await sst->load(erm->get_sharder(*t.schema()), cfg);
+            auto on_add = [sst, &sstm] (sstables::shared_sstable loading_sst) -> future<> {
+                if (loading_sst == sst) {
+                    auto cfg = sstm.configure_writer(sst->get_origin());
+                    co_await loading_sst->seal_sstable(cfg.backup);
+                }
+                co_return;
+            };
+            auto new_sstables = co_await t.add_new_sstable_and_update_cache(sst, on_add);
+            blogger.info("stream_sstables[{}] Cloned and loaded sstable {} -> {} successfully", ops_id, desc.generation, new_generation);
+
+            if (state == sstables::sstable_state::staging) {
+                co_await sharded_vbw.local().register_staging_sstable_tasks(new_sstables, t.schema()->id());
+            }
+        } else {
+            // Filesystem (intranode) clone path: the descriptor already refers to
+            // the cloned SSTable (hard-linked on the source shard).
+            auto sst = sstm.make_sstable(t.schema(), t.get_storage_options(), desc.generation, state, desc.version, desc.format);
+            sstables::sstable_open_config cfg {
+                    // Filesystem clones leave a TemporaryTOC.
+                    .unsealed_sstable = true,
+                    .ignore_component_digest_mismatch = db.get_config().ignore_component_digest_mismatch() };
+            co_await sst->load(erm->get_sharder(*t.schema()), cfg);
+            auto on_add = [sst, &sstm] (sstables::shared_sstable loading_sst) -> future<> {
+                if (loading_sst == sst) {
+                    auto cfg = sstm.configure_writer(sst->get_origin());
+                    co_await loading_sst->seal_sstable(cfg.backup);
+                }
+                co_return;
+            };
+            auto new_sstables = co_await t.add_new_sstable_and_update_cache(sst, on_add);
+            blogger.info("stream_sstables[{}] Loaded sstable {} successfully", ops_id, sst->toc_filename());
+
+            if (state == sstables::sstable_state::staging) {
+                co_await sharded_vbw.local().register_staging_sstable_tasks(new_sstables, t.schema()->id());
+            }
         }
     });
 }
@@ -798,24 +809,26 @@ future<stream_files_response> tablet_stream_files_handler(replica::database& db,
     auto& table = db.find_column_family(req.table);
     auto files = std::list<stream_blob_info>();
     size_t sstable_nr = 0;
-    // Kept for post-stream source-registry cleanup in the clone path.
-    utils::chunked_vector<sstables::entry_descriptor> cloned_descs;
+    bool clone_path = false;
+    // Held shared_sstable references prevent compaction from deleting the
+    // underlying S3 objects while the target node clones them.
+    utils::chunked_vector<sstables::shared_sstable> sstable_refs;
 
     if (req.clone_based_object_storage_streaming && table.get_storage_options().is_object_storage_type() && req.range.end()) {
         auto& tmap = table.get_effective_replication_map()->get_token_metadata().tablets().get_tablet_map(req.table);
         auto tid = tmap.get_tablet_id(req.range.end()->value());
-        cloned_descs = co_await table.clone_tablet_storage(tid, true);
-        sstable_nr = cloned_descs.size();
+        auto snapshot = co_await table.take_tablet_sstable_snapshot_for_clone(tid);
+        sstable_nr = snapshot.descs.size();
+        clone_path = true;
 
-        // Unlike the regular streaming path which sends one STREAM_BLOB RPC per
-        // component file (Data, Index, Filter, …) with the last one marked
-        // load_sstables to trigger loading, the clone path sends one
-        // clone_sstables message per SSTable (always with TOC component).  The
-        // receiver's load_sstable_for_tablet() loads the full SSTable from
-        // object storage by its TOC — no individual component transfer is needed
-        // since the server-side copy already placed all components.
+        // Keep the shared_sstable references alive for the duration of
+        // streaming so the source S3 objects are not deleted by compaction.
+        sstable_refs = std::move(snapshot.sstables);
+
+        // Send the *original* SSTable descriptors to the target. The target
+        // will perform the S3 server-side copy (clone) itself.
         auto schema = table.schema();
-        for (const auto& desc : cloned_descs) {
+        for (const auto& desc : snapshot.descs) {
             auto& info = files.emplace_back();
             info.fops = file_ops::clone_sstables;
             info.sstable_state = desc.state;
@@ -917,24 +930,10 @@ future<stream_files_response> tablet_stream_files_handler(replica::database& db,
         streaming_error = std::current_exception();
     }
 
-    // Unregister the source-side "creating" entries produced by clone_tablet_storage().
-    // The underlying S3/GCS objects were server-side copied; on success they are
-    // owned by the target node, on failure they become orphaned — either way the
-    // source-side registry rows must be removed to avoid accumulating stale
-    // "creating" entries.  The orphaned objects are harmless and will be
-    // re-cloned on a subsequent migration attempt.
-    if (!cloned_descs.empty()) {
-        auto& sstm = table.get_sstables_manager();
-        auto table_owner = table.schema()->id();
-        for (const auto& desc : cloned_descs) {
-            try {
-                co_await sstm.sstables_registry().delete_entry(table_owner, desc.generation);
-            } catch (...) {
-                blogger.warn("stream_sstables[{}] Failed to unregister cloned generation {} from source registry: {}",
-                        req.ops_id, desc.generation, std::current_exception());
-            }
-        }
-    }
+    // Release the shared_sstable references now that streaming is done.
+    // If the SSTables were compacted away while we held references, the
+    // underlying S3 objects can now be deleted.
+    sstable_refs.clear();
 
     if (streaming_error) {
         std::rethrow_exception(streaming_error);
@@ -942,8 +941,8 @@ future<stream_files_response> tablet_stream_files_handler(replica::database& db,
 
     resp.stream_bytes = stream_bytes;
     auto duration = std::chrono::steady_clock::now() - ops_start_time;
-    if (!cloned_descs.empty()) {
-        blogger.info("stream_sstables[{}] Finished clone-based streaming sstable_nr={} files_nr={} range={} stream_time={} (server-side copy, no bytes transferred)",
+    if (clone_path) {
+        blogger.info("stream_sstables[{}] Finished clone-based streaming sstable_nr={} files_nr={} range={} stream_time={} (target-side S3 clone, no bytes transferred)",
                 req.ops_id, sstable_nr, files_nr, req.range, duration);
     } else {
         blogger.info("stream_{}[{}] Finished sending files_nr={} range={} stream_bytes={} stream_time={} stream_bw={}",

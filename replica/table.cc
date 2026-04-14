@@ -1573,6 +1573,34 @@ table::clone_tablet_storage(locator::tablet_id tid, bool leave_unsealed) {
     co_return ret;
 }
 
+future<table::tablet_sstable_snapshot>
+table::take_tablet_sstable_snapshot_for_clone(locator::tablet_id tid) {
+    tablet_sstable_snapshot ret;
+    auto holder = async_gate().hold();
+
+    auto* sgp = _sg_manager->maybe_storage_group_for_id(_schema, tid.value());
+    if (!sgp) {
+        co_return ret;
+    }
+    auto& sg = *sgp;
+    auto sg_holder = sg.async_gate().hold();
+    co_await sg.flush();
+    // The sstable set must be obtained *after* the deletion lock is taken,
+    // otherwise components of sstables in the set might be unlinked from the filesystem
+    // by compaction while we are waiting for the lock.
+    auto deletion_guard = co_await get_sstable_list_permit();
+    co_await sg.make_sstable_set()->for_each_sstable_gently([&] (const sstables::shared_sstable& sst) -> future<> {
+        auto desc = sst->get_descriptor(sstables::component_type::TOC);
+        desc.state = sst->state();
+        ret.descs.push_back(std::move(desc));
+        // Holding the shared_sstable reference prevents compaction from
+        // deleting the underlying S3 objects while the target clones them.
+        ret.sstables.push_back(sst);
+        co_return;
+    });
+    co_return ret;
+}
+
 void table::update_stats_for_new_sstable(const sstables::shared_sstable& sst) noexcept {
     _stats.live_disk_space_used += sst->get_file_size_stats();
     _stats.total_disk_space_used += sst->get_file_size_stats();
