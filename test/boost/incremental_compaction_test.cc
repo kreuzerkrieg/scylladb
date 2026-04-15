@@ -175,7 +175,7 @@ SEASTAR_TEST_CASE(incremental_compaction_test) {
         // Generate 4 sstable runs composed of 4 fragments each after 4 compactions.
         // All fragments non-overlapping.
         for (auto i = 0U; i < tokens.size(); i++) {
-            auto sst = make_sstable_containing(sst_gen, { make_insert(tokens[i]) });
+            auto sst = make_sstable_containing(sst_gen, { make_insert(tokens[i]) }).get();
             sst->set_sstable_level(1);
             BOOST_REQUIRE(sst->get_sstable_level() == 1);
             column_family_test(cf).add_sstable(sst).get();
@@ -337,7 +337,7 @@ SEASTAR_TEST_CASE(basic_garbage_collection_test) {
             auto sst = env.make_sstable(s, tmp.path().string(), env.new_generation(), sstables::get_highest_sstable_version(), big);
             return sst;
         };
-        auto sst = make_sstable_containing(creator, std::move(mutations));
+        auto sst = make_sstable_containing(creator, std::move(mutations)).get();
         column_family_test(cf).add_sstable(sst).get();
 
         const auto& stats = sst->get_stats_metadata();
@@ -444,7 +444,7 @@ SEASTAR_TEST_CASE(ics_reshape_test) {
             std::vector<sstables::shared_sstable> sstables;
             sstables.reserve(sstable_count);
             for (unsigned i = 0; i < sstable_count; i++) {
-                auto sst = make_sstable_containing(sst_gen, {make_row(0)});
+                auto sst = make_sstable_containing(sst_gen, {make_row(0)}).get();
                 sstables.push_back(std::move(sst));
             }
 
@@ -459,7 +459,7 @@ SEASTAR_TEST_CASE(ics_reshape_test) {
             std::vector<sstables::shared_sstable> sstables;
             sstables.reserve(disjoint_sstable_count);
             for (unsigned i = 0; i < disjoint_sstable_count; i++) {
-                auto sst = make_sstable_containing(sst_gen, {make_row(i)});
+                auto sst = make_sstable_containing(sst_gen, {make_row(i)}).get();
                 sstables.push_back(std::move(sst));
             }
 
@@ -473,7 +473,7 @@ SEASTAR_TEST_CASE(ics_reshape_test) {
             std::vector<sstables::shared_sstable> sstables;
             sstables.reserve(disjoint_sstable_count);
             for (unsigned i = 0; i < disjoint_sstable_count; i++) {
-                auto sst = make_sstable_containing(sst_gen, {make_row(i)});
+                auto sst = make_sstable_containing(sst_gen, {make_row(i)}).get();
                 sstables::test(sst).set_run_identifier(sstable_run_id);
                 sstables.push_back(std::move(sst));
             }
@@ -487,7 +487,7 @@ SEASTAR_TEST_CASE(ics_reshape_test) {
             std::vector<sstables::shared_sstable> sstables;
             sstables.reserve(disjoint_sstable_count);
             for (unsigned i = 0; i < disjoint_sstable_count; i++) {
-                auto sst = make_sstable_containing(sst_gen, {make_row(0)});
+                auto sst = make_sstable_containing(sst_gen, {make_row(0)}).get();
                 sstables.push_back(std::move(sst));
             }
 
@@ -511,7 +511,7 @@ SEASTAR_TEST_CASE(gc_tombstone_with_grace_seconds_test) {
         mutation mut(schema, tests::generate_partition_key(schema, local_shard_only::yes));
         auto live_cell = atomic_cell::make_live(*byte_type, 0, to_bytes("a"), gc_clock::time_point(gc_clock::duration(expiration_time)), gc_clock::duration(1));
         mut.set_clustered_cell(clustering_key::make_empty(), *schema->get_column_definition("value"), std::move(live_cell));
-        auto sst = make_sstable_containing(env.make_sst_factory(schema), {mut});
+        auto sst = make_sstable_containing(env.make_sst_factory(schema), {mut}).get();
 
         table_for_tests cf = env.make_table_for_tests(schema);
         auto close_cf = deferred_stop(cf);
