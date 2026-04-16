@@ -2,7 +2,17 @@
 
 from __future__ import annotations
 
+"""Generate a local/S3/GCP test timing comparison table from testlog junit XML files.
+
+The script scans junit XML files under a testlog directory and groups parametrized
+tests by storage backend based on parameter names in square brackets:
+`[local]`, `[s3]`, `[gs]`, `[gcs]`, or `[gcp]`.
+It then prints a markdown table with average durations and regression percentages
+versus local storage.
+"""
+
 import argparse
+import logging
 import statistics
 import sys
 import xml.etree.ElementTree as ET
@@ -17,6 +27,8 @@ STORAGE_ALIASES = {
     "gcs": "gcp",
     "gcp": "gcp",
 }
+
+LOGGER = logging.getLogger(__name__)
 
 
 def parse_args() -> argparse.Namespace:
@@ -55,12 +67,19 @@ def normalize_storage_variant(test_name: str) -> tuple[str, str | None]:
 
 
 def collect_timings(xml_files: list[Path]) -> dict[str, dict[str, list[float]]]:
+    """Collect testcase durations from junit XML files for storage-parametrized tests.
+
+    Returns:
+        Nested mapping:
+            full_test_name -> storage_backend -> list[duration_seconds]
+    """
     timings: dict[str, dict[str, list[float]]] = defaultdict(lambda: defaultdict(list))
 
     for xml_file in xml_files:
         try:
             root = ET.parse(xml_file).getroot()
         except ET.ParseError:
+            LOGGER.warning("skipping malformed junit xml: %s", xml_file)
             continue
 
         testcases = root.findall(".//testcase")
@@ -94,12 +113,13 @@ def fmt_regression(local: float | None, other: float | None) -> str:
     if local is None or other is None:
         return "-"
     if local == 0:
-        return "inf"
+        return "N/A"
     delta = ((other - local) / local) * 100
     return f"{delta:+.1f}%"
 
 
 def build_markdown_table(timings: dict[str, dict[str, list[float]]]) -> str:
+    """Build a markdown table with mean timings and local-vs-object-storage deltas."""
     header = (
         "| test | local(s) | s3(s) | gcp(s) | s3 vs local | gcp vs local | local n | s3 n | gcp n |\n"
         "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"
@@ -135,6 +155,7 @@ def build_markdown_table(timings: dict[str, dict[str, list[float]]]) -> str:
 
 def main() -> int:
     args = parse_args()
+    logging.basicConfig(level=logging.WARNING, format="%(levelname)s: %(message)s")
     testlog_dir = args.testlog_dir
 
     if not testlog_dir.exists():
@@ -158,4 +179,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    sys.exit(main())
