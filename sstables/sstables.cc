@@ -3442,7 +3442,7 @@ future<> sstable::close_files() {
     }
 
     auto unlinked = make_ready_future<>();
-    if (_marked_for_deletion != mark_for_deletion::none) {
+    if (_marked_for_deletion != mark_for_deletion::none && !_unlinked) {
         // If a deletion fails for some reason we
         // log and ignore this failure, because on startup we'll again try to
         // clean up unused sstables, and because we'll never reuse the same

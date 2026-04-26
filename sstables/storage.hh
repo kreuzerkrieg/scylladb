@@ -109,7 +109,7 @@ public:
     virtual future<> change_state(const sstable& sst, sstable_state to, generation_type generation, delayed_commit_changes* delay) = 0;
     // runs in async context
     virtual void open(sstable& sst) = 0;
-    virtual future<> wipe(const sstable& sst, sync_dir) noexcept = 0;
+    virtual future<> wipe(sstable& sst, sync_dir) noexcept = 0;
     virtual future<file> open_component(const sstable& sst, component_type type, open_flags flags, file_open_options options, bool check_integrity) = 0;
     virtual future<data_sink> make_data_or_index_sink(sstable& sst, component_type type) = 0;
     virtual future<data_source> make_data_or_index_source(sstable& sst, component_type type, file f, uint64_t offset, uint64_t len, file_input_stream_options opt) const = 0;
