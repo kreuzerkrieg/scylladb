@@ -90,7 +90,7 @@ public:
 
 using shard_client_factory = std::function<shared_ptr<object_storage_client>(std::string)>;
 
-shared_ptr<object_storage_client> make_object_storage_client(const db::object_storage_endpoint_param&, semaphore&, shard_client_factory);
+shared_ptr<object_storage_client> make_object_storage_client(const db::object_storage_endpoint_param&, semaphore&, shard_client_factory, double s3_connections_per_share = 0.032);
 
 }
 

@@ -153,13 +153,14 @@ shared_ptr<client> client::make(std::string endpoint, endpoint_config_ptr cfg, s
     return seastar::make_shared<client>(std::move(endpoint), std::move(cfg), mem, std::move(gf), private_tag{});
 }
 
-shared_ptr<client> client::make(std::string ep, std::string region, std::string iam_role_arn, semaphore& memory, global_factory gf) {
+shared_ptr<client> client::make(std::string ep, std::string region, std::string iam_role_arn, semaphore& memory, global_factory gf, double connections_per_share) {
     auto url = utils::http::parse_simple_url(ep);
     endpoint_config cfg = {
         .port = url.port,
         .use_https = url.is_https(),
         .region = std::move(region),
         .role_arn = std::move(iam_role_arn),
+        .connections_per_share = connections_per_share,
     };
     return make(url.host, make_lw_shared<endpoint_config>(std::move(cfg)), memory, gf);
 }
@@ -271,9 +272,10 @@ client::group_client& client::find_or_create_client() {
     if (it == _https.end()) [[unlikely]] {
         auto factory = std::make_unique<utils::http::dns_connection_factory>(_host, _cfg->port, _cfg->use_https, s3l);
         // Limit the maximum number of connections this group's http client
-        // may have proportional to its shares. Shares are typically in the
-        // range of 100...1000, thus resulting in 1..10 connections
-        unsigned max_connections = _cfg->max_connections.has_value() ? *_cfg->max_connections : std::max((unsigned)(sg.get_shares() / 100), 1u);
+        // may have proportional to its shares. connections_per_share controls
+        // how many connections are created per share (default 0.032).
+        // Shares are typically in the range of 100...1000, thus resulting in 3..32 connections
+        unsigned max_connections = _cfg->max_connections.has_value() ? *_cfg->max_connections : std::max(static_cast<unsigned>(sg.get_shares() * _cfg->connections_per_share), 1u);
         it = _https.emplace(std::piecewise_construct,
             std::forward_as_tuple(sg),
             std::forward_as_tuple(std::move(factory), max_connections)
