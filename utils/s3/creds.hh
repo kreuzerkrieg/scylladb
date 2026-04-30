@@ -27,12 +27,15 @@ struct aws_credentials {
 };
 
 struct endpoint_config {
+    static constexpr double default_connections_per_share = 0.032;
+
     unsigned port;
     bool use_https;
     std::string region;
     // Amazon Resource Names (ARNs) to access AWS resources
     std::string role_arn;
     std::optional<unsigned> max_connections;
+    double connections_per_share = default_connections_per_share;
 
     std::strong_ordering operator<=>(const endpoint_config& o) const = default;
 };
