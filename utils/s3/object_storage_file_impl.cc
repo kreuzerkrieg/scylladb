@@ -75,7 +75,7 @@ future<temporary_buffer<char>> object_storage_file_impl::read_from_stream(uint64
 future<> object_storage_file_impl::ensure_output_stream() {
     if (!_write_stream) {
         auto ds = _client->make_upload_sink(_object_name, _as);
-        _write_stream.emplace(output_stream<char>(std::move(ds), 128 * 1024));
+        _write_stream.emplace(output_stream<char>(std::move(ds)));
         _write_pos = 0;
     }
     return make_ready_future<>();

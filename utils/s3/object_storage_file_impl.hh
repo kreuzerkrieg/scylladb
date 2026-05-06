@@ -20,7 +20,7 @@ class object_storage_file_impl final : public file_impl {
     shared_ptr<client> _client;
     sstring _object_name;
     mutable std::optional<stats> _stats;
-    seastar::abort_source* const _as;
+    seastar::abort_source* _as;
 
     // Stream-based sequential read state
     std::optional<input_stream<char>> _read_stream;
