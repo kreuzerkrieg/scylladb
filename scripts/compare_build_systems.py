@@ -105,6 +105,10 @@ def _collect_internal_lib_names(*build_lists):
 # A library present on BOTH sides always matches and is not checked here.
 # A library absent from both sides is irrelevant.
 # Only asymmetric presence is checked against this table.
+#
+# MAINTAINER: if the tool reports a library mismatch that is expected
+# (i.e., one build system links it transitively while the other links
+# it explicitly), add an entry here rather than suppressing the error.
 _KNOWN_LIB_ASYMMETRIES = {
     # configure.py links these explicitly; CMake resolves them
     # transitively through imported targets (Seastar, GnuTLS, etc.)
@@ -139,6 +143,10 @@ _KNOWN_LIB_ASYMMETRIES = {
     "rt": "cmake",
 }
 
+# Standalone tools that have known structural differences in link flags
+# between the two build systems (e.g., -fno-lto present only in CMake).
+_CPP_APPS = {"patchelf"}
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Ninja file parsing
@@ -168,6 +176,12 @@ def parse_ninja(filepath):
         i = 0
         while i < len(lines):
             line = lines[i].rstrip("\n")
+
+            # Handle ninja line continuations: a trailing $ joins the next
+            # line (stripping leading whitespace from the continuation).
+            while line.endswith("$") and i + 1 < len(lines):
+                i += 1
+                line = line[:-1] + lines[i].strip()
 
             if not line or line.startswith("#"):
                 i += 1
@@ -378,7 +392,10 @@ def normalize_linker_flag(tok):
             elif "--strip" in part:
                 result.add(f"-Wl,{part}")
             elif part and not part.startswith("/"):
-                # Skip bare paths (rpath values, library search paths)
+                # Skip absolute paths (rpath values, library search paths) —
+                # these are build-dir-dependent and normalized separately.
+                # Keep remaining symbolic sub-parts (the catch-all for flags
+                # not handled by the specific branches above).
                 result.add(f"-Wl,{part}")
         return result
     if tok.startswith("-Xlinker "):
@@ -539,6 +556,9 @@ def _is_link_rule(rule):
 
     Excludes link_stripped rules which are just stripped copies of the
     unstripped targets (configure.py creates both variants).
+    Note: this guards against the *rule name* containing "stripped".
+    Callers may additionally filter *output paths* ending in ".stripped" —
+    those are separate guards against different things.
     """
     rl = rule.lower()
     return ("link" in rl and "static" not in rl and "shared" not in rl
@@ -793,7 +813,7 @@ def extract_cmake_idl_outputs(builds):
     return result
 
 
-def compare_idl_outputs(conf_idls, cmake_idls, verbose=False, quiet=False):
+def compare_idl_outputs(conf_idls, cmake_idls, quiet=False):
     """Compare IDL-generated file sets between both build systems.
 
     Returns (ok, summary_dict).
@@ -1039,8 +1059,6 @@ def compare_link_settings(conf_targets, cmake_targets, internal_libs,
     """
     common = sorted(set(conf_targets) & set(cmake_targets))
 
-    # Standalone tools that have known structural differences
-    _CPP_APPS = {"patchelf"}
 
     flag_diffs = 0
     lib_diffs = 0
@@ -1222,7 +1240,7 @@ def compare_mode(mode, repo_root, conf_parsed, cmake_parsed,
     cmake_idls = extract_cmake_idl_outputs(cmake_builds)
 
     idl_ok, idl_summary = compare_idl_outputs(
-        conf_idls, cmake_idls, verbose, quiet)
+        conf_idls, cmake_idls, quiet)
     if not idl_ok:
         all_ok = False
 
@@ -1547,6 +1565,11 @@ def main():
 
     has_failures = any(v[0] is False for v in results.values())
     all_pass = all(v[0] is True for v in results.values())
+
+    # Precedence: failures (exit 1) > all pass (exit 0) > partial skip (exit 2).
+    # When the canary fails, skipped modes have status None, so has_failures
+    # is True and we exit 1 — the "could not be compared" branch (exit 2) is
+    # only reached when there are no failures but some modes were skipped.
 
     if has_failures:
         if not quiet:
