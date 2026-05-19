@@ -12,7 +12,7 @@ from test.pylib.manager_client import ManagerClient
 from test.pylib.rest_client import inject_error_one_shot, HTTPError, read_barrier
 from test.pylib.util import wait_for_cql_and_get_hosts, unique_name, wait_for
 from test.pylib.tablets import get_tablet_replica, get_all_tablet_replicas, get_tablet_count, TabletReplicas
-from test.cluster.util import reconnect_driver, create_new_test_keyspace, new_test_keyspace, get_topology_version
+from test.cluster.util import reconnect_driver, create_new_test_keyspace, new_test_keyspace, get_topology_version, make_cfg, make_ks_opts
 from test.cqlpy.cassandra_tests.validation.entities.secondary_index_test import dotestCreateAndDropIndex
 
 import pytest
@@ -151,12 +151,13 @@ async def test_tablet_metadata_propagates_with_schema_changes_in_snapshot_mode(m
                 conn_logger.setLevel(logging.INFO)
 
 
-async def test_scans(manager: ManagerClient):
+async def test_scans(manager: ManagerClient, tablet_storage):
     logger.info("Bootstrapping cluster")
-    servers = await manager.servers_add(3)
+    cfg = make_cfg(tablet_storage)
+    servers = await manager.servers_add(3, config=cfg)
 
     cql = manager.get_cql()
-    async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 1} AND tablets = {'initial': 8}") as ks:
+    async with new_test_keyspace(manager, make_ks_opts(tablet_storage, rf=1, initial_tablets=8)) as ks:
         await cql.run_async(f"CREATE TABLE {ks}.test (pk int PRIMARY KEY, c int);")
 
         keys = range(100)
@@ -169,6 +170,31 @@ async def test_scans(manager: ManagerClient):
         assert len(rows) == len(keys)
         for r in rows:
             assert r.c == r.pk
+
+        # Flush and re-read to exercise reading from SSTables (important for
+        # object-storage where data lives in S3/GCS after flush).
+        for s in servers:
+            await manager.api.flush_keyspace(s.ip_addr, ks)
+
+        rows = await cql.run_async(f"SELECT * FROM {ks}.test BYPASS CACHE;")
+        assert len(rows) == len(keys)
+        for r in rows:
+            assert r.c == r.pk
+
+        # Point queries exercise create_single_key_sstable_reader which uses
+        # deferred readers to avoid opening all SSTables at once on object
+        # storage.  Insert additional data and flush again to create multiple
+        # SSTables so the single-key path must merge across them.
+        extra_keys = range(100, 200)
+        await asyncio.gather(*[cql.run_async(f"INSERT INTO {ks}.test (pk, c) VALUES ({k}, {k});") for k in extra_keys])
+        for s in servers:
+            await manager.api.flush_keyspace(s.ip_addr, ks)
+
+        for k in [0, 50, 99, 100, 150, 199]:
+            rows = await cql.run_async(f"SELECT * FROM {ks}.test WHERE pk = {k} BYPASS CACHE;")
+            assert len(rows) == 1
+            assert rows[0].pk == k
+            assert rows[0].c == k
 
 
 async def test_table_drop_with_auto_snapshot(manager: ManagerClient):

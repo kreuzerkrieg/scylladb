@@ -774,6 +774,69 @@ using sstable_reader_factory_type = std::function<mutation_reader(shared_sstable
 
 static logging::logger irclogger("incremental_reader_selector");
 
+// A mutation_reader wrapper that defers creation of the underlying SSTable
+// reader until the first read attempt. This prevents S3 downloads from
+// starting immediately when readers are created during range scans over many
+// SSTables. Without this, creating N readers at once spawns N background
+// download fibers (via chunked_download_source) that compete for connections
+// and memory, leading to resource exhaustion on object storage.
+class deferred_sstable_reader final : public mutation_reader::impl {
+    seastar::noncopyable_function<mutation_reader()> _factory;
+    mutation_reader_opt _reader;
+private:
+    void ensure_underlying_reader() {
+        if (!_reader) {
+            _reader = _factory();
+        }
+    }
+public:
+    deferred_sstable_reader(schema_ptr schema,
+                           reader_permit permit,
+                           seastar::noncopyable_function<mutation_reader()> factory)
+        : impl(std::move(schema), std::move(permit))
+        , _factory(std::move(factory))
+        , _reader()
+    {}
+
+    virtual future<> fill_buffer() override {
+        ensure_underlying_reader();
+        return _reader->fill_buffer().then([this] {
+            _reader->move_buffer_content_to(*this);
+            _end_of_stream = _reader->is_end_of_stream();
+        });
+    }
+
+    virtual future<> next_partition() override {
+        clear_buffer_to_next_partition();
+        if (is_buffer_empty() && !is_end_of_stream()) {
+            ensure_underlying_reader();
+            return _reader->next_partition();
+        }
+        return make_ready_future<>();
+    }
+
+    virtual future<> fast_forward_to(const dht::partition_range& pr) override {
+        ensure_underlying_reader();
+        clear_buffer();
+        _end_of_stream = false;
+        return _reader->fast_forward_to(pr);
+    }
+
+    virtual future<> fast_forward_to(position_range pr) override {
+        ensure_underlying_reader();
+        clear_buffer();
+        _end_of_stream = false;
+        return _reader->fast_forward_to(std::move(pr));
+    }
+
+    virtual future<> close() noexcept override {
+        if (_reader) {
+            return _reader->close();
+        }
+        return make_ready_future<>();
+    }
+};
+
 // Incremental selector implementation for combined_mutation_reader that
 // selects readers on-demand as the read progresses through the token
 // range.
@@ -784,10 +847,12 @@ class incremental_reader_selector : public reader_selector {
     std::optional<sstable_set::incremental_selector> _selector;
     std::unordered_set<generation_type> _read_sstable_gens;
     sstable_reader_factory_type _fn;
+    reader_permit _permit;
 
     mutation_reader create_reader(shared_sstable sst) {
         tracing::trace(_trace_state, "Reading partition range {} from sstable {}", *_pr, seastar::value_of([&sst] { return sst->get_filename(); }));
-        return _fn(sst, *_pr);
+        return make_mutation_reader<deferred_sstable_reader>(_s, _permit,
+            [this, sst = std::move(sst)] () mutable { return _fn(sst, *_pr); });
     }
 
     dht::ring_position_view pr_end() const {
@@ -802,13 +867,15 @@ public:
             lw_shared_ptr<const sstable_set> sstables,
             const dht::partition_range& pr,
             tracing::trace_state_ptr trace_state,
-            sstable_reader_factory_type fn)
+            sstable_reader_factory_type fn,
+            reader_permit permit)
         : reader_selector(s, pr.start() ? pr.start()->value() : dht::ring_position_view::min(), sstables->size())
         , _pr(&pr)
         , _sstables(std::move(sstables))
         , _trace_state(std::move(trace_state))
         , _selector(_sstables->make_incremental_selector())
-        , _fn(std::move(fn)) {
+        , _fn(std::move(fn))
+        , _permit(std::move(permit)) {
 
         irclogger.trace("{}: created for range: {} with {} sstables",
                 fmt::ptr(this),
@@ -984,8 +1051,11 @@ sstable_set_impl::create_single_key_sstable_reader(
     auto readers = filter_sstable_for_reader_by_ck(std::move(selected_sstables), *cf, schema, slice)
         | std::views::transform([&] (const shared_sstable& sstable) {
             tracing::trace(trace_state, "Reading key {} from sstable {}", pos, seastar::value_of([&sstable] { return sstable->get_filename(); }));
-            return sstable->make_reader(schema, permit, pr, slice, trace_state, fwd, mutation_reader::forwarding::yes,
-                default_read_monitor(), integrity, &hash);
+            return make_mutation_reader<deferred_sstable_reader>(schema, permit,
+                [schema, permit, &pr, &slice, trace_state, fwd, integrity, hash, sstable] () {
+                    return sstable->make_reader(schema, permit, pr, slice, trace_state, fwd, mutation_reader::forwarding::yes,
+                        default_read_monitor(), integrity, &hash);
+                });
           })
         | std::ranges::to<std::vector<mutation_reader>>();
 
@@ -1383,11 +1453,12 @@ sstable_set::make_range_sstable_reader(
             (shared_sstable& sst, const dht::partition_range& pr) mutable {
         return sst->make_reader(s, permit, pr, slice, trace_state, fwd, fwd_mr, monitor_generator(sst), integrity);
     };
-    return make_combined_reader(s, std::move(permit), std::make_unique<incremental_reader_selector>(s,
+    return make_combined_reader(s, permit, std::make_unique<incremental_reader_selector>(s,
                     shared_from_this(),
                     pr,
                     std::move(trace_state),
-                    std::move(reader_factory_fn)),
+                    std::move(reader_factory_fn),
+                    permit),
             fwd,
             fwd_mr);
 }
@@ -1424,11 +1495,12 @@ sstable_set::make_local_shard_sstable_reader(
         auto sst = *sstables->begin();
         return reader_factory_fn(sst, pr);
     }
-    return make_combined_reader(s, std::move(permit), std::make_unique<incremental_reader_selector>(s,
+    return make_combined_reader(s, permit, std::make_unique<incremental_reader_selector>(s,
                     shared_from_this(),
                     pr,
                     std::move(trace_state),
-                    std::move(reader_factory_fn)),
+                    std::move(reader_factory_fn),
+                    permit),
             fwd,
             fwd_mr,
             statistics);

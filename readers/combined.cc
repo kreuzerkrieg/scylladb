@@ -7,6 +7,7 @@
  */
 
 #include <seastar/core/coroutine.hh>
+#include <seastar/core/loop.hh>
 #include <seastar/core/when_all.hh>
 
 #include "readers/empty.hh"
@@ -381,7 +382,12 @@ future<mutation_reader_merger::needs_merge> mutation_reader_merger::advance_gall
 }
 
 future<> mutation_reader_merger::prepare_next() {
-    return parallel_for_each(_next, [this] (reader_and_last_fragment_kind rk) {
+    // Limit concurrency to avoid overwhelming object-storage backends (S3)
+    // when many SSTables are read simultaneously. For local SSTables whose
+    // fill_buffer() returns a ready future, max_concurrent_for_each behaves
+    // like parallel_for_each with negligible overhead.
+    static constexpr size_t max_reader_prepare_concurrency = 16;
+    return max_concurrent_for_each(_next, max_reader_prepare_concurrency, [this] (reader_and_last_fragment_kind rk) {
         return prepare_one(rk, reader_galloping::no).discard_result();
     }).then([this] {
         _next.clear();
