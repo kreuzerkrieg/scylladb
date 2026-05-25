@@ -786,7 +786,6 @@ class deferred_sstable_reader final : public mutation_reader::impl {
 private:
     void ensure_underlying_reader() {
         if (!_reader) {
-            irclogger.info("[DEFERRED_READER] opening underlying reader for {:p} (S3 download starts now)", fmt::ptr(this));
             _reader = _factory();
         }
     }
@@ -797,9 +796,7 @@ public:
         : impl(std::move(schema), std::move(permit))
         , _factory(std::move(factory))
         , _reader()
-    {
-        irclogger.info("[DEFERRED_READER] created wrapper {:p} (underlying not yet open)", fmt::ptr(this));
-    }
+    {}
 
     virtual future<> fill_buffer() override {
         ensure_underlying_reader();
@@ -834,10 +831,8 @@ public:
 
     virtual future<> close() noexcept override {
         if (_reader) {
-            irclogger.info("[DEFERRED_READER] closing {:p} (underlying was open)", fmt::ptr(this));
             return _reader->close();
         }
-        irclogger.info("[DEFERRED_READER] closing {:p} (underlying was never opened)", fmt::ptr(this));
         return make_ready_future<>();
     }
 };
