@@ -102,7 +102,7 @@ public:
         return _client->make_upload_sink(name.str(), as);
     }
     data_source make_download_source(object_name name, abort_source* as) override {
-        return _client->make_chunked_download_source(name.str(), s3::full_range, as);
+        return _client->make_greedy_download_source(name.str(), s3::full_range, as);
     }
     future<bool> object_exists(object_name name, abort_source* as) override {
         return _client->object_exists(name.str(), as);

@@ -766,7 +766,7 @@ void test_chunked_download_data_source(const client_maker_function& client_maker
     cln->upload_file(file_path, object_name).get();
 
     testlog.info("Download object");
-    auto in = input_stream<char>(cln->make_chunked_download_source(object_name, s3::full_range));
+    auto in = input_stream<char>(cln->make_greedy_download_source(object_name, s3::full_range));
     auto close = seastar::deferred_close(in);
 
     file rf = open_file_dma(file_path.native(), open_flags::ro).get();
@@ -795,7 +795,7 @@ void test_chunked_download_data_source(const client_maker_function& client_maker
     BOOST_REQUIRE_EQUAL(total_size, object_size);
 #ifdef SCYLLA_ENABLE_ERROR_INJECTION
     utils::get_local_injector().enable("kill_s3_inflight_req");
-    auto in_throw = input_stream<char>(cln->make_chunked_download_source(object_name, s3::full_range));
+    auto in_throw = input_stream<char>(cln->make_greedy_download_source(object_name, s3::full_range));
     auto close_throw = seastar::deferred_close(in_throw);
 
     auto reader = [&in_throw] {
