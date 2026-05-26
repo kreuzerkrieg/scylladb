@@ -692,6 +692,7 @@ scylla_tests = set([
     'test/perf/perf_row_cache_reads',
     'test/perf/logalloc',
     'test/perf/perf_s3_client',
+    'test/perf/perf_s3_downloader',
     'test/unit/lsa_async_eviction_test',
     'test/unit/lsa_sync_eviction_test',
     'test/unit/row_cache_alloc_stress_test',
