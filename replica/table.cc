@@ -105,9 +105,17 @@ table::make_sstable_reader(schema_ptr s,
     // consequence, fast_forward_to() will *NOT* work on the result,
     // regardless of what the fwd_mr parameter says.
     if (pr.is_singular() && pr.start()->value().has_key()) {
+        const auto& ck_ranges = slice.default_row_ranges();
+        const char* dir = slice.is_reversed() ? "_rev" : "_fwd";
+        if (ck_ranges.empty()) {
+            tlogger.info("[READER:pk_full{}] {}.{}", dir, s->ks_name(), s->cf_name());
+        } else {
+            tlogger.info("[READER:pk_ck{}] {}.{}: {} ck range(s)", dir, s->ks_name(), s->cf_name(), ck_ranges.size());
+        }
         return sstables->create_single_key_sstable_reader(const_cast<column_family*>(this), std::move(s), std::move(permit),
                 _stats.estimated_sstable_per_read, pr, slice, std::move(trace_state), fwd, fwd_mr, predicate, integrity);
     } else {
+        tlogger.info("[READER:range_scan] {}.{}", s->ks_name(), s->cf_name());
         return sstables->make_local_shard_sstable_reader(std::move(s), std::move(permit), pr, slice,
                 std::move(trace_state), fwd, fwd_mr, sstables::default_read_monitor_generator(), predicate, nullptr, integrity);
     }

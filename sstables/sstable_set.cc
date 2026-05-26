@@ -23,8 +23,33 @@
 #include "readers/from_mutations.hh"
 #include "readers/empty.hh"
 #include "readers/combined.hh"
+#include "readers/delegating_impl.hh"
 
 namespace sstables {
+
+/// Wraps a combined sstable reader and emits a debug log line when the reader
+/// is closed, recording how many underlying SSTable readers are being released.
+class logging_close_reader : public delegating_reader {
+    size_t _num_sst_readers;
+    sstring _ks;
+    sstring _cf;
+    sstring _pk;
+    static logging::logger& _log;
+public:
+    logging_close_reader(mutation_reader&& r, size_t num_sst_readers,
+                         sstring ks, sstring cf, sstring pk)
+        : delegating_reader(std::move(r))
+        , _num_sst_readers(num_sst_readers)
+        , _ks(std::move(ks))
+        , _cf(std::move(cf))
+        , _pk(std::move(pk))
+    {}
+    future<> close() noexcept override {
+        _log.info("[SURVIVORS:close] {}.{} pk={}: releasing {} sst reader(s)",
+                   _ks, _cf, _pk, _num_sst_readers);
+        return delegating_reader::close();
+    }
+};
 
 extern logging::logger sstlog;
 
@@ -773,6 +798,7 @@ sstable_set make_partitioned_sstable_set(schema_ptr schema, dht::token_range tok
 using sstable_reader_factory_type = std::function<mutation_reader(shared_sstable&, const dht::partition_range& pr)>;
 
 static logging::logger irclogger("incremental_reader_selector");
+logging::logger& logging_close_reader::_log = irclogger;
 
 // Incremental selector implementation for combined_mutation_reader that
 // selects readers on-demand as the read progresses through the token
@@ -976,9 +1002,13 @@ sstable_set_impl::create_single_key_sstable_reader(
 {
     const auto& pos = pr.start()->value();
     auto hash = utils::make_hashed_key(static_cast<bytes_view>(key::from_partition_key(*schema, *pos.key())));
-    auto selected_sstables = filter_sstable_for_reader(select(pr), *schema, pos, hash, predicate);
+    auto candidates = select(pr);
+    auto num_candidates = candidates.size();
+    auto selected_sstables = filter_sstable_for_reader(std::move(candidates), *schema, pos, hash, predicate);
     auto num_sstables = selected_sstables.size();
     if (!num_sstables) {
+        irclogger.info("[SURVIVORS] {}.{} pk={}: candidates={} after_bloom=0 after_ck_filter=0",
+                schema->ks_name(), schema->cf_name(), pos, num_candidates);
         return make_empty_mutation_reader(schema, permit);
     }
     auto readers = filter_sstable_for_reader_by_ck(std::move(selected_sstables), *cf, schema, slice)
@@ -998,11 +1028,15 @@ sstable_set_impl::create_single_key_sstable_reader(
     // to make_combined_reader to ensure partition_start/end are emitted even if
     // all sstables actually containing the partition were filtered.
     auto num_readers = readers.size();
+    irclogger.info("[SURVIVORS] {}.{} pk={}: candidates={} after_bloom={} after_ck_filter={}",
+            schema->ks_name(), schema->cf_name(), pos, num_candidates, num_sstables, num_readers);
     if (num_readers != num_sstables) {
         readers.push_back(make_mutation_reader_from_mutations(schema, permit, mutation(schema, *pos.key()), slice, fwd));
     }
     sstable_histogram.add(num_readers);
-    return make_combined_reader(schema, std::move(permit), std::move(readers), fwd, fwd_mr);
+    auto combined = make_combined_reader(schema, permit, std::move(readers), fwd, fwd_mr);
+    return make_mutation_reader<logging_close_reader>(std::move(combined), num_readers,
+            schema->ks_name(), schema->cf_name(), format("{}", pos));
 }
 
 mutation_reader
@@ -1047,6 +1081,8 @@ time_series_sstable_set::create_single_key_sstable_reader(
     auto it = std::find_if(_sstables->begin(), _sstables->end(), [&] (const sst_entry& e) { return sst_filter(*e.second); });
     if (it == _sstables->end()) {
         // No sstables contain data for the queried partition.
+        irclogger.info("[SURVIVORS:twcs_lazy] {}.{} pk={}: total_sstables={} after_bloom=0 (empty, TWCS lazy path)",
+                schema->ks_name(), schema->cf_name(), pos, _sstables->size());
         return make_empty_mutation_reader(std::move(schema), std::move(permit));
     }
 
@@ -1064,7 +1100,8 @@ time_series_sstable_set::create_single_key_sstable_reader(
     // We're going to pass this filter into sstable_position_reader_queue. The queue guarantees that
     // the filter is going to be called at most once for each sstable and exactly once after
     // the queue is exhausted. We use that fact to gather statistics.
-    auto filter = [pk_filter = std::move(pk_filter), ck_filter = std::move(ck_filter), &stats]
+    auto filter = [pk_filter = std::move(pk_filter), ck_filter = std::move(ck_filter), &stats,
+                   ks = schema->ks_name(), cf_name = schema->cf_name(), &pos]
         (const sstable& sst) {
             if (!pk_filter(sst)) {
                 return false;
@@ -1073,11 +1110,16 @@ time_series_sstable_set::create_single_key_sstable_reader(
             ++stats.sstables_checked_by_clustering_filter;
             if (ck_filter(sst)) {
                 ++stats.surviving_sstables_after_clustering_filter;
+                irclogger.info("[SURVIVORS:twcs_lazy] {}.{} pk={}: opened reader for sstable {}",
+                        ks, cf_name, pos, sst.get_filename());
                 return true;
             }
 
             return false;
     };
+
+    irclogger.info("[SURVIVORS:twcs_lazy] {}.{} pk={}: total_sstables={} (TWCS lazy path, readers opened on demand)",
+            schema->ks_name(), schema->cf_name(), pos, _sstables->size());
 
     auto reversed = slice.is_reversed();
     // Note that `sstable_position_reader_queue` always includes a reader which emits a `partition_start` fragment,
