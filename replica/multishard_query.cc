@@ -819,7 +819,15 @@ future<foreign_ptr<lw_shared_ptr<typename ResultBuilder::result_type>>> do_query
 
     std::vector<foreign_ptr<lw_shared_ptr<typename ResultBuilder::result_type>>> results;
     locator::tablet_range_splitter range_splitter{s, tablets, this_node_id, ranges};
+    // unsigned tablet_iterations = 0;
+    // mq_log.info("QPROBE tablets page-begin uuid={} is_first_page={} nranges={} range_front={} row_limit={} partition_limit={}",
+    //         cmd.query_uuid, bool(cmd.is_first_page), ranges.size(),
+    //         ranges.empty() ? sstring("none") : format("{}", ranges.front()),
+    //         cmd.get_row_limit(), cmd.partition_limit);
     while (auto range_opt = range_splitter()) {
+        // ++tablet_iterations;
+        // mq_log.info("QPROBE tablets dispatch uuid={} iter={} shard={} range={}",
+        //         cmd.query_uuid, tablet_iterations, range_opt->shard, range_opt->range);
         auto& r = *results.emplace_back(co_await db.invoke_on(range_opt->shard,
                     [&result_builder, gs = global_schema_ptr(s), &query_cmd, &range_opt, gts = tracing::global_trace_state_ptr(trace_state), timeout] (replica::database& db) {
             return result_builder.query(db, gs, query_cmd, range_opt->range, gts, timeout);
@@ -829,10 +837,16 @@ future<foreign_ptr<lw_shared_ptr<typename ResultBuilder::result_type>>> do_query
         query_cmd.partition_limit -= std::min(query_cmd.partition_limit, ResultBuilder::get_partition_count(r));
         query_cmd.set_row_limit(query_cmd.get_row_limit() - std::min(query_cmd.get_row_limit(), ResultBuilder::get_row_count(r)));
 
+        // mq_log.info("QPROBE tablets result uuid={} iter={} rows={} parts={} short_read={} row_limit_left={}",
+        //         cmd.query_uuid, tablet_iterations, ResultBuilder::get_row_count(r), ResultBuilder::get_partition_count(r),
+        //         bool(r.is_short_read()), query_cmd.get_row_limit());
+
         if (!query_cmd.partition_limit || !query_cmd.get_row_limit() || r.is_short_read()) {
             break;
         }
     }
+
+    // mq_log.info("QPROBE tablets page-end uuid={} tablet_iterations={}", cmd.query_uuid, tablet_iterations);
 
     co_return result_builder.merge(std::move(results));
 }

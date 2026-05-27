@@ -6439,6 +6439,11 @@ storage_proxy::query_partition_key_range_concurrent(storage_proxy::clock_type::t
         // get stuck on 0 and never increased too much if the number of results remains small.
         concurrency_factor = std::max(size_t(1), ranges.size());
 
+        // slogger.info("QPROBE pkr iter uuid={} cf={} nranges={} front={} back={}",
+                // cmd->query_uuid, concurrency_factor, ranges.size(),
+                // ranges.empty() ? sstring("none") : format("{}", ranges.front()),
+                // ranges.empty() ? sstring("none") : format("{}", ranges.back()));
+
         while (i != ranges.end()) {
             co_await utils::get_local_injector().inject(
                 "query_partition_key_range_concurrent_scan_pause",
@@ -6589,6 +6594,8 @@ storage_proxy::query_partition_key_range_concurrent(storage_proxy::clock_type::t
         remaining_row_count -= result->row_count().value();
         remaining_partition_count -= result->partition_count().value();
         results.emplace_back(std::move(result));
+        // slogger.info("QPROBE pkr iter-result uuid={} dispatched={} rows_this_iter={} remaining_rows={} ranges_exhausted={}",
+                // cmd->query_uuid, exec.size(), results.back()->row_count().value(), remaining_row_count, ranges_to_vnodes.empty());
         if (ranges_to_vnodes.empty() || !remaining_row_count || !remaining_partition_count) {
             auto used_replicas = replicas_per_token_range();
             for (auto& e : exec) {
@@ -6627,6 +6634,10 @@ storage_proxy::query_partition_key_range(lw_shared_ptr<query::read_command> cmd,
 
     int result_rows_per_range = 0;
     int concurrency_factor = 1;
+
+    // slogger.info("QPROBE pkr page-begin uuid={} row_limit={} part_limit={} uses_tablets={}",
+            // cmd->query_uuid, cmd->get_row_limit(), cmd->partition_limit,
+            // erm->get_replication_strategy().uses_tablets());
 
     slogger.debug("Estimated result rows per range: {}; requested rows: {}, concurrent range requests: {}",
             result_rows_per_range, cmd->get_row_limit(), concurrency_factor);

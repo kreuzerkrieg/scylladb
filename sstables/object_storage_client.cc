@@ -101,8 +101,8 @@ public:
     data_sink make_upload_sink(object_name name, abort_source* as) override {
         return _client->make_upload_sink(name.str(), as);
     }
-    data_source make_download_source(object_name name, abort_source* as) override {
-        return _client->make_chunked_download_source(name.str(), s3::full_range, as);
+    data_source make_download_source(object_name name, uint64_t offset, uint64_t len, abort_source* as) override {
+        return _client->make_chunked_download_source(name.str(), {offset, len}, as);
     }
     future<bool> object_exists(object_name name, abort_source* as) override {
         return _client->object_exists(name.str(), as);
@@ -185,7 +185,7 @@ public:
     data_sink make_upload_sink(object_name name, abort_source* as) override {
         return _client->create_upload_sink(name.bucket(), name.object(), {}, as);
     }
-    data_source make_download_source(object_name name, abort_source* as) override {
+    data_source make_download_source(object_name name, uint64_t offset, uint64_t len, abort_source* as) override {
         return _client->create_download_source(name.bucket(), name.object(), as);
     }
     future<bool> object_exists(object_name name, abort_source* as) override {

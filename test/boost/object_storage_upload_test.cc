@@ -82,7 +82,7 @@ future<> test_file_upload(test_env_config cfg, size_t size) {
 
         client->upload_file(path, name, up).get();
 
-        auto source = client->make_download_source(name);
+        auto source = client->make_download_source(name, 0, std::numeric_limits<uint64_t>::max());
         auto is1 = make_file_input_stream(seastar::open_file_dma(path.string(), open_flags::ro).get());
         auto is2 = input_stream<char>(std::move(source));
 

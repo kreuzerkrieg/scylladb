@@ -144,7 +144,9 @@ future<data_source> filesystem_storage::make_data_or_index_source(sstable& sst, 
     co_return co_await make_source(sst, type, std::move(f), offset, len, std::move(opt));
 }
 
-future<data_source> filesystem_storage::make_source(sstable&, component_type type, file f, uint64_t offset, uint64_t len, file_input_stream_options opt) const {
+future<data_source> filesystem_storage::make_source(sstable& sst, component_type type, file f, uint64_t offset, uint64_t len, file_input_stream_options opt) const {
+    auto comp_name = sstable_version_constants::get_component_map(sst.get_version()).at(type);
+    sstlog.info("make_source: filesystem path for {}/{} offset={} len={}", sst.generation(), comp_name, offset, len);
     co_return make_file_data_source(std::move(f), offset, len, std::move(opt));
 }
 
@@ -819,7 +821,7 @@ object_storage_base::make_data_or_index_source(sstable& sst, component_type type
 
 future<data_source>
 object_storage_base::make_source(sstable& sst, component_type type, file f, uint64_t offset, uint64_t len, file_input_stream_options) const {
-    co_return co_await maybe_wrap_source(sst, type, _client->make_download_source(make_object_name(sst, type), abort_source()), offset, len);
+    co_return co_await maybe_wrap_source(sst, type, _client->make_download_source(make_object_name(sst, type), offset, len, abort_source()), 0, len);
 }
 
 future<data_source>
@@ -829,13 +831,10 @@ s3_storage::make_data_or_index_source(sstable& sst, component_type type, file f,
 
 future<data_source>
 s3_storage::make_source(sstable& sst, component_type type, file f, uint64_t offset, uint64_t len, file_input_stream_options options) const {
-    if (offset == 0) {
-        co_return co_await object_storage_base::make_source(sst, type, std::move(f), offset, len, std::move(options));
-    }
-    // Reuse the file passed in by the caller.The file is already wrapped with
-    // the configured file_io_extensions (applied at open_component time), so
-    // no further wrapping is needed.
-    co_return make_file_data_source(std::move(f), offset, len, std::move(options));
+    auto comp_name = sstable_version_constants::get_component_map(sst.get_version()).at(type);
+    sstlog.info("make_source: chunked_download path for {}/{} offset={} len={}", sst.generation(), comp_name, offset, len);
+    co_return co_await object_storage_base::make_source(sst, type, std::move(f), offset, len, std::move(options));
+    // co_return make_file_data_source(std::move(f), offset, len, std::move(options));
 }
 
 future<data_sink> object_storage_base::make_component_sink(sstable& sst, component_type type, open_flags oflags, file_output_stream_options options) {

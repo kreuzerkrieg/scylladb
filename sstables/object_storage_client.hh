@@ -77,7 +77,7 @@ public:
     virtual file make_readable_file(object_name, abort_source* = nullptr) = 0;
     virtual data_sink make_data_upload_sink(object_name, std::optional<unsigned> max_parts_per_piece, abort_source* = nullptr) = 0;
     virtual data_sink make_upload_sink(object_name, abort_source* = nullptr) = 0;
-    virtual data_source make_download_source(object_name, abort_source* = nullptr) = 0;
+    virtual data_source make_download_source(object_name, uint64_t offset, uint64_t len, abort_source* = nullptr) = 0;
     virtual future<bool> object_exists(object_name name, abort_source* as = nullptr) = 0;
 
     virtual abstract_lister make_object_lister(std::string bucket, std::string prefix, lister::filter_type) = 0;

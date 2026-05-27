@@ -1140,7 +1140,7 @@ future<size_t> populate_snapshot_sstables_from_manifests(sstables::storage_manag
     co_await seastar::max_concurrent_for_each(manifest_prefixes, 16, [&] (const sstring& manifest_prefix) {
         // Download the manifest JSON file
         sstables::object_name name(bucket, manifest_prefix);
-        auto source = client->make_download_source(name);
+        auto source = client->make_download_source(name, 0, std::numeric_limits<uint64_t>::max());
         return seastar::with_closeable(input_stream<char>(std::move(source)), [&] (input_stream<char>& is) {
             return process_manifest(is, keyspace, table, expected_snapshot_name, manifest_prefix, sys_dist_ks, cl).then([&](size_t count) {
                 if (!tablet_count) {

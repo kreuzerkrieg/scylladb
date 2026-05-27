@@ -246,6 +246,7 @@ void querier_cache::insert_querier(
     // current partition when the page ends so it cannot be reused across
     // pages.
     if (q.is_reversed()) {
+        qlogger.info("QPROBE insert SKIP-reversed key={}", key);
         (void)with_gate(_closing_gate, [q = std::move(q)] () mutable {
             return q.close().finally([q = std::move(q)] {});
         });
@@ -261,6 +262,7 @@ void querier_cache::insert_querier(
     auto irh = sem.register_inactive_read(querier_utils::get_reader(q));
     if (!irh) {
         ++stats.resource_based_evictions;
+        qlogger.info("QPROBE insert EVICT-on-register key={}", key);
         return;
     }
   try {
@@ -271,21 +273,25 @@ void querier_cache::insert_querier(
     auto it = index.emplace(key, std::make_unique<Querier>(std::move(q)));
 
     ++stats.population;
+    qlogger.info("QPROBE insert OK key={}", key);
     auto cleanup_index = defer([&] () noexcept {
         index.erase(it);
         --stats.population;
     });
 
-    auto notify_handler = [&stats, &index, it] (reader_concurrency_semaphore::evict_reason reason) {
+    auto notify_handler = [&stats, &index, key, it] (reader_concurrency_semaphore::evict_reason reason) {
         index.erase(it);
         switch (reason) {
             case reader_concurrency_semaphore::evict_reason::permit:
                 ++stats.resource_based_evictions;
+                qlogger.info("QPROBE evict key={} reason=resource", key);
                 break;
             case reader_concurrency_semaphore::evict_reason::time:
                 ++stats.time_based_evictions;
+                qlogger.info("QPROBE evict key={} reason=ttl", key);
                 break;
             case reader_concurrency_semaphore::evict_reason::manual:
+                qlogger.info("QPROBE evict key={} reason=manual", key);
                 break;
         }
         --stats.population;
@@ -336,6 +342,7 @@ std::optional<Querier> querier_cache::lookup_querier(
     ++stats.lookups;
     if (!base_ptr) {
         ++stats.misses;
+        qlogger.info("QPROBE lookup MISS key={} range={}", key, ranges.front());
         return std::nullopt;
     }
 
@@ -355,10 +362,17 @@ std::optional<Querier> querier_cache::lookup_querier(
     const auto can_be_used = can_be_used_for_page(_is_user_semaphore_func, q, s, ranges.front(), slice, current_sem);
     if (can_be_used == can_use::yes) {
         tracing::trace(trace_state, "Reusing querier");
+        // qlogger.info("QPROBE lookup HIT key={} range={}", key, ranges.front());
         return std::optional<Querier>(std::move(q));
     }
 
     tracing::trace(trace_state, "Dropping querier because {}", cannot_use_reason(can_be_used));
+    // qlogger.info("QPROBE lookup DROP key={} range={} reason={}", key, ranges.front(), cannot_use_reason(can_be_used));
+    // if (const auto saved = q.current_position()) {
+        // qlogger.info("QPROBE drop-detail key={} saved_partition={} saved_pos={}", key, saved->partition, saved->position);
+    // } else {
+        // qlogger.info("QPROBE drop-detail key={} saved_position=none", key);
+    // }
     ++stats.drops;
 
     auto permit = q.permit();
