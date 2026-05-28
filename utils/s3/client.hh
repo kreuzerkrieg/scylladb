@@ -107,7 +107,6 @@ class client : public enable_shared_from_this<client> {
     class upload_sink;
     class upload_jumbo_sink;
     class chunked_download_source;
-    class greedy_download_source;
     class download_source;
     class do_upload_file;
     class readable_file;
@@ -214,7 +213,6 @@ public:
     data_sink make_upload_jumbo_sink(sstring object_name, std::optional<unsigned> max_parts_per_piece = {}, seastar::abort_source* = nullptr);
     data_source make_download_source(sstring object_name, range download_range = s3::full_range, seastar::abort_source* = nullptr);
     data_source make_chunked_download_source(sstring object_name, range range = s3::full_range, seastar::abort_source* = nullptr);
-    data_source make_greedy_download_source(sstring object_name, range range = s3::full_range, seastar::abort_source* = nullptr);
     /// upload a file with specified path to s3
     ///
     /// @param path the path to the file
