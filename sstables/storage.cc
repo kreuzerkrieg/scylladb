@@ -144,7 +144,9 @@ future<data_source> filesystem_storage::make_data_or_index_source(sstable& sst, 
     co_return co_await make_source(sst, type, std::move(f), offset, len, std::move(opt));
 }
 
-future<data_source> filesystem_storage::make_source(sstable&, component_type type, file f, uint64_t offset, uint64_t len, file_input_stream_options opt) const {
+future<data_source> filesystem_storage::make_source(sstable& sst, component_type type, file f, uint64_t offset, uint64_t len, file_input_stream_options opt) const {
+    auto comp_name = sstable_version_constants::get_component_map(sst.get_version()).at(type);
+    sstlog.info("make_source: filesystem path for {}/{} offset={} len={}", sst.generation(), comp_name, offset, len);
     co_return make_file_data_source(std::move(f), offset, len, std::move(opt));
 }
 
@@ -829,6 +831,8 @@ s3_storage::make_data_or_index_source(sstable& sst, component_type type, file f,
 
 future<data_source>
 s3_storage::make_source(sstable& sst, component_type type, file f, uint64_t offset, uint64_t len, file_input_stream_options options) const {
+    auto comp_name = sstable_version_constants::get_component_map(sst.get_version()).at(type);
+    sstlog.info("s3_storage::make_source: object_store path for {}/{} offset={} len={}", sst.generation(), comp_name, offset, len);
     if (offset == 0) {
         co_return co_await object_storage_base::make_source(sst, type, std::move(f), offset, len, std::move(options));
     }
