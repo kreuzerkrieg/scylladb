@@ -463,6 +463,12 @@ future<> client::make_request(http::request req,
     co_await authorize(request);
     auto& gc = co_await find_or_create_client();
 
+    if (auto it = request._headers.find("Range"); it != request._headers.end()) {
+        s3l.info("make_request {} {} Range={}", request._method, request._url, it->second);
+    } else {
+        s3l.info("make_request {} {}", request._method, request._url);
+    }
+
     co_await gc.http.make_request(request, handler, rs, std::nullopt, as).handle_exception([err_handler = std::move(err_handler)](auto ex) {
         err_handler(std::move(ex));
     });
@@ -1932,6 +1938,186 @@ public:
 
 file client::make_readable_file(sstring object_name, seastar::abort_source* as) {
     return file(make_shared<readable_file>(shared_from_this(), std::move(object_name), as));
+}
+
+// A readable_file that serves positional reads from the prefetching
+// chunked_download_source instead of issuing one HTTP GET per read.
+//
+// Unlike client::readable_file (which is stateless and calls
+// get_object_contiguous() for every read_dma, paying one round-trip per
+// buffer), this file keeps a forward-only input_stream over a
+// chunked_download_source whose background fiber prefetches ahead. Reads that
+// advance sequentially (the next pos equals the end of the previous read) are
+// served from the already-downloaded buffers without any new request.
+//
+// When the (offset, length) sub-range to be read is known up front (e.g. from
+// s3_storage::make_source), construct with that range so the prefetching
+// stream starts immediately and the first read needs no extra round trip.
+//
+// Contract: this file is *stateful* and supports only forward access within
+// the range it was constructed with, by a single consumer (e.g.
+// file_input_stream). Concurrent read_dma() calls on the same instance are not
+// supported. A read skips forward within the already-prefetched stream; moving
+// backward, or outside the constructed range, is a programming error and trips
+// a SCYLLA_ASSERT. Use readable_file for scattered random reads.
+class client::buffered_readable_file : public file_impl {
+    shared_ptr<client> _client;
+    sstring _object_name;
+    std::optional<stats> _stats;
+    seastar::abort_source* _as;
+
+    const range _range;
+    input_stream<char> _stream;
+    // Absolute offset of the next byte the stream will yield.
+    uint64_t _stream_pos = 0;
+
+    [[noreturn]] void unsupported() {
+        throw_with_backtrace<std::logic_error>("unsupported operation on s3 buffered readable file");
+    }
+
+    future<> maybe_update_stats() {
+        if (_stats) {
+            return make_ready_future<>();
+        }
+        return _client->get_object_stats(_object_name).then([this] (auto st) {
+            _stats = std::move(st);
+            return make_ready_future<>();
+        });
+    }
+
+    // First absolute offset past the constructed range.
+    uint64_t range_end() const noexcept {
+        return _range.offset() + _range.length();
+    }
+
+    // Advance the stream so its next yielded byte is at absolute offset `pos`.
+    // The stream is forward-only and bounded to the constructed range, so this
+    // only ever moves forward and never reopens the source. A forward gap is
+    // consumed from the already-prefetched data; the walk stops at end of data,
+    // since a consumer that doesn't know the object size (e.g. file_input_stream)
+    // may probe one buffer past the end. read_exactly() returns short/empty at
+    // EOF rather than throwing, unlike input_stream::skip().
+    future<> seek_to(uint64_t pos) {
+        SCYLLA_ASSERT(pos >= _stream_pos);
+        while (_stream_pos < pos) {
+            auto buf = co_await _stream.read_exactly(pos - _stream_pos);
+            if (buf.empty()) {
+                break;
+            }
+            _stream_pos += buf.size();
+        }
+        _stream_pos = pos;
+    }
+
+public:
+    // The prefetching stream starts right away at `download_range` (the whole
+    // object by default) and is bounded to it. Access must move forward and stay
+    // within the range; both invariants are enforced with SCYLLA_ASSERT.
+    buffered_readable_file(shared_ptr<client> cln, sstring object_name, range download_range = s3::full_range, seastar::abort_source* as = nullptr)
+        : _client(std::move(cln))
+        , _object_name(std::move(object_name))
+        , _as(as)
+        , _range(download_range)
+        , _stream(_client->make_chunked_download_source(_object_name, _range, _as))
+        , _stream_pos(_range.offset())
+    {
+    }
+
+    future<size_t> write_dma(uint64_t pos, const void* buffer, size_t len, io_intent*) override { unsupported(); }
+    future<size_t> write_dma(uint64_t pos, std::vector<iovec> iov, io_intent*) override { unsupported(); }
+    future<> truncate(uint64_t length) override { unsupported(); }
+    subscription<directory_entry> list_directory(std::function<future<> (directory_entry de)> next) override { unsupported(); }
+
+    future<> flush(void) override { return make_ready_future<>(); }
+    future<> allocate(uint64_t position, uint64_t length) override { return make_ready_future<>(); }
+    future<> discard(uint64_t offset, uint64_t length) override { return make_ready_future<>(); }
+
+    class buffered_readable_file_handle_impl final : public file_handle_impl {
+        client::handle _h;
+        sstring _object_name;
+
+    public:
+        buffered_readable_file_handle_impl(client::handle h, sstring object_name)
+                : _h(std::move(h))
+                , _object_name(std::move(object_name))
+        {}
+
+        std::unique_ptr<file_handle_impl> clone() const override {
+            return std::make_unique<buffered_readable_file_handle_impl>(_h, _object_name);
+        }
+
+        shared_ptr<file_impl> to_file() && override {
+            // TODO: cannot traverse abort source across shards.
+            return make_shared<buffered_readable_file>(std::move(_h).to_client(), std::move(_object_name));
+        }
+    };
+
+    std::unique_ptr<file_handle_impl> dup() override {
+        return std::make_unique<buffered_readable_file_handle_impl>(client::handle(*_client), _object_name);
+    }
+
+    future<uint64_t> size(void) override {
+        co_await maybe_update_stats();
+        co_return _stats->size;
+    }
+
+    future<struct stat> stat(void) override {
+        co_await maybe_update_stats();
+        struct stat ret {};
+        ret.st_nlink = 1;
+        ret.st_mode = S_IFREG | S_IRUSR | S_IRGRP | S_IROTH;
+        ret.st_size = _stats->size;
+        ret.st_blksize = 1 << 10; // huh?
+        ret.st_blocks = _stats->size >> 9;
+        // objects are immutable on S3, therefore we can use Last-Modified to set both st_mtime and st_ctime
+        ret.st_mtime = _stats->last_modified;
+        ret.st_ctime = _stats->last_modified;
+        co_return ret;
+    }
+
+    // Read up to `len` bytes at absolute offset `pos` into `buffer`, advancing
+    // forward through the prefetched stream. Returns a short count (0 at the end
+    // of the range), as allowed by the file_impl contract.
+    future<size_t> read_dma(uint64_t pos, void* buffer, size_t len, io_intent*) override {
+        SCYLLA_ASSERT(pos >= _range.offset() && pos <= range_end());
+        co_await seek_to(pos);
+        auto buf = co_await _stream.read_exactly(len);
+        std::copy_n(buf.get(), buf.size(), reinterpret_cast<uint8_t*>(buffer));
+        _stream_pos += buf.size();
+        co_return buf.size();
+    }
+
+    future<size_t> read_dma(uint64_t pos, std::vector<iovec> iov, io_intent* intent) override {
+        size_t done = 0;
+        for (auto& v : iov) {
+            auto n = co_await read_dma(pos + done, v.iov_base, v.iov_len, intent);
+            done += n;
+            if (n < v.iov_len) {
+                break;
+            }
+        }
+        co_return done;
+    }
+
+    future<temporary_buffer<uint8_t>> dma_read_bulk(uint64_t offset, size_t range_size, io_intent*) override {
+        SCYLLA_ASSERT(offset >= _range.offset() && offset <= range_end());
+        co_await seek_to(offset);
+        auto buf = co_await _stream.read_exactly(range_size);
+        _stream_pos += buf.size();
+        co_return temporary_buffer<uint8_t>(reinterpret_cast<uint8_t*>(buf.get_write()), buf.size(), buf.release());
+    }
+
+    future<> close() override {
+        co_await _stream.close();
+    }
+};
+
+file client::make_buffered_readable_file(sstring object_name, seastar::abort_source* as) {
+    return file(make_shared<buffered_readable_file>(shared_from_this(), std::move(object_name), s3::full_range, as));
+}
+
+file client::make_buffered_readable_file(sstring object_name, range download_range, seastar::abort_source* as) {
+    return file(make_shared<buffered_readable_file>(shared_from_this(), std::move(object_name), download_range, as));
 }
 
 future<> client::close() {

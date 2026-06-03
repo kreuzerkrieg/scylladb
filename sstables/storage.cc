@@ -833,12 +833,18 @@ future<data_source>
 s3_storage::make_source(sstable& sst, component_type type, file f, uint64_t offset, uint64_t len, file_input_stream_options options) const {
     auto comp_name = sstable_version_constants::get_component_map(sst.get_version()).at(type);
     sstlog.info("s3_storage::make_source: object_store path for {}/{} offset={} len={}", sst.generation(), comp_name, offset, len);
-    if (offset == 0) {
-        co_return co_await object_storage_base::make_source(sst, type, std::move(f), offset, len, std::move(options));
-    }
+    // if (offset == 0) {
+        // co_return co_await object_storage_base::make_source(sst, type, std::move(f), offset, len, std::move(options));
+    // }
     // Reuse the file passed in by the caller.The file is already wrapped with
     // the configured file_io_extensions (applied at open_component time), so
     // no further wrapping is needed.
+    // QPROBE EXPERIMENT (option C): the S3 readable_file path issues one HTTP GET per
+    // file_input_stream buffer (get_object_contiguous reads the whole requested range in a
+    // single GET). The default sstable buffer is 128 KiB, so a large non-zero-offset read
+    // degrades to one S3 GET per 128 KiB, paying RTT each time. Bump the buffer here to
+    // confirm the 128 KiB buffer is the bottleneck.
+    // options.buffer_size = std::max(options.buffer_size, 512_KiB);
     co_return make_file_data_source(std::move(f), offset, len, std::move(options));
 }
 

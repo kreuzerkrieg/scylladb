@@ -508,6 +508,152 @@ SEASTAR_THREAD_TEST_CASE(test_client_readable_file_stream_proxy) {
     client_readable_file_stream(make_proxy_client);
 }
 
+// Exercises the file_impl positional interface of buffered_readable_file with
+// forward-only access (the contract the type enforces with SCYLLA_ASSERT).
+void client_buffered_readable_file(const client_maker_function& client_maker) {
+    semaphore mem(16<<20);
+    s3_test_fixture guard(client_maker, mem);
+    auto cln = guard.client();
+    const auto name = guard.object_path("testbufroobject");
+
+    testlog.info("Put object {}\n", name);
+    temporary_buffer<char> data = sstring("1234567890ABCDEF").release();
+    cln->put_object(name, std::move(data)).get();
+
+    auto f = cln->make_buffered_readable_file(name);
+    auto close_readable_file = deferred_close(f);
+
+    testlog.info("Check file size\n");
+    size_t sz = f.size().get();
+    BOOST_REQUIRE_EQUAL(sz, 16);
+
+    testlog.info("Check buffer read\n");
+    char buffer[16];
+    sz = f.dma_read(0, buffer, 5).get();
+    BOOST_REQUIRE_EQUAL(sz, 5);
+    BOOST_REQUIRE_EQUAL(sstring(buffer, 5), sstring("12345"));
+
+    testlog.info("Check iovec read\n");
+    std::vector<iovec> iovs;
+    iovs.push_back({buffer, 3});
+    iovs.push_back({buffer + 3, 2});
+    sz = f.dma_read(5, std::move(iovs)).get();
+    BOOST_REQUIRE_EQUAL(sz, 5);
+    BOOST_REQUIRE_EQUAL(sstring(buffer, 3), sstring("678"));
+    BOOST_REQUIRE_EQUAL(sstring(buffer + 3, 2), sstring("90"));
+
+    testlog.info("Check bulk read\n");
+    auto buf = f.dma_read_bulk<char>(10, 6).get();
+    BOOST_REQUIRE_EQUAL(to_sstring(std::move(buf)), sstring("ABCDEF"));
+}
+
+SEASTAR_THREAD_TEST_CASE(test_client_buffered_readable_file_minio) {
+    client_buffered_readable_file(make_minio_client);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_client_buffered_readable_file_proxy) {
+    client_buffered_readable_file(make_proxy_client);
+}
+
+void client_buffered_readable_file_stream(const client_maker_function& client_maker) {
+    semaphore mem(16<<20);
+    s3_test_fixture guard(client_maker, mem);
+    auto cln = guard.client();
+    const auto name = guard.object_path("testbufstreamobject");
+
+    testlog.info("Put object {}\n", name);
+    sstring sample("1F2E3D4C5B6A70899807A6B5C4D3E2F1");
+    temporary_buffer<char> data(sample.c_str(), sample.size());
+    cln->put_object(name, std::move(data)).get();
+
+    auto f = cln->make_buffered_readable_file(name);
+    auto close_readable_file = deferred_close(f);
+    auto in = make_file_input_stream(f);
+    auto close_stream = deferred_close(in);
+
+    testlog.info("Check input stream read\n");
+    auto res = seastar::util::read_entire_stream_contiguous(in).get();
+    BOOST_REQUIRE_EQUAL(res, sample);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_client_buffered_readable_file_stream_minio) {
+    client_buffered_readable_file_stream(make_minio_client);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_client_buffered_readable_file_stream_proxy) {
+    client_buffered_readable_file_stream(make_proxy_client);
+}
+
+// Reads a multi-megabyte object through buffered_readable_file (sequentially,
+// via file_input_stream, and through the range-bounded factory) and verifies
+// the bytes match the original. This is the streaming path the type is
+// optimized for: the background fiber prefetches ahead so sequential reads
+// avoid one GET per buffer.
+void test_buffered_readable_file_large(const client_maker_function& client_maker, size_t object_size) {
+    tmpdir tmp;
+    const auto file_path = tmp.path() / "test_object";
+    auto expected_checksum = create_file(file_path, object_size).get();
+
+    semaphore mem(16_MiB);
+    s3_test_fixture guard(client_maker, mem);
+    auto cln = guard.client();
+    const auto object_name = guard.object_path("test_object");
+    cln->upload_file(file_path, object_name).get();
+
+    testlog.info("Sequential read through file_input_stream");
+    {
+        auto f = cln->make_buffered_readable_file(object_name);
+        auto input = make_file_input_stream(f);
+        uint32_t actual_checksum = crc32_utils::init_checksum();
+        size_t actual_size = 0;
+        for (;;) {
+            auto buf = input.read().get();
+            if (buf.empty()) {
+                break;
+            }
+            actual_size += buf.size();
+            uint32_t chunk_checksum = crc32_utils::checksum(buf.get(), buf.size());
+            actual_checksum = checksum_combine_or_feed<crc32_utils>(actual_checksum, chunk_checksum, buf.get(), buf.size());
+        }
+        BOOST_REQUIRE_EQUAL(actual_size, object_size);
+        BOOST_REQUIRE_EQUAL(actual_checksum, expected_checksum);
+        input.close().get();
+        f.close().get();
+    }
+
+    testlog.info("Range-bounded read from a non-zero offset compared to the original file");
+    {
+        const uint64_t offset = object_size / 3;
+        const size_t len = 256_KiB;
+        // Construct anchored at the sub-range, as s3_storage::make_source does,
+        // then read forward over it.
+        auto f = cln->make_buffered_readable_file(object_name, s3::range{offset, len});
+        auto close_f = deferred_close(f);
+
+        file orig = open_file_dma(file_path.native(), open_flags::ro).get();
+        auto orig_in = make_file_input_stream(std::move(orig), offset, len);
+        auto close_orig = deferred_close(orig_in);
+        auto expected = seastar::util::read_entire_stream_contiguous(orig_in).get();
+
+        temporary_buffer<char> got(len);
+        size_t done = 0;
+        while (done < len) {
+            auto n = f.dma_read(offset + done, got.get_write() + done, len - done).get();
+            BOOST_REQUIRE_GT(n, 0u);
+            done += n;
+        }
+        BOOST_REQUIRE_EQUAL(sstring(got.get(), len), expected);
+    }
+}
+
+SEASTAR_THREAD_TEST_CASE(test_buffered_readable_file_large_minio) {
+    test_buffered_readable_file_large(make_minio_client, 20_MiB);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_buffered_readable_file_large_proxy) {
+    test_buffered_readable_file_large(make_proxy_client, 20_MiB);
+}
+
 void client_put_get_tagging(const client_maker_function& client_maker) {
     semaphore mem(16<<20);
     s3_test_fixture guard(client_maker, mem);

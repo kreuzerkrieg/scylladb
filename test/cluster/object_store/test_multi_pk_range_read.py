@@ -619,8 +619,8 @@ async def test_read_pattern(manager: ManagerClient, s3_storage, tmp_path, query_
             # ---------------------------------------------------------------
             # 5. Inject S3 latency (S3 mode only)
             # ---------------------------------------------------------------
-            # if storage_mode == "s3" and S3_READ_LATENCY_MS > 0:
-            #     toxiproxy.add_latency(S3_READ_LATENCY_MS)
+            if storage_mode == "s3" and S3_READ_LATENCY_MS > 0:
+                toxiproxy.add_latency(S3_READ_LATENCY_MS)
 
             # ---------------------------------------------------------------
             # 6. Execute the query pattern
