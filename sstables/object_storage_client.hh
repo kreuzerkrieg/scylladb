@@ -75,6 +75,16 @@ public:
     virtual future<> copy_object(object_name src, object_name dst, abort_source* = nullptr) = 0;
     virtual future<> delete_object(object_name) = 0;
     virtual file make_readable_file(object_name, abort_source* = nullptr) = 0;
+    // Returns a forward-only file over the object's [offset, offset+len) byte range,
+    // backed by the backend's buffered/prefetching download path. The file reports DMA
+    // alignment 1 and serializes its reads, so it is safe to drive with
+    // make_file_data_source (random-access, read-ahead) and to wrap with maybe_wrap_file.
+    virtual file make_buffered_readable_file(object_name, uint64_t offset, uint64_t len, abort_source* = nullptr) = 0;
+    // Returns a forward-only data_source that yields exactly the object's
+    // [offset, offset+len) byte range, served by the backend's buffered/prefetching
+    // download path (a few large GETs rather than one per consumer buffer). Used by
+    // s3_storage::make_source for streaming sstable component reads.
+    virtual data_source make_ranged_download_source(object_name, uint64_t offset, uint64_t len, abort_source* = nullptr) = 0;
     virtual data_sink make_data_upload_sink(object_name, std::optional<unsigned> max_parts_per_piece, abort_source* = nullptr) = 0;
     virtual data_sink make_upload_sink(object_name, abort_source* = nullptr) = 0;
     virtual data_source make_download_source(object_name, abort_source* = nullptr) = 0;

@@ -28,6 +28,7 @@
 #include "utils/s3/creds.hh"
 #include "utils/memory_data_sink.hh"
 #include "utils/lister.hh"
+#include "utils/io-wrappers.hh"
 
 using namespace seastar;
 using namespace sstables;
@@ -93,7 +94,15 @@ public:
         return _client->delete_object(name.str());
     }
     file make_readable_file(object_name name, abort_source* as) override {
-        return _client->make_buffered_readable_file(name.str(), as);
+        return _client->make_readable_file(name.str(), as);
+    }
+    data_source make_ranged_download_source(object_name name, uint64_t offset, uint64_t len, abort_source* as) override {
+        // Ranged GET starting at `offset`; the chunked source prefetches in the
+        // background, so a sequential read is a few large GETs instead of one per buffer.
+        return _client->make_chunked_download_source(name.str(), {offset, len}, as);
+    }
+    file make_buffered_readable_file(object_name name, uint64_t offset, uint64_t len, abort_source* as) override {
+        return _client->make_buffered_readable_file(name.str(), {offset, len}, as);
     }
     data_sink make_data_upload_sink(object_name name, std::optional<unsigned> max_parts_per_piece, abort_source* as) override {
         return _client->make_upload_jumbo_sink(name.str(), max_parts_per_piece, as);
@@ -178,6 +187,16 @@ public:
                 [scf = _shard_client, name] {
                     return scf();
                 }, as);
+    }
+    data_source make_ranged_download_source(object_name name, uint64_t offset, uint64_t len, abort_source* as) override {
+        // GCS has no native ranged GET here; download from 0 and slice to [offset, offset+len).
+        return create_ranged_source(_client->create_download_source(name.bucket(), name.object(), as), offset, len);
+    }
+    file make_buffered_readable_file(object_name name, uint64_t, uint64_t, abort_source* as) override {
+        // GCS: no buffered/forward-only file variant here; fall back to the random-access file.
+        return _client->make_readable_file(name.bucket(), name.object(), [scf = _shard_client, name] {
+            return scf();
+        }, as);
     }
     data_sink make_data_upload_sink(object_name name, std::optional<unsigned> max_parts_per_piece, abort_source* as) override {
         return make_upload_sink(std::move(name), as);

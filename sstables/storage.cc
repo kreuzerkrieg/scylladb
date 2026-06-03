@@ -831,21 +831,25 @@ s3_storage::make_data_or_index_source(sstable& sst, component_type type, file f,
 
 future<data_source>
 s3_storage::make_source(sstable& sst, component_type type, file f, uint64_t offset, uint64_t len, file_input_stream_options options) const {
-    auto comp_name = sstable_version_constants::get_component_map(sst.get_version()).at(type);
-    sstlog.info("s3_storage::make_source: object_store path for {}/{} offset={} len={}", sst.generation(), comp_name, offset, len);
-    // if (offset == 0) {
-        // co_return co_await object_storage_base::make_source(sst, type, std::move(f), offset, len, std::move(options));
-    // }
-    // Reuse the file passed in by the caller.The file is already wrapped with
-    // the configured file_io_extensions (applied at open_component time), so
-    // no further wrapping is needed.
-    // QPROBE EXPERIMENT (option C): the S3 readable_file path issues one HTTP GET per
-    // file_input_stream buffer (get_object_contiguous reads the whole requested range in a
-    // single GET). The default sstable buffer is 128 KiB, so a large non-zero-offset read
-    // degrades to one S3 GET per 128 KiB, paying RTT each time. Bump the buffer here to
-    // confirm the 128 KiB buffer is the bottleneck.
-    // options.buffer_size = std::max(options.buffer_size, 512_KiB);
-    co_return make_file_data_source(std::move(f), offset, len, std::move(options));
+    // Stream [offset, offset+len) through buffered_readable_file: a file over a chunked,
+    // internally-prefetching download source. The file reports DMA alignment 1 and
+    // serializes its reads, so it is safe under make_file_data_source's random-access,
+    // read-ahead consumer. maybe_wrap_file applies file-level extensions (encryption/
+    // compression), exactly like the regular component-open path.
+    //
+    // The GET is ranged from `offset`, so no bytes before `offset` are downloaded. This
+    // is correct for position-independent file extensions; this path currently has none.
+    // A position-dependent extension (e.g. block encryption) would need the download to
+    // start at a block boundary <= offset (e.g. s3::full_range).
+    co_return make_file_data_source(
+        co_await maybe_wrap_file(
+            sst,
+            type,
+            open_flags::ro,
+            _client->make_buffered_readable_file(make_object_name(sst, type), offset, len, abort_source())),
+        offset,
+        len,
+        std::move(options));
 }
 
 future<data_sink> object_storage_base::make_component_sink(sstable& sst, component_type type, open_flags oflags, file_output_stream_options options) {

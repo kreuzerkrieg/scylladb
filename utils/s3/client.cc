@@ -1971,6 +1971,13 @@ class client::buffered_readable_file : public file_impl {
     // Absolute offset of the next byte the stream will yield.
     uint64_t _stream_pos = 0;
 
+    // Serializes the read methods. make_file_data_source's consumer
+    // (file_data_source_impl) issues concurrent read-ahead reads; without this, two
+    // reads would interleave on the single forward-only _stream and mutate _stream_pos
+    // concurrently, scrambling the data. The chunked source prefetches internally, so
+    // serializing the file-level reads does not cost throughput.
+    seastar::semaphore _read_serializer{1};
+
     [[noreturn]] void unsupported() {
         throw_with_backtrace<std::logic_error>("unsupported operation on s3 buffered readable file");
     }
@@ -2021,6 +2028,11 @@ public:
         , _stream(_client->make_chunked_download_source(_object_name, _range, _as))
         , _stream_pos(_range.offset())
     {
+        // S3 objects have no DMA alignment constraints. Reporting alignment 1 prevents
+        // file_data_source_impl from aligning reads DOWN (which would seek the
+        // forward-only stream backwards); reads then land exactly at the requested pos.
+        _memory_dma_alignment = 1;
+        _disk_read_dma_alignment = 1;
     }
 
     future<size_t> write_dma(uint64_t pos, const void* buffer, size_t len, io_intent*) override { unsupported(); }
@@ -2076,10 +2088,8 @@ public:
     }
 
     // Read up to `len` bytes at absolute offset `pos` into `buffer`, advancing
-    // forward through the prefetched stream. Returns a short count (0 at the end
-    // of the range), as allowed by the file_impl contract.
-    future<size_t> read_dma(uint64_t pos, void* buffer, size_t len, io_intent*) override {
-        SCYLLA_ASSERT(pos >= _range.offset() && pos <= range_end());
+    // forward through the prefetched stream. Caller must hold _read_serializer.
+    future<size_t> do_read(uint64_t pos, void* buffer, size_t len) {
         co_await seek_to(pos);
         auto buf = co_await _stream.read_exactly(len);
         std::copy_n(buf.get(), buf.size(), reinterpret_cast<uint8_t*>(buffer));
@@ -2087,10 +2097,21 @@ public:
         co_return buf.size();
     }
 
-    future<size_t> read_dma(uint64_t pos, std::vector<iovec> iov, io_intent* intent) override {
+    // Read up to `len` bytes at absolute offset `pos` into `buffer`, advancing
+    // forward through the prefetched stream. Returns a short count (0 at the end
+    // of the range), as allowed by the file_impl contract.
+    future<size_t> read_dma(uint64_t pos, void* buffer, size_t len, io_intent*) override {
+        SCYLLA_ASSERT(pos >= _range.offset() && pos <= range_end());
+        auto units = co_await seastar::get_units(_read_serializer, 1);
+        co_return co_await do_read(pos, buffer, len);
+    }
+
+    future<size_t> read_dma(uint64_t pos, std::vector<iovec> iov, io_intent*) override {
+        auto units = co_await seastar::get_units(_read_serializer, 1);
         size_t done = 0;
         for (auto& v : iov) {
-            auto n = co_await read_dma(pos + done, v.iov_base, v.iov_len, intent);
+            SCYLLA_ASSERT(pos + done >= _range.offset() && pos + done <= range_end());
+            auto n = co_await do_read(pos + done, v.iov_base, v.iov_len);
             done += n;
             if (n < v.iov_len) {
                 break;
@@ -2101,6 +2122,7 @@ public:
 
     future<temporary_buffer<uint8_t>> dma_read_bulk(uint64_t offset, size_t range_size, io_intent*) override {
         SCYLLA_ASSERT(offset >= _range.offset() && offset <= range_end());
+        auto units = co_await seastar::get_units(_read_serializer, 1);
         co_await seek_to(offset);
         auto buf = co_await _stream.read_exactly(range_size);
         _stream_pos += buf.size();
