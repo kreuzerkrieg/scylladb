@@ -108,6 +108,7 @@ class client : public enable_shared_from_this<client> {
     class download_source;
     class do_upload_file;
     class readable_file;
+    class buffered_readable_file;
     std::string _host;
     endpoint_config_ptr _cfg;
     semaphore _creds_sem;
@@ -196,6 +197,8 @@ public:
     future<> delete_bucket_with_objects(sstring bucket_name, seastar::abort_source* = nullptr);
 
     file make_readable_file(sstring object_name, seastar::abort_source* = nullptr);
+    file make_buffered_readable_file(sstring object_name, seastar::abort_source* = nullptr);
+    file make_buffered_readable_file(sstring object_name, range download_range, seastar::abort_source* = nullptr);
     data_sink make_upload_sink(sstring object_name, seastar::abort_source* = nullptr);
     data_sink make_upload_jumbo_sink(sstring object_name, std::optional<unsigned> max_parts_per_piece = {}, seastar::abort_source* = nullptr);
     data_source make_download_source(sstring object_name, range download_range = s3::full_range, seastar::abort_source* = nullptr);

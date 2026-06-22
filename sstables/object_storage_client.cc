@@ -94,7 +94,7 @@ public:
         return _client->delete_object(name.str(), as);
     }
     file make_readable_file(object_name name, abort_source* as) override {
-        return _client->make_readable_file(name.str(), as);
+        return _client->make_buffered_readable_file(name.str(), as);
     }
     data_sink make_data_upload_sink(object_name name, std::optional<unsigned> max_parts_per_piece, abort_source* as) override {
         return _client->make_upload_jumbo_sink(name.str(), max_parts_per_piece, as);

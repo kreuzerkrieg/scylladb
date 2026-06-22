@@ -494,6 +494,7 @@ future<> client::make_request(http::request req,
     co_await authorize(request);
     auto& gc = co_await find_or_create_client();
 
+
     co_await gc.http.make_request(request, handler, rs, std::nullopt, as).handle_exception([err_handler = std::move(err_handler)](auto ex) {
         err_handler(std::move(ex));
     });
@@ -1355,6 +1356,7 @@ data_sink client::make_upload_jumbo_sink(sstring object_name, std::optional<unsi
 }
 
 class client::chunked_download_source final : public seastar::data_source_impl {
+    friend class buffered_readable_file;
     struct claimed_buffer {
         temporary_buffer<char> _buffer;
         std::optional<semaphore_units<>> _claimed_memory;
@@ -1961,6 +1963,153 @@ public:
 
 file client::make_readable_file(sstring object_name, seastar::abort_source* as) {
     return file(make_shared<readable_file>(shared_from_this(), std::move(object_name), as));
+}
+
+class client::buffered_readable_file : public file_impl {
+    shared_ptr<client> _client;
+    sstring _object_name;
+    std::optional<struct stat> _stats;
+    abort_source* _as;
+
+    std::unique_ptr<input_stream<char>> _stream;
+    uint64_t _stream_pos;
+
+    [[noreturn]] static void unsupported() { throw_with_backtrace<std::logic_error>("unsupported operation on s3 buffered readable file"); }
+
+    future<> maybe_update_stats() {
+        if (_stats) [[likely]] {
+            return make_ready_future<>();
+        }
+        return _client->get_object_stats(_object_name).then([this](auto st) {
+            auto& stat_ref = _stats.emplace();
+            stat_ref.st_nlink = 1;
+            stat_ref.st_mode = S_IFREG | S_IRUSR | S_IRGRP | S_IROTH;
+            stat_ref.st_size = st.size;
+            stat_ref.st_blksize = minimum_part_size; //why not?
+            stat_ref.st_blocks = st.size >> 9;
+            // objects are immutable on S3; therefore, we can use Last-Modified to set both st_mtime and st_ctime
+            stat_ref.st_mtime = st.last_modified;
+            stat_ref.st_ctime = st.last_modified;
+            return make_ready_future<>();
+        });
+    }
+
+    future<> seek_to(uint64_t pos) {
+        s3l.trace ("seek to {} when the stream_pos is {} for object {}", pos, _stream_pos, _object_name);
+        // SCYLLA_ASSERT(pos >= _stream_pos);
+        if (pos < _stream_pos || pos > _stream_pos + chunked_download_source::_max_buffers_size + chunked_download_source::_socket_buff_size) [[unlikely]] {
+            if (_stream) {
+                s3l.trace("closing stream for object {}", _object_name);
+                co_await _stream->close();
+                _stream.reset();
+            }
+        }
+        if (!_stream) [[unlikely]] {
+            _stream_pos = pos;
+            s3l.trace ("creating new stream for object {} at offset {}", _object_name, pos);
+            _stream = std::make_unique<input_stream<char>>(_client->make_chunked_download_source(_object_name, range{pos, co_await size() - pos}, _as));
+        }
+
+        while (_stream_pos < pos) {
+            auto buf = co_await _stream->read_exactly(pos - _stream_pos);
+            if (buf.empty()) {
+                break;
+            }
+            _stream_pos += buf.size();
+        }
+        // _stream_pos = pos;
+    }
+
+public:
+    buffered_readable_file() = delete;
+    buffered_readable_file(shared_ptr<client> cln, sstring object_name, abort_source* as = nullptr)
+        : _client(std::move(cln)), _object_name(std::move(object_name)), _as(as), _stream(nullptr), _stream_pos(0) {
+    }
+
+    future<size_t> write_dma(uint64_t pos, const void* buffer, size_t len, io_intent*) override { unsupported(); }
+    future<size_t> write_dma(uint64_t pos, std::vector<iovec> iov, io_intent*) override { unsupported(); }
+    future<> truncate(uint64_t length) override { unsupported(); }
+    subscription<directory_entry> list_directory(std::function<future<>(directory_entry de)> next) override { unsupported(); }
+
+    future<> flush() override { return make_ready_future<>(); }
+    future<> allocate(uint64_t position, uint64_t length) override { return make_ready_future<>(); }
+    future<> discard(uint64_t offset, uint64_t length) override { return make_ready_future<>(); }
+
+    class buffered_readable_file_handle_impl final : public file_handle_impl {
+        handle _h;
+        sstring _object_name;
+
+    public:
+        buffered_readable_file_handle_impl(handle h, sstring object_name) : _h(std::move(h)), _object_name(std::move(object_name)) {}
+
+        [[nodiscard]] std::unique_ptr<file_handle_impl> clone() const override {
+            return std::make_unique<buffered_readable_file_handle_impl>(_h, _object_name);
+        }
+
+        shared_ptr<file_impl> to_file() && override {
+            // TODO: cannot traverse abort source across shards.
+            return make_shared<buffered_readable_file>(std::move(_h).to_client(), std::move(_object_name));
+        }
+    };
+
+    std::unique_ptr<file_handle_impl> dup() override { return std::make_unique<buffered_readable_file_handle_impl>(handle(*_client), _object_name); }
+
+    future<uint64_t> size() override {
+        co_await maybe_update_stats();
+        co_return _stats->st_size;
+    }
+
+    future<struct stat> stat() override {
+        co_await maybe_update_stats();
+        co_return _stats.value();
+    }
+
+    future<size_t> do_read(uint64_t pos, void* buffer, size_t len) {
+        s3l.trace("do_read {} bytes at offset {} for object {}", len, pos, _object_name);
+        co_await seek_to(pos);
+        auto buf = co_await _stream->read_exactly(len);
+        auto buf_size = buf.size();
+        SCYLLA_ASSERT(buf_size <= len);
+        std::copy_n(buf.get(), buf_size, static_cast<uint8_t*>(buffer));
+        _stream_pos += buf_size;
+        co_return buf_size;
+    }
+
+    future<size_t> read_dma(uint64_t pos, void* buffer, size_t len, io_intent*) override {
+        co_return co_await do_read(pos, buffer, len);
+    }
+
+    future<size_t> read_dma(uint64_t pos, std::vector<iovec> iov, io_intent*) override {
+        size_t done = 0;
+        for (auto& [iov_base, iov_len] : iov) {
+            auto n = co_await read_dma(pos + done, iov_base, iov_len, nullptr);
+            done += n;
+            if (n < iov_len) {
+                break;
+            }
+        }
+        co_return done;
+    }
+
+    future<temporary_buffer<uint8_t>> dma_read_bulk(uint64_t offset, size_t range_size, io_intent*) override {
+        temporary_buffer<uint8_t> buf(range_size);
+        auto n = co_await read_dma(offset, buf.get_write(), range_size, nullptr);
+        SCYLLA_ASSERT(n <= range_size);
+        buf.trim(n);
+        co_return buf;
+    }
+
+    future<> close() override {
+        s3l.trace ("closing buffered_readable_file for {}", _object_name);
+        if (_stream) {
+            co_await _stream->close();
+            _stream.reset();
+        }
+    }
+};
+
+file client::make_buffered_readable_file(sstring object_name, seastar::abort_source* as) {
+    return {make_shared<buffered_readable_file>(shared_from_this(), std::move(object_name), as)};
 }
 
 future<> client::close() {

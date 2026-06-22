@@ -820,15 +820,36 @@ s3_storage::make_data_or_index_source(sstable& sst, component_type type, file f,
     co_return co_await make_source(sst, type, std::move(f), offset, len, std::move(options));
 }
 
+namespace {
+
+// A buffered_readable_file (used for S3-backed sstables) owns a background
+// prefetch fiber inside its chunked_download_source that is only joined by
+// file::close(). However, make_file_data_source's file_data_source_impl never
+// closes its underlying file. Wrap the resulting data source so that closing it
+// also closes the file, ensuring the prefetch fiber is joined before the file
+// (and the source it owns) is destroyed.
+class file_closing_data_source_impl final : public data_source_impl {
+    data_source _source;
+    file _file;
+public:
+    file_closing_data_source_impl(data_source source, file f) noexcept
+        : _source(std::move(source)), _file(std::move(f)) {}
+    future<temporary_buffer<char>> get() override { return _source.get(); }
+    future<temporary_buffer<char>> skip(uint64_t n) override { return _source.skip(n); }
+    future<> close() override {
+        co_await _source.close();
+        co_await _file.close();
+    }
+};
+
+} // anonymous namespace
+
 future<data_source>
 s3_storage::make_source(sstable& sst, component_type type, file f, uint64_t offset, uint64_t len, file_input_stream_options options) const {
-    if (offset == 0) {
-        co_return co_await object_storage_base::make_source(sst, type, std::move(f), offset, len, std::move(options));
-    }
-    // Reuse the file passed in by the caller.The file is already wrapped with
-    // the configured file_io_extensions (applied at open_component time), so
-    // no further wrapping is needed.
+    options.read_ahead = 0;
     co_return make_file_data_source(std::move(f), offset, len, std::move(options));
+    // auto src = make_file_data_source(f, offset, len, std::move(options));
+    // co_return data_source(std::make_unique<file_closing_data_source_impl>(std::move(src), std::move(f)));
 }
 
 future<data_sink> object_storage_base::make_component_sink(sstable& sst, component_type type, open_flags oflags, file_output_stream_options options) {
