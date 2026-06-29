@@ -119,6 +119,8 @@ class client : public enable_shared_from_this<client> {
 
     struct group_client {
         seastar::http::client http;
+        uint64_t read_bytes = 0;
+        uint64_t write_bytes = 0;
         // Bounds the number of background upload requests in flight for this
         // scheduling group to the number of HTTP connections configured for it.
         // Buffer-bearing uploads (memtable flush / compaction via upload_sink)
