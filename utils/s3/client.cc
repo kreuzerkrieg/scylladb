@@ -287,9 +287,9 @@ void client::group_client::register_metrics(std::string class_name, std::string 
             sm::description("Total time spend writing data to objects"), {ep_label, sg_label}));
     defs.emplace_back(sm::make_counter("total_read_prefetch_bytes", [this] { return prefetch_bytes; },
             sm::description("Total number of bytes requested from object"), {ep_label, sg_label}));
-    defs.emplace_back(sm::make_counter("downloads_blocked_on_memory",
-                      [this] { return downloads_blocked_on_memory; },
-                      sm::description("Counts the number of times S3 client downloads were delayed due to insufficient memory availability"),
+    defs.emplace_back(sm::make_counter("downloads_starving_on_max_concurrency",
+                      [this] { return downloads_starving_on_max_concurrency; },
+                      sm::description("Counts the number of times S3 client downloads were starving on max concurrency limit"),
                       {ep_label, sg_label}));
     defs.emplace_back(sm::make_counter("integrated_request_queue_length",
                           [this] { return http.integrated_requests_queued().integral(); },
@@ -1405,7 +1405,7 @@ class client::chunked_download_source final : public seastar::data_source_impl {
 
                 if (!_is_finished && !_buffers.empty() && !units) {
                     auto& gc = co_await _client->find_or_create_client();
-                    ++gc.downloads_blocked_on_memory;
+                    ++gc.downloads_starving_on_max_concurrency;
                     co_await _bg_fiber_cv.when([this] {
                         return _is_finished || _buffers.empty() || try_get_units(_client->_buffered_dl_sem, 1);
                     });
