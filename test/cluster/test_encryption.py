@@ -20,6 +20,7 @@ from test.pylib.manager_client import ManagerClient, ServerInfo
 from test.pylib.object_storage import format_tuples
 from test.pylib.util import wait_for_cql_and_get_hosts
 from test.pylib.tablets import get_all_tablet_replicas
+from test.cluster.object_store.conftest import make_cluster_with_object_storage
 
 from test.pylib import nodetool
 
@@ -44,7 +45,7 @@ def workdir():
     with tempfile.TemporaryDirectory() as tmp_dir:
         yield tmp_dir
 
-async def test_file_streaming_respects_encryption(manager: ManagerClient, storage, workdir):
+async def _do_test_file_streaming_respects_encryption(manager: ManagerClient, storage, workdir, initial_servers):
     # pylint: disable=missing-function-docstring
     cfg = {
         'tablets_mode_for_new_keyspaces': 'enabled',
@@ -55,8 +56,7 @@ async def test_file_streaming_respects_encryption(manager: ManagerClient, storag
         cfg['experimental_features'] = ['keyspace-storage-options']
 
     cmdline = ['--smp=1']
-    servers = []
-    servers.append(await manager.server_add(config=cfg, cmdline=cmdline))
+    servers = list(initial_servers)
     await manager.disable_tablet_balancing()
 
     cql = manager.cql
@@ -84,6 +84,25 @@ async def test_file_streaming_respects_encryption(manager: ManagerClient, storag
 
     rows = cql.execute("SELECT * from ks.t WHERE pk = 'alamakota'")
     assert len(list(rows)) == 1
+
+
+async def test_file_streaming_respects_encryption_local(manager: ManagerClient, workdir):
+    # pylint: disable=missing-function-docstring
+    cfg = {'tablets_mode_for_new_keyspaces': 'enabled'}
+    server = await manager.server_add(config=cfg, cmdline=['--smp=1'])
+    await _do_test_file_streaming_respects_encryption(manager, None, workdir, [server])
+
+
+@pytest.mark.parametrize('flavor', ['s3', 'gs'])
+async def test_file_streaming_respects_encryption_object_storage(manager: ManagerClient, flavor,
+                                                                 request, pytestconfig, tmpdir, workdir):
+    # pylint: disable=missing-function-docstring
+    async with make_cluster_with_object_storage(manager, flavor, num_nodes=1,
+                                                pytestconfig=pytestconfig, tmpdir=tmpdir,
+                                                test_name=request.node.name,
+                                                extra_cfg={'tablets_mode_for_new_keyspaces': 'enabled'},
+                                                cmdline=['--smp=1']) as (storage, servers):
+        await _do_test_file_streaming_respects_encryption(manager, storage, workdir, servers)
 
 
 def filter_ciphers(kp: KeyProviderFactory, ciphers=dict[str, list[int]]) -> list[tuple[str, len]]:
