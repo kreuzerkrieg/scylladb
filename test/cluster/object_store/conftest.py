@@ -52,18 +52,6 @@ async def make_object_storage(kind, pytestconfig, tmpdir, test_name):
         await server.stop()
 
 
-@pytest.fixture(scope="function", params=['s3', 'gs'])
-async def object_storage(request, pytestconfig, tmpdir):
-    async with make_object_storage(request.param, pytestconfig, tmpdir, request.node.name) as server:
-        yield server
-
-
-@pytest.fixture(scope="function")
-async def s3_storage(request, pytestconfig, tmpdir):
-    async with make_object_storage('s3', pytestconfig, tmpdir, request.node.name) as server:
-        yield server
-
-
 @asynccontextmanager
 async def make_cluster_with_object_storage(manager: ManagerClient,
                                            kind: str,
