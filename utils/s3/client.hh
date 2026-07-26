@@ -111,6 +111,19 @@ struct stats {
     std::time_t last_modified;
 };
 
+// Aggregated HTTP counters aross all the per-scheduling-group connection pools
+// of a single client. The number of requests actually put on the wire is
+// ops + retries: seastar counts a logical request in ops and every extra
+// attempt granted by the retry strategy in retries.
+struct request_counters {
+    uint64_t read_ops = 0;
+    uint64_t read_retries = 0;
+    uint64_t read_bytes = 0;
+    uint64_t write_ops = 0;
+    uint64_t write_retries = 0;
+    uint64_t write_bytes = 0;
+};
+
 future<> ignore_reply(const http::reply& rep, input_stream<char>&& in_);
 [[noreturn]] void map_s3_client_exception(std::exception_ptr ex);
 
@@ -255,6 +268,8 @@ public:
     // client keeps one http client per scheduling group and names the class
     // label after it, so the caller supplies only the type and the endpoint.
     void report_object_storage_metrics(utils::object_storage_metrics_labels labels);
+
+    request_counters get_request_counters() const noexcept;
 
     struct handle {
         std::string _host;
