@@ -162,6 +162,20 @@ void client::update_connections_per_shard(unsigned connections_per_shard) {
     });
 }
 
+request_counters client::get_request_counters() const noexcept {
+    request_counters ret;
+    for (const auto& [sg, gc] : _https) {
+        const auto& stats = gc.http.get_stats();
+        ret.read_ops += stats[httpd::GET].ops;
+        ret.read_retries += stats[httpd::GET].retries;
+        ret.write_ops += stats[httpd::PUT].ops;
+        ret.write_retries += stats[httpd::PUT].retries;
+        ret.read_bytes += gc.read_bytes;
+        ret.write_bytes += gc.write_bytes;
+    }
+    return ret;
+}
+
 shared_ptr<client> client::make(std::string endpoint, endpoint_config_ptr cfg, global_factory gf) {
     return seastar::make_shared<client>(std::move(endpoint), std::move(cfg), std::move(gf), private_tag{});
 }
