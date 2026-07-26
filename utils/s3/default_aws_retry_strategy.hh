@@ -18,7 +18,9 @@ protected:
     unsigned _max_retries;
 
 public:
-    explicit default_aws_retry_strategy(unsigned max_retries = 10);
+    static constexpr unsigned default_max_retries = 10;
+
+    explicit default_aws_retry_strategy(unsigned max_retries = default_max_retries);
 
     seastar::future<bool> should_retry(std::exception_ptr error, unsigned attempted_retries) const override;
 };
