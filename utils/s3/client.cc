@@ -187,6 +187,20 @@ static std::unique_ptr<throttling_controller> make_default_throttling_controller
     return std::make_unique<aws_throttling_controller>();
 }
 
+request_counters client::get_request_counters() const noexcept {
+    request_counters ret;
+    for (const auto& [sg, gc] : _https) {
+        const auto& stats = gc.http.get_stats();
+        ret.read_ops += stats[httpd::GET].ops;
+        ret.read_retries += stats[httpd::GET].retries;
+        ret.write_ops += stats[httpd::PUT].ops;
+        ret.write_retries += stats[httpd::PUT].retries;
+        ret.read_bytes += gc.read_bytes;
+        ret.write_bytes += gc.write_bytes;
+    }
+    return ret;
+}
+
 shared_ptr<client> client::make(std::string endpoint, endpoint_config_ptr cfg, global_factory gf) {
     return make(std::move(endpoint), std::move(cfg), nullptr, nullptr, std::move(gf));
 }
