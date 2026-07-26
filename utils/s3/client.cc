@@ -1412,6 +1412,9 @@ class client::chunked_download_source final : public seastar::data_source_impl {
     size_t _buffers_size = 0;
     bool _is_finished = false;
     bool _is_contiguous_mode = false;
+    // Consecutive failed attempts at the current range. Reset once a request
+    // gets through, so the budget applies per range rather than per object.
+    unsigned _retries = 0;
     condition_variable _bg_fiber_cv;
     condition_variable _get_cv;
     future<> _filling_fiber = make_ready_future<>();
@@ -1542,11 +1545,21 @@ class client::chunked_download_source final : public seastar::data_source_impl {
                     {},
                     _as);
                 _is_contiguous_mode = _buffers_size < _max_buffers_size * _buffers_high_watermark;
+                _retries = 0;
             } catch (...) {
                 auto ex = std::current_exception();
                 auto aws_ex = aws::aws_error::from_exception_ptr(ex);
                 if (!aws_ex.is_retryable()) {
                     s3l.info("Fiber for object '{}' failed: {}, exiting", _object_name, ex);
+                    _get_cv.broken(ex);
+                    co_return;
+                }
+                // This fiber retries on its own (it has to resume from the
+                // offset already consumed, which a request-level retry cannot
+                // do), so it also has to enforce its own budget -- otherwise a
+                // persistently throttling endpoint is retried forever.
+                if (++_retries > aws::default_aws_retry_strategy::default_max_retries) {
+                    s3l.warn("Fiber for object '{}' giving up after {} retries: {}", _object_name, _retries - 1, ex);
                     _get_cv.broken(ex);
                     co_return;
                 }
