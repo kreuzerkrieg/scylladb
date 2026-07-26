@@ -42,6 +42,7 @@
 #include <seastar/core/fstream.hh>
 #include <seastar/core/iostream.hh>
 #include <seastar/core/seastar.hh>
+#include <seastar/core/sleep.hh>
 #include <seastar/core/timer.hh>
 #include <seastar/coroutine/parallel_for_each.hh>
 #include <seastar/util/closeable.hh>
@@ -113,6 +114,8 @@ struct round_stats {
     // per internal retry, none of which are visible from here.
     uint64_t read_requests = 0;
     uint64_t read_bytes = 0;
+    uint64_t completed = 0; // whole objects downloaded
+    uint64_t sstables = 0;  // whole sstables completed
 
     round_stats& operator+=(const round_stats& o) noexcept {
         slowdown_errors += o.slowdown_errors;
@@ -120,7 +123,29 @@ struct round_stats {
         download_errors += o.download_errors;
         read_requests += o.read_requests;
         read_bytes += o.read_bytes;
+        completed += o.completed;
+        sstables += o.sstables;
         return *this;
+    }
+
+    // Rates between two cumulative samples taken dt apart.
+    struct rates {
+        double requests_per_sec;
+        double objects_per_sec;
+        double sstables_per_sec;
+        double mbytes_per_sec;
+    };
+
+    rates since(const round_stats& prev, double dt) const noexcept {
+        if (dt <= 0) {
+            return {};
+        }
+        return {
+            .requests_per_sec = static_cast<double>(read_requests - prev.read_requests) / dt,
+            .objects_per_sec = static_cast<double>(completed - prev.completed) / dt,
+            .sstables_per_sec = static_cast<double>(sstables - prev.sstables) / dt,
+            .mbytes_per_sec = static_cast<double>((read_bytes - prev.read_bytes) >> 20) / dt,
+        };
     }
 };
 
@@ -158,6 +183,46 @@ struct endpoint_params {
         return make_lw_shared<s3::endpoint_config>(std::move(cfg));
     }
 };
+
+// ─── sampling ────────────────────────────────────────────────────────────────
+
+// Samples are taken by each shard on its own timer and kept locally, then
+// collected once the round is over. Polling the shards from outside during the
+// round does not work: the cross-shard calls queue behind the download work and
+// get starved for the whole active phase, so every sample lands after the round
+// has already finished.
+struct sample {
+    double at_sec; // since round start
+    round_stats stats;
+};
+
+// Emits a sample as it is taken instead of only contributing to the series that
+// is assembled once the round is over. Without this a long round is opaque: the
+// throttling counters reach the operator only in the final RESULT line, so a
+// fleet cannot be stopped early when S3 starts pushing back -- a 20-minute round
+// accumulated ~25k SlowDown retries entirely invisibly before this existed.
+//
+// Escalates to warn when anything went wrong in the interval, so the line shows
+// up even for a run that only enables warn.
+static void log_sample(std::string_view verb, double at_sec, const round_stats& now, const round_stats& prev, double prev_at) {
+    const auto r = now.since(prev, at_sec - prev_at);
+    const auto slowdown = now.slowdown_errors - prev.slowdown_errors;
+    const auto netreset = now.network_errors - prev.network_errors;
+    const auto failed = now.download_errors - prev.download_errors;
+    if (slowdown || netreset || failed) {
+        plog.warn("shard {:2d} t={:6.1f}s {}/s={:7.0f} MB/s={:6.0f} slowdown+={} netreset+={} failed+={}",
+                  this_shard_id(),
+                  at_sec,
+                  verb,
+                  r.requests_per_sec,
+                  r.mbytes_per_sec,
+                  slowdown,
+                  netreset,
+                  failed);
+    } else {
+        plog.info("shard {:2d} t={:6.1f}s {}/s={:7.0f} MB/s={:6.0f}", this_shard_id(), at_sec, verb, r.requests_per_sec, r.mbytes_per_sec);
+    }
+}
 
 // ─── sstable grouping ────────────────────────────────────────────────────────
 //
@@ -216,14 +281,16 @@ static std::vector<sstable_group> group_by_sstable(const std::vector<sstring>& k
 class downloader {
     counting_retry_strategy* _retry = nullptr; // raw observer; client owns the unique_ptr
     shared_ptr<s3::client> _client;
-    std::vector<sstable_group> _sstables;              // shuffled per shard
-    unsigned _connections;                             // connection pool size
-    unsigned _sstable_concurrency;                     // concurrent sstables per shard, as in restore
+    std::vector<sstable_group> _sstables; // shuffled per shard
+    unsigned _connections;                // connection pool size
+    unsigned _sstable_concurrency;        // concurrent sstables per shard, as in restore
+    std::chrono::seconds _sample_interval;
     std::filesystem::path _corpus_dir;                 // empty when persistence is disabled
     std::unordered_set<std::string_view> _corpus_busy; // objects currently being saved
     uint64_t _total_bytes = 0;
     uint64_t _sstables_done = 0;
     unsigned _download_errors = 0;
+    std::vector<sample> _samples;
     utils::estimated_histogram _latencies;
 
     std::chrono::steady_clock::time_point _now() const noexcept { return std::chrono::steady_clock::now(); }
@@ -255,9 +322,9 @@ class downloader {
     // saved. It is claimed before the first co_await, otherwise two workers both
     // pass the check while suspended and then race on the rename.
     future<std::optional<output_stream<char>>> open_corpus_sink(const sstring& object_key) {
-        // Only one shard saves. _corpus_busy is per shard and the existence check
-        // below only helps once a rename has landed, so letting every shard save
-        // means each object gets written up to smp::count times over.
+        // Only one shard saves. _corpus_busy is per shard and the existence
+        // check only helps once a rename has landed, so letting every shard save
+        // means each object is written up to smp::count times over.
         if (_corpus_dir.empty() || this_shard_id() != 0 || _corpus_busy.contains(object_key)) {
             co_return std::nullopt;
         }
@@ -291,11 +358,12 @@ class downloader {
 
     future<> download_one(const sstring& file, abort_source& as) {
         const auto t0 = _now();
-        // sink is declared out here so the failure path can still close it: an
-        // output_stream asserts in its destructor when it was never closed, which
-        // takes down the process instead of failing the one download. It holds a
-        // value only while the stream is open; claimed tracks the _corpus_busy
-        // entry, which outlives the stream.
+        // Declared outside the try so the failure path can still close it: an
+        // output_stream asserts in its destructor if it was never closed, which
+        // aborts the whole process rather than failing the one download.
+        // sink holds a value only while the stream is still open, so the failure
+        // path can tell whether it has to close it; claimed tracks the
+        // _corpus_busy entry, which outlives the stream.
         std::optional<output_stream<char>> sink;
         std::exception_ptr failure;
         bool claimed = false;
@@ -339,12 +407,13 @@ class downloader {
         }
         // Cleanup lives outside the handler: co_await is not allowed inside one.
         if (sink) {
+            // Close before the destructor gets a chance to assert, and drop the
+            // partial file so the object is retried rather than being mistaken
+            // for a complete one on a later pass.
             try {
                 co_await sink->close();
             } catch (...) {
             }
-            // Drop the partial so the object is retried rather than being taken
-            // for a complete one on a later pass.
             try {
                 co_await remove_file(partial_path(corpus_path(file)).native());
             } catch (...) {
@@ -364,9 +433,14 @@ public:
                unsigned connections,
                unsigned sstable_concurrency,
                unsigned max_retries,
+               std::chrono::seconds sample_interval,
                std::vector<sstable_group> sstables,
                std::filesystem::path corpus_dir)
-        : _sstables(std::move(sstables)), _connections(connections), _sstable_concurrency(sstable_concurrency), _corpus_dir(std::move(corpus_dir)) {
+        : _sstables(std::move(sstables))
+        , _connections(connections)
+        , _sstable_concurrency(sstable_concurrency)
+        , _sample_interval(sample_interval)
+        , _corpus_dir(std::move(corpus_dir)) {
         // Give each shard a distinct permutation so concurrent shards do not
         // hammer the same sstables in the same order.
         std::shuffle(_sstables.begin(), _sstables.end(), std::default_random_engine(this_shard_id()));
@@ -380,10 +454,22 @@ public:
         _total_bytes = 0;
         _download_errors = 0;
         _latencies = utils::estimated_histogram{};
+        _samples.clear();
         _sstables_done = 0;
         _retry->reset();
 
         abort_source as;
+        const auto round_start = _now();
+        timer<lowres_clock> sample_timer;
+        sample_timer.set_callback([this, round_start] {
+            const auto at_sec = std::chrono::duration_cast<std::chrono::duration<double>>(_now() - round_start).count();
+            auto stats = collect_stats();
+            const round_stats prev = _samples.empty() ? round_stats{} : _samples.back().stats;
+            const double prev_at = _samples.empty() ? 0.0 : _samples.back().at_sec;
+            _samples.push_back(sample{.at_sec = at_sec, .stats = stats});
+            log_sample("GET", at_sec, stats, prev, prev_at);
+        });
+        sample_timer.arm_periodic(_sample_interval);
         timer<lowres_clock> timeout_timer;
         timeout_timer.set_callback([&as] {
             if (!as.abort_requested()) {
@@ -410,6 +496,7 @@ public:
         }
 
         timeout_timer.cancel();
+        sample_timer.cancel();
     }
 
     // Called by sharded<downloader>::stop().
@@ -423,8 +510,12 @@ public:
             .download_errors = _download_errors,
             .read_requests = counters.read_ops + counters.read_retries,
             .read_bytes = counters.read_bytes,
+            .completed = _latencies._count,
+            .sstables = _sstables_done,
         };
     }
+
+    std::vector<sample> collect_samples() const { return _samples; }
 
     future<> log_stats(double elapsed_sec) const {
         if (_latencies._count == 0) {
@@ -467,8 +558,8 @@ static future<std::vector<sstring>> list_bucket(const endpoint_params& ep, const
             break;
         }
     }
-    // Draining to the end closes the lister implicitly; stopping early leaves its
-    // fibre parked on a queue push, so it has to be closed explicitly.
+    // Draining to the end closes the lister implicitly; stopping early leaves
+    // its fibre parked on a queue push, so it has to be closed explicitly.
     if (truncated) {
         co_await bl.close();
     }
@@ -497,6 +588,7 @@ int main(int argc, char** argv) {
         "corpus_dir", bpo::value<sstring>()->default_value(""), "save each downloaded object once under this directory (empty: do not save)")(
         "max_objects", bpo::value<size_t>()->default_value(0), "use at most this many listed objects (0: all)")(
         "max_rounds", bpo::value<unsigned>()->default_value(0), "stop after this many rounds even if nothing failed (0: unlimited)")(
+        "sample_interval", bpo::value<unsigned>()->default_value(10), "seconds between in-round rate samples")(
         "sstable_concurrency",
         bpo::value<unsigned>()->default_value(default_sstable_concurrency),
         "sstables downloaded concurrently per shard (restore uses 16)");
@@ -512,6 +604,7 @@ int main(int argc, char** argv) {
         const std::filesystem::path corpus_dir{app.configuration()["corpus_dir"].as<sstring>().c_str()};
         const size_t max_objects = app.configuration()["max_objects"].as<size_t>();
         const unsigned max_rounds = app.configuration()["max_rounds"].as<unsigned>();
+        const auto sample_interval = std::chrono::seconds(app.configuration()["sample_interval"].as<unsigned>());
         const unsigned sstable_concurrency = app.configuration()["sstable_concurrency"].as<unsigned>();
 
         if (initial_connections < 1) {
@@ -536,7 +629,7 @@ int main(int argc, char** argv) {
             plog.info("=== Round: {} connections/shard × {} shards = {} total connections ===", conns, this_smp_shard_count(), conns * this_smp_shard_count());
 
             sharded<downloader> downloaders;
-            co_await downloaders.start(endpoint, conns, sstable_concurrency, max_retries, sstables, corpus_dir);
+            co_await downloaders.start(endpoint, conns, sstable_concurrency, max_retries, sample_interval, sstables, corpus_dir);
 
             const auto t0 = std::chrono::steady_clock::now();
             try {
@@ -544,9 +637,43 @@ int main(int argc, char** argv) {
             } catch (...) {
                 plog.error("Unexpected error during round: {}", std::current_exception());
             }
+
             const double elapsed = std::chrono::duration_cast<std::chrono::duration<double>>(std::chrono::steady_clock::now() - t0).count();
 
             co_await downloaders.invoke_on_all([elapsed](downloader& d) { return d.log_stats(elapsed); });
+
+            // Aggregate the per-shard series: all shards sample on the same
+            // interval from the same round start, so equal indices line up.
+            std::vector<std::vector<sample>> per_shard;
+            for (unsigned sh = 0; sh < this_smp_shard_count(); ++sh) {
+                per_shard.push_back(co_await downloaders.invoke_on(sh, &downloader::collect_samples));
+            }
+            size_t n = per_shard.empty() ? 0 : per_shard.front().size();
+            for (const auto& series : per_shard) {
+                n = std::min(n, series.size());
+            }
+            round_stats prev;
+            double prev_at = 0;
+            for (size_t i = 0; i < n; ++i) {
+                round_stats at_i;
+                double at_sec = 0;
+                for (const auto& series : per_shard) {
+                    at_i += series[i].stats;
+                    at_sec = std::max(at_sec, series[i].at_sec);
+                }
+                const auto r = at_i.since(prev, at_sec - prev_at);
+                plog.info("  t={:6.1f}s  GET/s={:7.0f}  sst/s={:6.1f}  obj/s={:7.1f}  MB/s={:6.0f}  slowdown+={}  netreset+={}  failed+={}",
+                          at_sec,
+                          r.requests_per_sec,
+                          r.sstables_per_sec,
+                          r.objects_per_sec,
+                          r.mbytes_per_sec,
+                          at_i.slowdown_errors - prev.slowdown_errors,
+                          at_i.network_errors - prev.network_errors,
+                          at_i.download_errors - prev.download_errors);
+                prev = at_i;
+                prev_at = at_sec;
+            }
 
             round_stats total;
             for (unsigned s = 0; s < this_smp_shard_count(); ++s) {
@@ -567,6 +694,24 @@ int main(int argc, char** argv) {
                       total.network_errors,
                       total.download_errors,
                       elapsed);
+
+            // One line per round, parseable, so runs from different builds can be
+            // compared without scraping the human-readable log.
+            plog.warn("RESULT {{\"conns_per_shard\":{},\"shards\":{},\"elapsed_sec\":{:.1f},"
+                      "\"requests\":{},\"requests_per_sec\":{:.0f},\"objects\":{},\"objects_per_sec\":{:.1f},"
+                      "\"sstables\":{},\"mbytes_per_sec\":{:.0f},\"slowdown\":{},\"net_reset\":{},\"failed\":{}}}",
+                      conns,
+                      this_smp_shard_count(),
+                      elapsed,
+                      total.read_requests,
+                      gets_per_sec,
+                      total.completed,
+                      elapsed > 0 ? total.completed / elapsed : 0.0,
+                      total.sstables,
+                      mbytes_per_sec,
+                      total.slowdown_errors,
+                      total.network_errors,
+                      total.download_errors);
 
             if (total.download_errors > 0) {
                 plog.warn(">>> {} file(s) failed after all retries at {} connections/shard — "
