@@ -159,6 +159,54 @@ struct endpoint_params {
     }
 };
 
+// ─── sstable grouping ────────────────────────────────────────────────────────
+//
+// Restore fetches whole sstables, not loose objects: per shard it runs
+// max_concurrent_for_each over sstables with a fixed concurrency, and within one
+// sstable it streams the components one after another, TOC first and Scylla
+// second (see download_sstable() in sstables_loader_helpers.cc). The request
+// pattern S3 sees depends on that shape, so the test reproduces it rather than
+// fetching every object independently.
+
+struct sstable_group {
+    std::vector<sstring> components; // TOC first, Scylla second, then the rest
+};
+
+// Component is the last '-' separated field of the basename. Dropping it leaves
+// an identifier shared by every component of one sstable, for both the modern
+// "<ver>-<gen>-<fmt>-<comp>" and the older "<ks>-<cf>-<ver>-<gen>-<comp>" forms.
+static std::string_view component_of(std::string_view key) {
+    const auto base = key.substr(key.rfind('/') + 1);
+    const auto dash = base.rfind('-');
+    return dash == std::string_view::npos ? base : base.substr(dash + 1);
+}
+
+static std::string_view sstable_of(std::string_view key) {
+    const auto dash = key.rfind('-');
+    return dash == std::string_view::npos ? key : key.substr(0, dash);
+}
+
+static std::vector<sstable_group> group_by_sstable(const std::vector<sstring>& keys) {
+    std::unordered_map<std::string_view, std::vector<sstring>> by_sstable;
+    for (const auto& k : keys) {
+        by_sstable[sstable_of(k)].push_back(k);
+    }
+
+    std::vector<sstable_group> groups;
+    groups.reserve(by_sstable.size());
+    for (auto& [_, components] : by_sstable) {
+        // Same ordering restore imposes, for the same reason: the TOC has to be
+        // first, and the Scylla component second.
+        const auto rank = [](const sstring& k) {
+            const auto c = component_of(k);
+            return c == "TOC.txt" ? 0 : c == "Scylla.db" ? 1 : 2;
+        };
+        std::stable_sort(components.begin(), components.end(), [&rank](const sstring& a, const sstring& b) { return rank(a) < rank(b); });
+        groups.push_back(sstable_group{.components = std::move(components)});
+    }
+    return groups;
+}
+
 // ─── downloader ──────────────────────────────────────────────────────────────
 //
 // One instance per shard.  Each instance holds its own S3 client.  The file
@@ -168,11 +216,13 @@ struct endpoint_params {
 class downloader {
     counting_retry_strategy* _retry = nullptr; // raw observer; client owns the unique_ptr
     shared_ptr<s3::client> _client;
-    std::vector<sstring> _files;                       // shuffled per shard
-    unsigned _connections;                             // concurrency limit = connection pool size
+    std::vector<sstable_group> _sstables;              // shuffled per shard
+    unsigned _connections;                             // connection pool size
+    unsigned _sstable_concurrency;                     // concurrent sstables per shard, as in restore
     std::filesystem::path _corpus_dir;                 // empty when persistence is disabled
     std::unordered_set<std::string_view> _corpus_busy; // objects currently being saved
     uint64_t _total_bytes = 0;
+    uint64_t _sstables_done = 0;
     unsigned _download_errors = 0;
     utils::estimated_histogram _latencies;
 
@@ -226,6 +276,17 @@ class downloader {
     // the partial name has to carry the shard id to keep them from colliding.
     static std::filesystem::path partial_path(const std::filesystem::path& final_path) {
         return fmt::format("{}.partial.{}", final_path.native(), this_shard_id());
+    }
+
+    // Components go one at a time, in order, exactly as restore streams them.
+    future<> download_sstable(const sstable_group& sst, abort_source& as) {
+        for (const auto& component : sst.components) {
+            if (as.abort_requested()) {
+                co_return;
+            }
+            co_await download_one(component, as);
+        }
+        ++_sstables_done;
     }
 
     future<> download_one(const sstring& file, abort_source& as) {
@@ -299,11 +360,16 @@ class downloader {
     }
 
 public:
-    downloader(endpoint_params ep, unsigned connections, unsigned max_retries, std::vector<sstring> files, std::filesystem::path corpus_dir)
-        : _files(std::move(files)), _connections(connections), _corpus_dir(std::move(corpus_dir)) {
+    downloader(endpoint_params ep,
+               unsigned connections,
+               unsigned sstable_concurrency,
+               unsigned max_retries,
+               std::vector<sstable_group> sstables,
+               std::filesystem::path corpus_dir)
+        : _sstables(std::move(sstables)), _connections(connections), _sstable_concurrency(sstable_concurrency), _corpus_dir(std::move(corpus_dir)) {
         // Give each shard a distinct permutation so concurrent shards do not
-        // hammer the same objects in the same order.
-        std::shuffle(_files.begin(), _files.end(), std::default_random_engine(this_shard_id()));
+        // hammer the same sstables in the same order.
+        std::shuffle(_sstables.begin(), _sstables.end(), std::default_random_engine(this_shard_id()));
 
         auto rs = std::make_unique<counting_retry_strategy>(max_retries);
         _retry = rs.get();
@@ -314,6 +380,7 @@ public:
         _total_bytes = 0;
         _download_errors = 0;
         _latencies = utils::estimated_histogram{};
+        _sstables_done = 0;
         _retry->reset();
 
         abort_source as;
@@ -327,15 +394,15 @@ public:
         timeout_timer.arm(round_timeout);
 
         try {
-            // A fixed set of workers, each cycling through the file list until
-            // the round timeout aborts them. The worker set has to be what is
-            // bounded rather than the input range: max_concurrent_for_each has
-            // no early exit, so feeding it an unbounded range turns into a busy
-            // loop the moment the abort makes every item return immediately.
+            // One worker per concurrently-restored sstable, matching the
+            // max_concurrent_for_each concurrency restore uses per shard. The
+            // worker set is what is bounded, not the input range: cycling an
+            // unbounded range through max_concurrent_for_each becomes a busy loop
+            // the moment the abort makes every item return immediately.
             size_t next = 0;
-            co_await coroutine::parallel_for_each(std::views::iota(0u, _connections * 3), [this, &as, &next](unsigned) -> future<> {
+            co_await coroutine::parallel_for_each(std::views::iota(0u, _sstable_concurrency), [this, &as, &next](unsigned) -> future<> {
                 while (!as.abort_requested()) {
-                    co_await download_one(_files[next++ % _files.size()], as);
+                    co_await download_sstable(_sstables[next++ % _sstables.size()], as);
                 }
             });
         } catch (const abort_requested_exception&) {
@@ -419,6 +486,9 @@ int main(int argc, char** argv) {
     // Defaults match what a Scylla node uses for its object-storage S3 client.
     constexpr unsigned default_connections = s3::endpoint_config::default_connections_per_shard;
     constexpr unsigned default_retries = aws::default_aws_retry_strategy::default_max_retries;
+    // What restore passes to max_concurrent_for_each per shard, see
+    // sstables_loader.cc:download_tablet_sstables().
+    constexpr unsigned default_sstable_concurrency = 16;
     app.add_options()("bucket", bpo::value<sstring>()->default_value(""), "S3 bucket name (default: $S3_BUCKET_FOR_TEST)")(
         "prefix", bpo::value<sstring>()->default_value(""), "object key prefix to filter listed files")(
         "initial_connections", bpo::value<unsigned>()->default_value(default_connections), "connections per shard for the first round (doubles each round)")(
@@ -426,7 +496,10 @@ int main(int argc, char** argv) {
         "round_timeout", bpo::value<unsigned>()->default_value(15), "per-round timeout in minutes")(
         "corpus_dir", bpo::value<sstring>()->default_value(""), "save each downloaded object once under this directory (empty: do not save)")(
         "max_objects", bpo::value<size_t>()->default_value(0), "use at most this many listed objects (0: all)")(
-        "max_rounds", bpo::value<unsigned>()->default_value(0), "stop after this many rounds even if nothing failed (0: unlimited)");
+        "max_rounds", bpo::value<unsigned>()->default_value(0), "stop after this many rounds even if nothing failed (0: unlimited)")(
+        "sstable_concurrency",
+        bpo::value<unsigned>()->default_value(default_sstable_concurrency),
+        "sstables downloaded concurrently per shard (restore uses 16)");
 
     return app.run(argc, argv, [&app]() -> future<> {
         const sstring bucket = app.configuration()["bucket"].as<sstring>().empty() ? sstring(tests::getenv_safe("S3_BUCKET_FOR_TEST"))
@@ -439,6 +512,7 @@ int main(int argc, char** argv) {
         const std::filesystem::path corpus_dir{app.configuration()["corpus_dir"].as<sstring>().c_str()};
         const size_t max_objects = app.configuration()["max_objects"].as<size_t>();
         const unsigned max_rounds = app.configuration()["max_rounds"].as<unsigned>();
+        const unsigned sstable_concurrency = app.configuration()["sstable_concurrency"].as<unsigned>();
 
         if (initial_connections < 1) {
             throw std::invalid_argument("initial_connections must be >= 1");
@@ -453,7 +527,8 @@ int main(int argc, char** argv) {
             plog.error("No files found in s3://{}/{} — nothing to do", bucket, prefix);
             co_return;
         }
-        plog.info("Going to run on {} objects under s3://{}/{}", files.size(), bucket, prefix);
+        auto sstables = group_by_sstable(files);
+        plog.info("Going to run on {} objects in {} sstables under s3://{}/{}", files.size(), sstables.size(), bucket, prefix);
 
         // Keep doubling connections each round until the retry strategy is
         // exhausted and downloads start failing outright.
@@ -461,7 +536,7 @@ int main(int argc, char** argv) {
             plog.info("=== Round: {} connections/shard × {} shards = {} total connections ===", conns, this_smp_shard_count(), conns * this_smp_shard_count());
 
             sharded<downloader> downloaders;
-            co_await downloaders.start(endpoint, conns, max_retries, files, corpus_dir);
+            co_await downloaders.start(endpoint, conns, sstable_concurrency, max_retries, sstables, corpus_dir);
 
             const auto t0 = std::chrono::steady_clock::now();
             try {
