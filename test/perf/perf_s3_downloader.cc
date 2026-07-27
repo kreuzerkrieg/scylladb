@@ -225,6 +225,27 @@ static void log_sample(std::string_view verb, double at_sec, const round_stats& 
     }
 }
 
+// Mints ids the same way the sstable code does: sstable_identifier and
+// sstable_generation_generator both call UUID_gen::get_time_UUID()
+// (sstables/types.hh, sstables/generation_type.hh), so the key distribution here
+// matches what a real node writes.
+//
+// One guard is needed that production does not need. clock_seq_and_node is a
+// `static thread_local const` whose dynamic initialiser can run late; read before
+// then it is zero-initialised, and get_time_UUID() then returns byte-identical
+// UUIDs for every call on that shard. The assert covering this in UUID_gen is
+// compiled out in release builds, so it fails silently -- observed here as
+// hundreds of sstables colliding on one corpus directory. Detect the degenerate
+// result and fall back to a generator that randomises the low half.
+static utils::UUID fresh_sstable_id() {
+    auto id = utils::UUID_gen::get_time_UUID();
+    if (id.get_least_significant_bits() == 0) [[unlikely]] {
+        const auto now = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::system_clock::now().time_since_epoch());
+        id = utils::UUID_gen::get_random_time_UUID_from_micros(now);
+    }
+    return id;
+}
+
 // ─── sstable grouping ────────────────────────────────────────────────────────
 //
 // Restore fetches whole sstables, not loose objects: per shard it runs
@@ -235,6 +256,7 @@ static void log_sample(std::string_view verb, double at_sec, const round_stats& 
 // fetching every object independently.
 
 struct sstable_group {
+    sstring id;                      // key prefix shared by every component
     std::vector<sstring> components; // TOC first, Scylla second, then the rest
 };
 
@@ -265,7 +287,7 @@ static std::vector<sstable_group> group_by_sstable(const std::vector<sstring>& k
 
     std::vector<sstable_group> groups;
     groups.reserve(by_sstable.size());
-    for (auto& [_, components] : by_sstable) {
+    for (auto& [id, components] : by_sstable) {
         // Same ordering restore imposes, for the same reason: the TOC has to be
         // first, and the Scylla component second.
         const auto rank = [](const sstring& k) {
@@ -273,9 +295,44 @@ static std::vector<sstable_group> group_by_sstable(const std::vector<sstring>& k
             return c == "TOC.txt" ? 0 : c == "Scylla.db" ? 1 : 2;
         };
         std::stable_sort(components.begin(), components.end(), [&rank](const sstring& a, const sstring& b) { return rank(a) < rank(b); });
-        groups.push_back(sstable_group{.components = std::move(components)});
+        groups.push_back(sstable_group{.id = sstring(id), .components = std::move(components)});
     }
+    // Iteration order of an unordered_map is not part of its contract, and the
+    // fleet split assigns work by position in this vector, so the order has to
+    // come from the keys themselves: every instance must derive the same order
+    // from the same listing without coordinating with the others.
+    std::ranges::sort(groups, std::less<>{}, &sstable_group::id);
     return groups;
+}
+
+// Splits the dataset across a fleet: an instance takes the sstables whose
+// position in the globally ordered listing is congruent to its own index. S3
+// lists keys lexicographically, so each instance reaches the same assignment
+// from the same bucket with no coordinator and no manifest to distribute, and
+// the slices are exactly balanced for any fleet size.
+//
+// Deriving the assignment from the sstable_id instead is a trap. A v1 time UUID
+// keeps its only fast-varying field, time_low, in the high half of the MSB: the
+// low 48 bits of the LSB are the node id, fixed per producing shard, and the low
+// 16 bits of the MSB are version|time_hi, which advances once per ~7.8 hours.
+// Measured over a real 5735-sstable corpus, the ids carried 64 distinct LSBs
+// that all shared their low 32 bits, so truncate-and-modulus lands every sstable
+// on one instance for any fleet size dividing 256 — 16, 32 and 64 included.
+// Folding the halves together first, as std::hash<UUID> does, restores the
+// entropy but not the independence: PR 30846 derives the object prefix from a
+// hash of the same id, so sharing a hash with the prefix layout would correlate
+// each instance's key set with the variable under test. Position correlates with
+// neither.
+static std::vector<sstable_group> select_fleet_slice(std::vector<sstable_group> groups, unsigned fleet_size, unsigned fleet_index) {
+    if (fleet_size <= 1) {
+        return groups;
+    }
+    std::vector<sstable_group> mine;
+    mine.reserve(groups.size() / fleet_size + 1);
+    for (size_t i = fleet_index; i < groups.size(); i += fleet_size) {
+        mine.push_back(std::move(groups[i]));
+    }
+    return mine;
 }
 
 // ─── downloader ──────────────────────────────────────────────────────────────
@@ -323,7 +380,7 @@ class downloader {
     future<> download_sstable(const sstable_group& sst, abort_source& as) {
         // One id for the whole sstable: every component of it has to land under
         // the same directory, exactly as it would in the bucket.
-        const auto sid = utils::UUID_gen::get_time_UUID();
+        const auto sid = fresh_sstable_id();
         for (const auto& component : sst.components) {
             if (as.abort_requested()) {
                 co_return;
@@ -576,7 +633,13 @@ public:
     // arguments to every shard, which would give each one the whole list.
     void adopt(std::vector<upload_item> items) { _items = std::move(items); }
 
-    future<> run(abort_source& as) {
+    // The abort_source has to be created here, per shard. abort_source::subscription
+    // is an intrusive list hook and the list is not thread safe, so sharing one
+    // across shards -- as passing it into invoke_on_all does -- corrupts the list
+    // as soon as several shards register with it, and http::client::make_request
+    // then segfaults walking a null node.
+    future<> run() {
+        abort_source as;
         size_t next = 0;
 
         // Upload had no in-flight reporting at all: throttling surfaced only in
@@ -674,7 +737,7 @@ static std::vector<upload_item> plan_uploads(const std::filesystem::path& corpus
         if (!dir.is_directory()) {
             continue;
         }
-        const auto sid = utils::UUID_gen::get_time_UUID();
+        const auto sid = fresh_sstable_id();
         for (const auto& comp : std::filesystem::directory_iterator(dir.path())) {
             if (!comp.is_regular_file()) {
                 continue;
@@ -745,6 +808,8 @@ int main(int argc, char** argv) {
         "round_timeout", bpo::value<unsigned>()->default_value(15), "per-round timeout in minutes (0: run until the whole list is done)")(
         "corpus_dir", bpo::value<sstring>()->default_value(""), "save each downloaded object once under this directory (empty: do not save)")(
         "max_objects", bpo::value<size_t>()->default_value(0), "use at most this many listed objects (0: all)")(
+        "fleet_size", bpo::value<unsigned>()->default_value(1), "number of instances sharing the dataset (1: this instance takes all of it)")(
+        "fleet_index", bpo::value<unsigned>()->default_value(0), "0-based index of this instance within the fleet")(
         "max_rounds", bpo::value<unsigned>()->default_value(0), "stop after this many rounds even if nothing failed (0: unlimited)")(
         "sample_interval", bpo::value<unsigned>()->default_value(10), "seconds between in-round rate samples")(
         "sstable_concurrency",
@@ -766,6 +831,8 @@ int main(int argc, char** argv) {
         const auto round_timeout = std::chrono::minutes(app.configuration()["round_timeout"].as<unsigned>());
         const std::filesystem::path corpus_dir{app.configuration()["corpus_dir"].as<sstring>().c_str()};
         const size_t max_objects = app.configuration()["max_objects"].as<size_t>();
+        const unsigned fleet_size = app.configuration()["fleet_size"].as<unsigned>();
+        const unsigned fleet_index = app.configuration()["fleet_index"].as<unsigned>();
         unsigned max_rounds = app.configuration()["max_rounds"].as<unsigned>();
         // Walking the list once is a single round by definition; without this the
         // connection-doubling loop would start over and re-fetch everything.
@@ -781,6 +848,13 @@ int main(int argc, char** argv) {
 
         if (mode != "download" && mode != "upload") {
             throw std::invalid_argument(format("unknown mode '{}', expected download or upload", mode));
+        }
+
+        if (fleet_size < 1) {
+            throw std::invalid_argument("fleet_size must be >= 1");
+        }
+        if (fleet_index >= fleet_size) {
+            throw std::invalid_argument(format("fleet_index {} is out of range for fleet_size {}", fleet_index, fleet_size));
         }
 
         if (mode == "upload") {
@@ -815,8 +889,7 @@ int main(int argc, char** argv) {
             }
 
             const auto t0 = std::chrono::steady_clock::now();
-            abort_source as;
-            co_await uploaders.invoke_on_all([&as](uploader& u) { return u.run(as); });
+            co_await uploaders.invoke_on_all([](uploader& u) { return u.run(); });
             const double elapsed = std::chrono::duration_cast<std::chrono::duration<double>>(std::chrono::steady_clock::now() - t0).count();
 
             co_await uploaders.invoke_on_all([elapsed](uploader& u) { return u.log_stats(elapsed); });
@@ -857,7 +930,20 @@ int main(int argc, char** argv) {
             co_return;
         }
         auto sstables = group_by_sstable(files);
-        plog.info("Going to run on {} objects in {} sstables under s3://{}/{}", files.size(), sstables.size(), bucket, prefix);
+        const auto fleet_total = sstables.size();
+        sstables = select_fleet_slice(std::move(sstables), fleet_size, fleet_index);
+        if (sstables.empty()) {
+            plog.error("Fleet slice {}/{} is empty: only {} sstables under s3://{}/{}", fleet_index, fleet_size, fleet_total, bucket, prefix);
+            co_return;
+        }
+        plog.info("Going to run on {} of {} sstables ({} objects listed) under s3://{}/{}, fleet slice {}/{}",
+                  sstables.size(),
+                  fleet_total,
+                  files.size(),
+                  bucket,
+                  prefix,
+                  fleet_index,
+                  fleet_size);
 
         // Keep doubling connections each round until the retry strategy is
         // exhausted and downloads start failing outright.
