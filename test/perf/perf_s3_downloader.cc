@@ -531,6 +531,167 @@ public:
     }
 };
 
+// ─── uploader ────────────────────────────────────────────────────────────────
+//
+// Mirrors db/snapshot/backup_task.cc: components are uploaded individually via
+// client::upload_file(), with the per-shard in-flight count bounded by what
+// backup uses -- sstables_manager::dir_semaphore(), whose size is
+// initial_sstable_loading_concurrency (default 4). upload_file() itself
+// parallelises the parts of one file internally, bounded by the client.
+//
+// Keys follow the layout object_name(bucket, prefix, sstable_id, component)
+// produces: /<bucket>/<prefix>/<sstable_id>/<component>. A fresh sstable_id is
+// minted per sstable per run, so repeated runs accumulate rather than overwrite
+// each other -- the same reason a real sstable gets a new generation.
+
+struct upload_item {
+    std::filesystem::path local;
+    sstring key;
+};
+
+class uploader {
+    counting_retry_strategy* _retry = nullptr;
+    shared_ptr<s3::client> _client;
+    std::vector<upload_item> _items;
+    unsigned _connections;
+    unsigned _file_concurrency;
+    std::chrono::seconds _sample_interval;
+    uint64_t _uploaded_bytes = 0;
+    uint64_t _uploaded_files = 0;
+    unsigned _upload_errors = 0;
+    utils::estimated_histogram _latencies;
+
+    std::chrono::steady_clock::time_point _now() const noexcept { return std::chrono::steady_clock::now(); }
+
+public:
+    uploader(endpoint_params ep, unsigned connections, unsigned file_concurrency, unsigned max_retries, std::chrono::seconds sample_interval,
+             std::vector<upload_item> items)
+        : _items(std::move(items)), _connections(connections), _file_concurrency(file_concurrency), _sample_interval(sample_interval) {
+        auto rs = std::make_unique<counting_retry_strategy>(max_retries);
+        _retry = rs.get();
+        _client = s3::client::make(ep.host, ep.make_config(_connections), std::move(rs));
+    }
+
+    // The slice is handed over after start(): sharded<> copies its constructor
+    // arguments to every shard, which would give each one the whole list.
+    void adopt(std::vector<upload_item> items) { _items = std::move(items); }
+
+    future<> run(abort_source& as) {
+        size_t next = 0;
+
+        // Upload had no in-flight reporting at all: throttling surfaced only in
+        // the closing RESULT line. That is how a fleet run accumulated ~25k
+        // SlowDown retries and 75 aborted multipart uploads before anyone could
+        // see it. Sample on the same interval the download side uses.
+        const auto round_start = _now();
+        round_stats prev;
+        double prev_at = 0;
+        timer<lowres_clock> sample_timer;
+        sample_timer.set_callback([this, round_start, &prev, &prev_at] {
+            const auto at_sec = std::chrono::duration_cast<std::chrono::duration<double>>(_now() - round_start).count();
+            auto stats = collect_stats();
+            log_sample("PUT", at_sec, stats, prev, prev_at);
+            prev = stats;
+            prev_at = at_sec;
+        });
+        sample_timer.arm_periodic(_sample_interval);
+
+        co_await coroutine::parallel_for_each(std::views::iota(0u, _file_concurrency), [this, &as, &next](unsigned) -> future<> {
+            while (!as.abort_requested()) {
+                const size_t i = next++;
+                if (i >= _items.size()) {
+                    co_return;
+                }
+                co_await upload_one(_items[i], as);
+            }
+        });
+        sample_timer.cancel();
+    }
+
+    future<> upload_one(const upload_item& item, abort_source& as) {
+        const auto t0 = _now();
+        std::exception_ptr failure;
+        try {
+            const auto size = co_await file_size(item.local.native());
+            co_await _client->upload_file(item.local, item.key, std::nullopt, std::nullopt, &as);
+            _uploaded_bytes += size;
+            ++_uploaded_files;
+            _latencies.add(std::chrono::duration_cast<std::chrono::milliseconds>(_now() - t0).count());
+        } catch (...) {
+            failure = std::current_exception();
+        }
+        if (failure && !as.abort_requested()) {
+            // A throttled upload surfaces as "Failed to parse ETag list" rather
+            // than as SlowDown: upload_part swallows the real error and leaves an
+            // empty ETag. Take the throttling counts from the retry strategy.
+            plog.info("shard {}: error uploading {}: {}", this_shard_id(), item.key, failure);
+            ++_upload_errors;
+        }
+    }
+
+    future<> stop() { co_await _client->close(); }
+
+    round_stats collect_stats() const noexcept {
+        const auto c = _client->get_request_counters();
+        return {
+            .slowdown_errors = _retry ? _retry->slowdown_errors() : 0u,
+            .network_errors = _retry ? _retry->network_errors() : 0u,
+            .download_errors = _upload_errors,
+            .read_requests = c.write_ops + c.write_retries,
+            .read_bytes = c.write_bytes,
+            .completed = _uploaded_files,
+            .sstables = 0,
+        };
+    }
+
+    future<> log_stats(double elapsed_sec) const {
+        if (_latencies._count == 0) {
+            plog.info("  shard {:2d}: no files uploaded", this_shard_id());
+            co_return;
+        }
+        plog.info("  shard {:2d}: files={:6}  bytes={:8}MB  speed={:.0f}MB/s  up-errors={}  lat min/p50/p99/max = {}/{}/{}/{} ms",
+                  this_shard_id(),
+                  _latencies._count,
+                  _uploaded_bytes >> 20,
+                  elapsed_sec > 0 ? static_cast<double>(_uploaded_bytes >> 20) / elapsed_sec : 0.0,
+                  _upload_errors,
+                  _latencies.percentile(0.0),
+                  _latencies.percentile(0.5),
+                  _latencies.percentile(0.99),
+                  _latencies.percentile(1.0));
+    }
+};
+
+// The corpus is laid out as <sstable_id>/<component>, so one directory is one
+// sstable. A *new* id is minted for the upload key rather than reusing the
+// directory name, so repeated upload runs accumulate objects instead of
+// overwriting each other. A time UUID is used because that is what
+// scylla_metadata::set_sstable_identifier() defaults to, giving the same key
+// distribution a real node produces.
+static std::vector<upload_item> plan_uploads(const std::filesystem::path& corpus_dir, const sstring& bucket, const sstring& prefix) {
+    std::vector<upload_item> items;
+    for (const auto& dir : std::filesystem::directory_iterator(corpus_dir)) {
+        if (!dir.is_directory()) {
+            continue;
+        }
+        const auto sid = utils::UUID_gen::get_time_UUID();
+        for (const auto& comp : std::filesystem::directory_iterator(dir.path())) {
+            if (!comp.is_regular_file()) {
+                continue;
+            }
+            const auto name = comp.path().filename().string();
+            if (name.ends_with(".partial")) {
+                continue; // interrupted download, not a complete component
+            }
+            items.push_back(upload_item{
+                .local = comp.path(),
+                .key = fmt::format("/{}/{}/{}/{}", bucket, prefix, sid, name),
+            });
+        }
+    }
+    return items;
+}
+
 // ─── bucket listing ──────────────────────────────────────────────────────────
 
 static future<std::vector<sstring>> list_bucket(const endpoint_params& ep, const sstring& bucket, const sstring& prefix, size_t max_objects) {
@@ -575,6 +736,8 @@ int main(int argc, char** argv) {
     // sstables_loader.cc:download_tablet_sstables().
     constexpr unsigned default_sstable_concurrency = 16;
     // What backup bounds itself by: sstables_manager::dir_semaphore(), sized from
+    // initial_sstable_loading_concurrency (db/config.cc default 4).
+    constexpr unsigned default_file_concurrency = 4;
     app.add_options()("bucket", bpo::value<sstring>()->default_value(""), "S3 bucket name (default: $S3_BUCKET_FOR_TEST)")(
         "prefix", bpo::value<sstring>()->default_value(""), "object key prefix to filter listed files")(
         "initial_connections", bpo::value<unsigned>()->default_value(default_connections), "connections per shard for the first round (doubles each round)")(
@@ -586,7 +749,12 @@ int main(int argc, char** argv) {
         "sample_interval", bpo::value<unsigned>()->default_value(10), "seconds between in-round rate samples")(
         "sstable_concurrency",
         bpo::value<unsigned>()->default_value(default_sstable_concurrency),
-        "sstables downloaded concurrently per shard (restore uses 16)");
+        "sstables downloaded concurrently per shard (restore uses 16)")("mode", bpo::value<sstring>()->default_value("download"), "download or upload")(
+        "upload_bucket", bpo::value<sstring>()->default_value("manager-backup-tests-us-east-1"), "bucket to upload the corpus into")(
+        "upload_prefix", bpo::value<sstring>()->default_value("sstables_ewz"), "key prefix for uploads")(
+        "file_concurrency",
+        bpo::value<unsigned>()->default_value(default_file_concurrency),
+        "components uploaded concurrently per shard (backup uses initial_sstable_loading_concurrency, 4)");
 
     return app.run(argc, argv, [&app]() -> future<> {
         const sstring bucket = app.configuration()["bucket"].as<sstring>().empty() ? sstring(tests::getenv_safe("S3_BUCKET_FOR_TEST"))
@@ -606,6 +774,80 @@ int main(int argc, char** argv) {
         }
         const auto sample_interval = std::chrono::seconds(app.configuration()["sample_interval"].as<unsigned>());
         const unsigned sstable_concurrency = app.configuration()["sstable_concurrency"].as<unsigned>();
+        const sstring mode = app.configuration()["mode"].as<sstring>();
+        const sstring upload_bucket = app.configuration()["upload_bucket"].as<sstring>();
+        const sstring upload_prefix = app.configuration()["upload_prefix"].as<sstring>();
+        const unsigned file_concurrency = app.configuration()["file_concurrency"].as<unsigned>();
+
+        if (mode != "download" && mode != "upload") {
+            throw std::invalid_argument(format("unknown mode '{}', expected download or upload", mode));
+        }
+
+        if (mode == "upload") {
+            if (corpus_dir.empty()) {
+                throw std::invalid_argument("upload mode needs --corpus_dir");
+            }
+            auto items = plan_uploads(corpus_dir, upload_bucket, upload_prefix);
+            if (items.empty()) {
+                plog.error("no sstable components found under {}", corpus_dir.native());
+                co_return;
+            }
+            plog.info("Uploading {} components to s3://{}/{}/ ({} concurrent per shard x {} shards)",
+                      items.size(),
+                      upload_bucket,
+                      upload_prefix,
+                      file_concurrency,
+                      this_smp_shard_count());
+
+            // Each shard takes a disjoint slice, so a component is uploaded once.
+            sharded<uploader> uploaders;
+            std::vector<std::vector<upload_item>> per_shard(this_smp_shard_count());
+            for (size_t i = 0; i < items.size(); ++i) {
+                per_shard[i % this_smp_shard_count()].push_back(std::move(items[i]));
+            }
+            co_await uploaders.start(endpoint, initial_connections, file_concurrency, max_retries, sample_interval, std::vector<upload_item>{});
+            // hand each shard its slice
+            for (unsigned sh = 0; sh < this_smp_shard_count(); ++sh) {
+                co_await uploaders.invoke_on(sh, [slice = std::move(per_shard[sh])](uploader& u) mutable -> future<> {
+                    u.adopt(std::move(slice));
+                    co_return;
+                });
+            }
+
+            const auto t0 = std::chrono::steady_clock::now();
+            abort_source as;
+            co_await uploaders.invoke_on_all([&as](uploader& u) { return u.run(as); });
+            const double elapsed = std::chrono::duration_cast<std::chrono::duration<double>>(std::chrono::steady_clock::now() - t0).count();
+
+            co_await uploaders.invoke_on_all([elapsed](uploader& u) { return u.log_stats(elapsed); });
+            round_stats total;
+            for (unsigned sh = 0; sh < this_smp_shard_count(); ++sh) {
+                total += co_await uploaders.invoke_on(sh, &uploader::collect_stats);
+            }
+            co_await uploaders.stop();
+
+            const double puts = elapsed > 0 ? static_cast<double>(total.read_requests) / elapsed : 0.0;
+            const double mbs = elapsed > 0 ? static_cast<double>(total.read_bytes >> 20) / elapsed : 0.0;
+            plog.warn("RESULT {{\"mode\":\"upload\",\"shards\":{},\"elapsed_sec\":{:.1f},"
+                      "\"requests\":{},\"requests_per_sec\":{:.0f},\"files\":{},\"mbytes_per_sec\":{:.0f},"
+                      "\"slowdown\":{},\"net_reset\":{},\"failed\":{}}}",
+                      this_smp_shard_count(),
+                      elapsed,
+                      total.read_requests,
+                      puts,
+                      total.completed,
+                      mbs,
+                      total.slowdown_errors,
+                      total.network_errors,
+                      total.download_errors);
+            co_return;
+        }
+
+        if (initial_connections < 1) {
+            throw std::invalid_argument("initial_connections must be >= 1");
+        }
+
+        plog.info("Endpoint {}://{}:{} region={}", endpoint.use_https ? "https" : "http", endpoint.host, endpoint.port, endpoint.region);
 
         // List files once on shard 0; the full vector is broadcast to every
         // shard via sharded<downloader>::start().
