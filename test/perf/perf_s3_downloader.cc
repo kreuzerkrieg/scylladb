@@ -56,6 +56,7 @@
 #include "utils/s3/aws_error.hh"
 #include "utils/s3/client.hh"
 #include "utils/s3/default_aws_retry_strategy.hh"
+#include "utils/UUID_gen.hh"
 
 using namespace std::chrono_literals;
 using namespace std::string_view_literals;
@@ -254,6 +255,11 @@ static std::string_view sstable_of(std::string_view key) {
 static std::vector<sstable_group> group_by_sstable(const std::vector<sstring>& keys) {
     std::unordered_map<std::string_view, std::vector<sstring>> by_sstable;
     for (const auto& k : keys) {
+        // manifest.json and schema.cql sit alongside the sstables but are not
+        // components of one; grouping them would invent single-file "sstables".
+        if (component_of(k) == std::string_view(k).substr(std::string_view(k).rfind('/') + 1)) {
+            continue;
+        }
         by_sstable[sstable_of(k)].push_back(k);
     }
 
@@ -284,9 +290,9 @@ class downloader {
     std::vector<sstable_group> _sstables; // shuffled per shard
     unsigned _connections;                // connection pool size
     unsigned _sstable_concurrency;        // concurrent sstables per shard, as in restore
+    bool _run_to_completion;              // walk the list once instead of cycling
     std::chrono::seconds _sample_interval;
-    std::filesystem::path _corpus_dir;                 // empty when persistence is disabled
-    std::unordered_set<std::string_view> _corpus_busy; // objects currently being saved
+    std::filesystem::path _corpus_dir; // empty when persistence is disabled
     uint64_t _total_bytes = 0;
     uint64_t _sstables_done = 0;
     unsigned _download_errors = 0;
@@ -295,43 +301,18 @@ class downloader {
 
     std::chrono::steady_clock::time_point _now() const noexcept { return std::chrono::steady_clock::now(); }
 
-    // Local path an object is persisted to.  The leading "/<bucket>" is dropped
-    // so that the directory tree mirrors the in-bucket key layout, which is what
-    // the upload phase needs in order to reproduce it.
-    std::filesystem::path corpus_path(const sstring& object_key) const {
-        std::filesystem::path key{object_key.c_str()};
-        auto it = key.begin();
-        ++it; // leading "/"
-        ++it; // bucket name
-        std::filesystem::path relative;
-        for (; it != key.end(); ++it) {
-            relative /= *it;
-        }
-        return _corpus_dir / relative;
+    // Components are persisted under a freshly minted sstable_id, mirroring the
+    // in-bucket layout <sstable_id>/<component>. The id is minted per sstable per
+    // shard, so two shards saving the same source sstable cannot collide, and the
+    // corpus is already in the shape the upload phase needs.
+    std::filesystem::path corpus_path(const utils::UUID& sid, std::string_view component) const {
+        return _corpus_dir / fmt::to_string(sid) / std::string(component);
     }
 
-    // Objects are saved at most once: the first pass populates the corpus and
-    // later rounds run without touching the disk, so local I/O never becomes the
-    // bottleneck during the rounds that matter.
-    // Objects are written to a ".partial" sibling and renamed once the download
-    // has completed, so an interrupted or failed transfer can never leave a
-    // truncated file that the existence check above would then skip forever.
-    // Several workers cycle over the same file list concurrently, so the same
-    // object is routinely downloaded more than once at a time. Only one of those
-    // downloads may write to disk: _corpus_busy holds the objects already being
-    // saved. It is claimed before the first co_await, otherwise two workers both
-    // pass the check while suspended and then race on the rename.
-    future<std::optional<output_stream<char>>> open_corpus_sink(const sstring& object_key) {
-        // Only one shard saves. _corpus_busy is per shard and the existence
-        // check only helps once a rename has landed, so letting every shard save
-        // means each object is written up to smp::count times over.
-        if (_corpus_dir.empty() || this_shard_id() != 0 || _corpus_busy.contains(object_key)) {
-            co_return std::nullopt;
-        }
-        _corpus_busy.emplace(object_key);
-        auto path = corpus_path(object_key);
-        if (co_await file_exists(path.native())) {
-            _corpus_busy.erase(object_key);
+    static std::filesystem::path partial_path(const std::filesystem::path& final_path) { return final_path.native() + ".partial"; }
+
+    future<std::optional<output_stream<char>>> open_corpus_sink(const std::filesystem::path& path) {
+        if (_corpus_dir.empty()) {
             co_return std::nullopt;
         }
         co_await recursive_touch_directory(path.parent_path().native());
@@ -339,24 +320,20 @@ class downloader {
         co_return co_await make_file_output_stream(std::move(f));
     }
 
-    // Shards share the corpus directory but keep separate _corpus_busy sets, so
-    // the partial name has to carry the shard id to keep them from colliding.
-    static std::filesystem::path partial_path(const std::filesystem::path& final_path) {
-        return fmt::format("{}.partial.{}", final_path.native(), this_shard_id());
-    }
-
-    // Components go one at a time, in order, exactly as restore streams them.
     future<> download_sstable(const sstable_group& sst, abort_source& as) {
+        // One id for the whole sstable: every component of it has to land under
+        // the same directory, exactly as it would in the bucket.
+        const auto sid = utils::UUID_gen::get_time_UUID();
         for (const auto& component : sst.components) {
             if (as.abort_requested()) {
                 co_return;
             }
-            co_await download_one(component, as);
+            co_await download_one(component, sid, as);
         }
         ++_sstables_done;
     }
 
-    future<> download_one(const sstring& file, abort_source& as) {
+    future<> download_one(const sstring& file, const utils::UUID& sid, abort_source& as) {
         const auto t0 = _now();
         // Declared outside the try so the failure path can still close it: an
         // output_stream asserts in its destructor if it was never closed, which
@@ -366,15 +343,9 @@ class downloader {
         // _corpus_busy entry, which outlives the stream.
         std::optional<output_stream<char>> sink;
         std::exception_ptr failure;
-        bool claimed = false;
-        auto release = defer([this, &file, &claimed]() noexcept {
-            if (claimed) {
-                _corpus_busy.erase(file);
-            }
-        });
+        const auto path = _corpus_dir.empty() ? std::filesystem::path{} : corpus_path(sid, component_of(file));
         try {
-            sink = co_await open_corpus_sink(file);
-            claimed = sink.has_value();
+            sink = co_await open_corpus_sink(path);
             // Same source Scylla uses to read a whole object — see
             // object_storage_client::make_download_source().
             auto src = _client->make_chunked_download_source(file, s3::full_range, &as);
@@ -394,7 +365,6 @@ class downloader {
             if (sink) {
                 co_await sink->close();
                 sink.reset(); // closed; the failure path must not close it again
-                auto path = corpus_path(file);
                 co_await rename_file(partial_path(path).native(), path.native());
             }
             _total_bytes += sz;
@@ -415,7 +385,7 @@ class downloader {
             } catch (...) {
             }
             try {
-                co_await remove_file(partial_path(corpus_path(file)).native());
+                co_await remove_file(partial_path(path).native());
             } catch (...) {
             }
         }
@@ -435,15 +405,28 @@ public:
                unsigned max_retries,
                std::chrono::seconds sample_interval,
                std::vector<sstable_group> sstables,
-               std::filesystem::path corpus_dir)
+               std::filesystem::path corpus_dir,
+               bool run_to_completion)
         : _sstables(std::move(sstables))
         , _connections(connections)
         , _sstable_concurrency(sstable_concurrency)
+        , _run_to_completion(run_to_completion)
         , _sample_interval(sample_interval)
         , _corpus_dir(std::move(corpus_dir)) {
-        // Give each shard a distinct permutation so concurrent shards do not
-        // hammer the same sstables in the same order.
-        std::shuffle(_sstables.begin(), _sstables.end(), std::default_random_engine(this_shard_id()));
+        if (_run_to_completion) {
+            // One pass over the data: shards take disjoint slices so each sstable
+            // is fetched once and the corpus holds one copy, rather than every
+            // shard walking the whole list.
+            std::vector<sstable_group> mine;
+            for (size_t i = this_shard_id(); i < _sstables.size(); i += this_smp_shard_count()) {
+                mine.push_back(std::move(_sstables[i]));
+            }
+            _sstables = std::move(mine);
+        } else {
+            // Load generation: every shard cycles the whole list, in its own order
+            // so concurrent shards do not hammer the same sstables together.
+            std::shuffle(_sstables.begin(), _sstables.end(), std::default_random_engine(this_shard_id()));
+        }
 
         auto rs = std::make_unique<counting_retry_strategy>(max_retries);
         _retry = rs.get();
@@ -477,7 +460,9 @@ public:
                 as.request_abort();
             }
         });
-        timeout_timer.arm(round_timeout);
+        if (!_run_to_completion) {
+            timeout_timer.arm(round_timeout);
+        }
 
         try {
             // One worker per concurrently-restored sstable, matching the
@@ -485,10 +470,19 @@ public:
             // worker set is what is bounded, not the input range: cycling an
             // unbounded range through max_concurrent_for_each becomes a busy loop
             // the moment the abort makes every item return immediately.
+            // With a round timeout the workers cycle the list to keep load up for
+            // the whole round. Without one the point is to get through the data
+            // once, so each sstable is taken exactly once and the run ends when
+            // the list is exhausted.
             size_t next = 0;
-            co_await coroutine::parallel_for_each(std::views::iota(0u, _sstable_concurrency), [this, &as, &next](unsigned) -> future<> {
+            const bool once = _run_to_completion;
+            co_await coroutine::parallel_for_each(std::views::iota(0u, _sstable_concurrency), [this, &as, &next, once](unsigned) -> future<> {
                 while (!as.abort_requested()) {
-                    co_await download_sstable(_sstables[next++ % _sstables.size()], as);
+                    const size_t i = next++;
+                    if (once && i >= _sstables.size()) {
+                        co_return;
+                    }
+                    co_await download_sstable(_sstables[once ? i : i % _sstables.size()], as);
                 }
             });
         } catch (const abort_requested_exception&) {
@@ -580,11 +574,12 @@ int main(int argc, char** argv) {
     // What restore passes to max_concurrent_for_each per shard, see
     // sstables_loader.cc:download_tablet_sstables().
     constexpr unsigned default_sstable_concurrency = 16;
+    // What backup bounds itself by: sstables_manager::dir_semaphore(), sized from
     app.add_options()("bucket", bpo::value<sstring>()->default_value(""), "S3 bucket name (default: $S3_BUCKET_FOR_TEST)")(
         "prefix", bpo::value<sstring>()->default_value(""), "object key prefix to filter listed files")(
         "initial_connections", bpo::value<unsigned>()->default_value(default_connections), "connections per shard for the first round (doubles each round)")(
         "max_retries", bpo::value<unsigned>()->default_value(default_retries), "max retries per request inside the counting retry strategy")(
-        "round_timeout", bpo::value<unsigned>()->default_value(15), "per-round timeout in minutes")(
+        "round_timeout", bpo::value<unsigned>()->default_value(15), "per-round timeout in minutes (0: run until the whole list is done)")(
         "corpus_dir", bpo::value<sstring>()->default_value(""), "save each downloaded object once under this directory (empty: do not save)")(
         "max_objects", bpo::value<size_t>()->default_value(0), "use at most this many listed objects (0: all)")(
         "max_rounds", bpo::value<unsigned>()->default_value(0), "stop after this many rounds even if nothing failed (0: unlimited)")(
@@ -603,15 +598,14 @@ int main(int argc, char** argv) {
         const auto round_timeout = std::chrono::minutes(app.configuration()["round_timeout"].as<unsigned>());
         const std::filesystem::path corpus_dir{app.configuration()["corpus_dir"].as<sstring>().c_str()};
         const size_t max_objects = app.configuration()["max_objects"].as<size_t>();
-        const unsigned max_rounds = app.configuration()["max_rounds"].as<unsigned>();
+        unsigned max_rounds = app.configuration()["max_rounds"].as<unsigned>();
+        // Walking the list once is a single round by definition; without this the
+        // connection-doubling loop would start over and re-fetch everything.
+        if (round_timeout.count() == 0 && max_rounds == 0) {
+            max_rounds = 1;
+        }
         const auto sample_interval = std::chrono::seconds(app.configuration()["sample_interval"].as<unsigned>());
         const unsigned sstable_concurrency = app.configuration()["sstable_concurrency"].as<unsigned>();
-
-        if (initial_connections < 1) {
-            throw std::invalid_argument("initial_connections must be >= 1");
-        }
-
-        plog.info("Endpoint {}://{}:{} region={}", endpoint.use_https ? "https" : "http", endpoint.host, endpoint.port, endpoint.region);
 
         // List files once on shard 0; the full vector is broadcast to every
         // shard via sharded<downloader>::start().
@@ -629,7 +623,7 @@ int main(int argc, char** argv) {
             plog.info("=== Round: {} connections/shard × {} shards = {} total connections ===", conns, this_smp_shard_count(), conns * this_smp_shard_count());
 
             sharded<downloader> downloaders;
-            co_await downloaders.start(endpoint, conns, sstable_concurrency, max_retries, sample_interval, sstables, corpus_dir);
+            co_await downloaders.start(endpoint, conns, sstable_concurrency, max_retries, sample_interval, sstables, corpus_dir, round_timeout.count() == 0);
 
             const auto t0 = std::chrono::steady_clock::now();
             try {
