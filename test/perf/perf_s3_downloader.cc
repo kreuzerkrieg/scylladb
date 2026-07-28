@@ -32,6 +32,8 @@
 //   AWS_SESSION_TOKEN            – AWS session token (for temporary credentials)
 
 #include <algorithm>
+#include <array>
+#include <optional>
 #include <chrono>
 #include <filesystem>
 #include <random>
@@ -260,29 +262,52 @@ struct sstable_group {
     std::vector<sstring> components; // TOC first, Scylla second, then the rest
 };
 
-// Component is the last '-' separated field of the basename. Dropping it leaves
-// an identifier shared by every component of one sstable, for both the modern
-// "<ver>-<gen>-<fmt>-<comp>" and the older "<ks>-<cf>-<ver>-<gen>-<comp>" forms.
-static std::string_view component_of(std::string_view key) {
-    const auto base = key.substr(key.rfind('/') + 1);
-    const auto dash = base.rfind('-');
-    return dash == std::string_view::npos ? base : base.substr(dash + 1);
+// Component names Scylla writes. An explicit set is needed because the two
+// layouts this test has to read cannot be told apart by shape:
+//
+//   backup:         <prefix>/<host_id>/me-<gen>-big-Data.db   components share a dir
+//   object storage: <prefix>/<sstable_id>/Data.db             one dir per sstable
+//
+// In the first the component is the trailing '-' field and the sstable identity is
+// the filename stem; in the second the basename *is* the component and the
+// identity is the directory. Deciding on "does the basename contain a dash" gets
+// the second case wrong -- every key looks like a non-component and the listing
+// groups to zero sstables -- and it also has to special-case manifest.json and
+// schema.cql, which sit alongside the sstables.
+static bool is_component_name(std::string_view name) {
+    static constexpr std::array known = {
+        "CRC.db"sv, "CompressionInfo.db"sv, "Data.db"sv, "Digest.crc32"sv, "Filter.db"sv,
+        "Index.db"sv, "Scylla.db"sv, "Statistics.db"sv, "Summary.db"sv, "TOC.txt"sv,
+    };
+    return std::ranges::find(known, name) != known.end();
 }
 
-static std::string_view sstable_of(std::string_view key) {
-    const auto dash = key.rfind('-');
-    return dash == std::string_view::npos ? key : key.substr(0, dash);
+struct key_parts {
+    std::string_view sstable;   // identifier shared by every component of one sstable
+    std::string_view component; // e.g. "Data.db"
+};
+
+// nullopt for anything that is not an sstable component, which is how
+// manifest.json and schema.cql are excluded rather than by guessing from shape.
+static std::optional<key_parts> split_key(std::string_view key) {
+    const auto slash = key.rfind('/');
+    const auto base = slash == std::string_view::npos ? key : key.substr(slash + 1);
+    if (is_component_name(base)) {
+        return key_parts{.sstable = slash == std::string_view::npos ? key : key.substr(0, slash), .component = base};
+    }
+    const auto dash = base.rfind('-');
+    if (dash != std::string_view::npos && is_component_name(base.substr(dash + 1))) {
+        return key_parts{.sstable = key.substr(0, key.size() - (base.size() - dash)), .component = base.substr(dash + 1)};
+    }
+    return std::nullopt;
 }
 
 static std::vector<sstable_group> group_by_sstable(const std::vector<sstring>& keys) {
     std::unordered_map<std::string_view, std::vector<sstring>> by_sstable;
     for (const auto& k : keys) {
-        // manifest.json and schema.cql sit alongside the sstables but are not
-        // components of one; grouping them would invent single-file "sstables".
-        if (component_of(k) == std::string_view(k).substr(std::string_view(k).rfind('/') + 1)) {
-            continue;
+        if (const auto parts = split_key(k)) {
+            by_sstable[parts->sstable].push_back(k);
         }
-        by_sstable[sstable_of(k)].push_back(k);
     }
 
     std::vector<sstable_group> groups;
@@ -291,7 +316,8 @@ static std::vector<sstable_group> group_by_sstable(const std::vector<sstring>& k
         // Same ordering restore imposes, for the same reason: the TOC has to be
         // first, and the Scylla component second.
         const auto rank = [](const sstring& k) {
-            const auto c = component_of(k);
+            const auto parts = split_key(k);
+            const auto c = parts ? parts->component : std::string_view{};
             return c == "TOC.txt" ? 0 : c == "Scylla.db" ? 1 : 2;
         };
         std::stable_sort(components.begin(), components.end(), [&rank](const sstring& a, const sstring& b) { return rank(a) < rank(b); });
@@ -400,7 +426,8 @@ class downloader {
         // _corpus_busy entry, which outlives the stream.
         std::optional<output_stream<char>> sink;
         std::exception_ptr failure;
-        const auto path = _corpus_dir.empty() ? std::filesystem::path{} : corpus_path(sid, component_of(file));
+        const auto parts = split_key(file);
+        const auto path = _corpus_dir.empty() ? std::filesystem::path{} : corpus_path(sid, parts ? parts->component : std::string_view(file));
         try {
             sink = co_await open_corpus_sink(path);
             // Same source Scylla uses to read a whole object — see
