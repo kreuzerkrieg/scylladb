@@ -106,12 +106,42 @@ future<bool> counting_retry_strategy::should_retry(std::exception_ptr error, uns
     co_return co_await default_aws_retry_strategy::should_retry(error, attempted_retries);
 }
 
+// Attributing a lost object to throttling was previously done by correlating logs
+// after the fact. Classify the terminal exception instead. Two forms accounted for
+// every loss observed so far (run 11: 55 and 15 of 70):
+//
+//   storage_io_error  "... Code: 19. Reason: Please reduce your request rate."
+//   std::runtime_error "Failed to parse ETag list. Aborting multipart upload."
+//
+// The second used to be a throttle whose cause upload_part had swallowed. It now
+// propagates the real exception, so a parse error reaching here means no part
+// recorded a cause at all -- an anomaly worth looking at, not a throttle in
+// disguise. It stays a separate bucket so that distinction remains visible.
+//
+// Matching on message text rather than type because storage_io_error derives from
+// std::exception and carries the reason only in its what() string.
+enum class failure_kind { throttled, masked, other };
+
+static failure_kind classify_failure(std::exception_ptr e) {
+    const auto text = fmt::format("{}", e);
+    if (text.find("Failed to parse ETag list") != std::string::npos) {
+        return failure_kind::masked;
+    }
+    if (text.find("reduce your request rate") != std::string::npos) {
+        return failure_kind::throttled;
+    }
+    return failure_kind::other;
+}
+
 // ─── round_stats ─────────────────────────────────────────────────────────────
 
 struct round_stats {
     unsigned slowdown_errors = 0;
     unsigned network_errors = 0;
     unsigned download_errors = 0; // retry exhausted — unrecoverable; stop when > 0
+    // download_errors split by attributed cause; the remainder is "other"
+    unsigned failed_throttled = 0; // terminal error said "reduce your request rate"
+    unsigned failed_masked = 0;    // "Failed to parse ETag list" — cause swallowed
     // GETs actually put on the wire, counted by the HTTP client rather than by
     // this test: chunked_download_source issues one request per chunk plus one
     // per internal retry, none of which are visible from here.
@@ -124,6 +154,8 @@ struct round_stats {
         slowdown_errors += o.slowdown_errors;
         network_errors += o.network_errors;
         download_errors += o.download_errors;
+        failed_throttled += o.failed_throttled;
+        failed_masked += o.failed_masked;
         read_requests += o.read_requests;
         read_bytes += o.read_bytes;
         completed += o.completed;
@@ -379,6 +411,8 @@ class downloader {
     uint64_t _total_bytes = 0;
     uint64_t _sstables_done = 0;
     unsigned _download_errors = 0;
+    unsigned _download_errors_throttled = 0;
+    unsigned _download_errors_masked = 0;
     std::vector<sample> _samples;
     utils::estimated_histogram _latencies;
 
@@ -480,6 +514,16 @@ class downloader {
         }
         plog.info("shard {}: error downloading {}: {}", this_shard_id(), file, failure);
         ++_download_errors;
+        switch (classify_failure(failure)) {
+        case failure_kind::throttled:
+            ++_download_errors_throttled;
+            break;
+        case failure_kind::masked:
+            ++_download_errors_masked;
+            break;
+        case failure_kind::other:
+            break;
+        }
     }
 
 public:
@@ -520,6 +564,8 @@ public:
     future<> run(std::chrono::minutes round_timeout) {
         _total_bytes = 0;
         _download_errors = 0;
+        _download_errors_throttled = 0;
+        _download_errors_masked = 0;
         _latencies = utils::estimated_histogram{};
         _samples.clear();
         _sstables_done = 0;
@@ -586,6 +632,8 @@ public:
             .slowdown_errors = _retry ? _retry->slowdown_errors() : 0u,
             .network_errors = _retry ? _retry->network_errors() : 0u,
             .download_errors = _download_errors,
+            .failed_throttled = _download_errors_throttled,
+            .failed_masked = _download_errors_masked,
             .read_requests = counters.read_ops + counters.read_retries,
             .read_bytes = counters.read_bytes,
             .completed = _latencies._count,
@@ -643,6 +691,8 @@ class uploader {
     uint64_t _uploaded_bytes = 0;
     uint64_t _uploaded_files = 0;
     unsigned _upload_errors = 0;
+    unsigned _upload_errors_throttled = 0;
+    unsigned _upload_errors_masked = 0;
     utils::estimated_histogram _latencies;
 
     std::chrono::steady_clock::time_point _now() const noexcept { return std::chrono::steady_clock::now(); }
@@ -711,11 +761,20 @@ public:
             failure = std::current_exception();
         }
         if (failure && !as.abort_requested()) {
-            // A throttled upload surfaces as "Failed to parse ETag list" rather
-            // than as SlowDown: upload_part swallows the real error and leaves an
-            // empty ETag. Take the throttling counts from the retry strategy.
+            // upload_part now propagates the exception a part died with, so a
+            // throttled upload reports the 503 rather than an ETag parse error.
             plog.info("shard {}: error uploading {}: {}", this_shard_id(), item.key, failure);
             ++_upload_errors;
+            switch (classify_failure(failure)) {
+            case failure_kind::throttled:
+                ++_upload_errors_throttled;
+                break;
+            case failure_kind::masked:
+                ++_upload_errors_masked;
+                break;
+            case failure_kind::other:
+                break;
+            }
         }
     }
 
@@ -727,6 +786,8 @@ public:
             .slowdown_errors = _retry ? _retry->slowdown_errors() : 0u,
             .network_errors = _retry ? _retry->network_errors() : 0u,
             .download_errors = _upload_errors,
+            .failed_throttled = _upload_errors_throttled,
+            .failed_masked = _upload_errors_masked,
             .read_requests = c.write_ops + c.write_retries,
             .read_bytes = c.write_bytes,
             .completed = _uploaded_files,
@@ -930,7 +991,7 @@ int main(int argc, char** argv) {
             const double mbs = elapsed > 0 ? static_cast<double>(total.read_bytes >> 20) / elapsed : 0.0;
             plog.warn("RESULT {{\"mode\":\"upload\",\"shards\":{},\"elapsed_sec\":{:.1f},"
                       "\"requests\":{},\"requests_per_sec\":{:.0f},\"files\":{},\"mbytes_per_sec\":{:.0f},"
-                      "\"slowdown\":{},\"net_reset\":{},\"failed\":{}}}",
+                      "\"slowdown\":{},\"net_reset\":{},\"failed\":{},\"failed_throttled\":{},\"failed_masked\":{}}}",
                       this_smp_shard_count(),
                       elapsed,
                       total.read_requests,
@@ -939,7 +1000,9 @@ int main(int argc, char** argv) {
                       mbs,
                       total.slowdown_errors,
                       total.network_errors,
-                      total.download_errors);
+                      total.download_errors,
+                      total.failed_throttled,
+                      total.failed_masked);
             co_return;
         }
 
@@ -1048,7 +1111,8 @@ int main(int argc, char** argv) {
             // compared without scraping the human-readable log.
             plog.warn("RESULT {{\"conns_per_shard\":{},\"shards\":{},\"elapsed_sec\":{:.1f},"
                       "\"requests\":{},\"requests_per_sec\":{:.0f},\"objects\":{},\"objects_per_sec\":{:.1f},"
-                      "\"sstables\":{},\"mbytes_per_sec\":{:.0f},\"slowdown\":{},\"net_reset\":{},\"failed\":{}}}",
+                      "\"sstables\":{},\"mbytes_per_sec\":{:.0f},\"slowdown\":{},\"net_reset\":{},\"failed\":{},"
+                      "\"failed_throttled\":{},\"failed_masked\":{}}}",
                       conns,
                       this_smp_shard_count(),
                       elapsed,
@@ -1060,7 +1124,9 @@ int main(int argc, char** argv) {
                       mbytes_per_sec,
                       total.slowdown_errors,
                       total.network_errors,
-                      total.download_errors);
+                      total.download_errors,
+                      total.failed_throttled,
+                      total.failed_masked);
 
             if (total.download_errors > 0) {
                 plog.warn(">>> {} file(s) failed after all retries at {} connections/shard — "
