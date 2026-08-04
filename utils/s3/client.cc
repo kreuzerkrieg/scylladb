@@ -869,6 +869,12 @@ protected:
     sstring _object_name;
     sstring _upload_id;
     utils::chunked_vector<sstring> _part_etags;
+    // The first exception a part upload died with. upload_part() runs parts in the
+    // background and discards their futures, so the exception has nowhere to go and
+    // finalize_upload() can otherwise only observe that the ETag list came out short.
+    // Keeping the first one reports the failure that started the collapse rather than
+    // whichever part happened to finish last.
+    std::exception_ptr _part_failure;
     named_gate _bg_flushes;
     std::optional<tag> _tag;
     seastar::abort_source* _as;
@@ -1163,6 +1169,9 @@ future<> client::multipart_upload::upload_part(memory_data_sink_buffers bufs) {
     }, http::reply::status_type::ok, _as).handle_exception([this, part_number] (auto ex) {
         // ... the exact exception only remains in logs
         s3l.warn("couldn't upload part {}: {} (upload id {})", part_number, ex, _upload_id);
+        if (!_part_failure) {
+            _part_failure = std::move(ex);
+        }
     }).finally([gh = std::move(gh), mpu = std::move(mpu)] {});
 }
 
@@ -1189,6 +1198,14 @@ future<> client::multipart_upload::finalize_upload() {
 
     unsigned parts_xml_len = prepare_multipart_upload_parts(_part_etags);
     if (parts_xml_len == 0) {
+        // Report why the upload actually failed. A short ETag list is a symptom: the
+        // cause is whatever killed a part, and for a throttled endpoint that is a 503
+        // the retry strategy gave up on. Surfacing the generic message instead hides
+        // throttling behind what reads as a parse bug, and makes "how many objects did
+        // this endpoint refuse" unanswerable from the caller's side.
+        if (_part_failure) {
+            co_await coroutine::return_exception_ptr(std::exchange(_part_failure, {}));
+        }
         co_await coroutine::return_exception(std::runtime_error("Failed to parse ETag list. Aborting multipart upload."));
     }
 
@@ -1329,7 +1346,6 @@ future<> client::multipart_upload::upload_part(std::unique_ptr<upload_sink> piec
                 });
             });
         }, http::reply::status_type::ok, _as).handle_exception([this, part_number] (auto ex) {
-            // ... the exact exception only remains in logs
             s3l.warn("couldn't copy-upload part {}: {} (upload id {})", part_number, ex, _upload_id);
         });
     }).then_wrapped([this, &piece] (auto f) {
@@ -1797,6 +1813,9 @@ class client::do_upload_file : private multipart_upload {
             return make_ready_future();
         }, http::reply::status_type::ok, _as).handle_exception([this, part_number] (auto ex) {
             s3l.warn("couldn't upload part {}: {} (upload id {})", part_number, ex, _upload_id);
+            if (!_part_failure) {
+                _part_failure = std::move(ex);
+            }
         });
     }
 
