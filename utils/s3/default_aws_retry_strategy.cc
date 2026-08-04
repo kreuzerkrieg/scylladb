@@ -92,7 +92,11 @@ seastar::future<bool> default_aws_retry_strategy::should_retry(std::exception_pt
     }
 
     if (attempted_retries >= _max_retries) {
-        rs_logger.warn("Retries exhausted. Retry# {}", attempted_retries);
+        // Parse the error before the cap check so the message can name the cause.
+        // Without it "Retries exhausted" says only that a request died, and a run
+        // cannot tell an exhaustion caused by throttling from any other kind --
+        // which is the distinction the S3 throttling measurements turn on.
+        rs_logger.warn("Retries exhausted. Reason: {}. Retry# {}", err.get_error_message(), attempted_retries);
         co_return false;
     }
     bool should_retry = err.is_retryable() == utils::http::retryable::yes;
