@@ -39,6 +39,7 @@
 #include <random>
 #include <unordered_set>
 #include <ranges>
+#include <string>
 
 #include <seastar/core/app-template.hh>
 #include <seastar/core/fstream.hh>
@@ -819,13 +820,45 @@ public:
 // overwriting each other. A time UUID is used because that is what
 // scylla_metadata::set_sstable_identifier() defaults to, giving the same key
 // distribution a real node produces.
-static std::vector<upload_item> plan_uploads(const std::filesystem::path& corpus_dir, const sstring& bucket, const sstring& prefix) {
+// Random key-root prefix. S3 partitions on the leading bytes of a key, so a prefix
+// only spreads load when it comes *before* everything shared -- the hash element of
+// the X2 layout sits after the static prefix, which leaves every key of a run with
+// identical leading bytes. This one goes directly under the bucket.
+namespace random_prefix {
+constexpr std::array prefix_chars{
+    '-', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'A', 'B',
+    'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O',
+    'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z', '_', 'a',
+    'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n',
+    'o', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z'};
+
+static std::string get_random_prefix(size_t length) {
+  thread_local std::mt19937 gen = [] {
+    std::random_device rd;
+    std::seed_seq seq{rd(), rd(), rd(), rd(), rd(), rd(), rd(), rd()};
+    return std::mt19937{seq};
+  }();
+  thread_local std::uniform_int_distribution<uint64_t> rand_dist(
+      0, prefix_chars.size() - 1);
+  std::string ret_val(length, '\0');
+  std::ranges::generate(ret_val,
+                        [&]() { return prefix_chars[rand_dist(gen)]; });
+  return ret_val;
+}
+} // namespace random_prefix
+
+static std::vector<upload_item> plan_uploads(const std::filesystem::path& corpus_dir, const sstring& bucket, const sstring& prefix,
+                                            size_t random_prefix_len) {
     std::vector<upload_item> items;
     for (const auto& dir : std::filesystem::directory_iterator(corpus_dir)) {
         if (!dir.is_directory()) {
             continue;
         }
         const auto sid = fresh_sstable_id();
+        // Drawn once per sstable, not per component: a backup writes an sstable's
+        // components together, and splitting them across prefixes would measure a
+        // key distribution no real workload produces.
+        const auto root = random_prefix_len ? random_prefix::get_random_prefix(random_prefix_len) : std::string{};
         for (const auto& comp : std::filesystem::directory_iterator(dir.path())) {
             if (!comp.is_regular_file()) {
                 continue;
@@ -834,9 +867,20 @@ static std::vector<upload_item> plan_uploads(const std::filesystem::path& corpus
             if (name.ends_with(".partial")) {
                 continue; // interrupted download, not a complete component
             }
+            // Join only the elements that are set, so an empty --upload_prefix drops
+            // out of the key instead of leaving a double slash.
+            std::vector<sstring> parts;
+            if (!root.empty()) {
+                parts.emplace_back(root);
+            }
+            if (!prefix.empty()) {
+                parts.push_back(prefix);
+            }
+            parts.emplace_back(fmt::to_string(sid));
+            parts.emplace_back(name);
             items.push_back(upload_item{
                 .local = comp.path(),
-                .key = fmt::format("/{}/{}/{}/{}", bucket, prefix, sid, name),
+                .key = fmt::format("/{}/{}", bucket, fmt::join(parts, "/")),
             });
         }
     }
@@ -905,6 +949,10 @@ int main(int argc, char** argv) {
         "sstables downloaded concurrently per shard (restore uses 16)")("mode", bpo::value<sstring>()->default_value("download"), "download or upload")(
         "upload_bucket", bpo::value<sstring>()->default_value("manager-backup-tests-us-east-1"), "bucket to upload the corpus into")(
         "upload_prefix", bpo::value<sstring>()->default_value("sstables_ewz"), "key prefix for uploads")(
+        "upload_random_prefix", bpo::value<unsigned>()->default_value(0),
+        "prepend N random base64url characters directly under the bucket, ahead of --upload_prefix (0: off)")(
+        "upload_no_prefix", bpo::bool_switch(),
+        "omit --upload_prefix from the key entirely (boost rejects an empty --upload_prefix value)")(
         "file_concurrency",
         bpo::value<unsigned>()->default_value(default_file_concurrency),
         "components uploaded concurrently per shard (backup uses initial_sstable_loading_concurrency, 4)");
@@ -933,6 +981,8 @@ int main(int argc, char** argv) {
         const sstring upload_bucket = app.configuration()["upload_bucket"].as<sstring>();
         const sstring upload_prefix = app.configuration()["upload_prefix"].as<sstring>();
         const unsigned file_concurrency = app.configuration()["file_concurrency"].as<unsigned>();
+        const auto upload_random_prefix = app.configuration()["upload_random_prefix"].as<unsigned>();
+        const bool upload_no_prefix = app.configuration()["upload_no_prefix"].as<bool>();
 
         if (mode != "download" && mode != "upload") {
             throw std::invalid_argument(format("unknown mode '{}', expected download or upload", mode));
@@ -949,7 +999,7 @@ int main(int argc, char** argv) {
             if (corpus_dir.empty()) {
                 throw std::invalid_argument("upload mode needs --corpus_dir");
             }
-            auto items = plan_uploads(corpus_dir, upload_bucket, upload_prefix);
+            auto items = plan_uploads(corpus_dir, upload_bucket, upload_no_prefix ? sstring{} : upload_prefix, upload_random_prefix);
             if (items.empty()) {
                 plog.error("no sstable components found under {}", corpus_dir.native());
                 co_return;
