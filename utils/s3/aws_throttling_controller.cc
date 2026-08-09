@@ -104,12 +104,27 @@ void aws_throttling_controller::on_throttled() {
 }
 
 void aws_throttling_controller::on_success() {
+    // One unit back per success, whatever the request spent getting there. A request
+    // that retried once is therefore net zero, while one that retried repeatedly stays
+    // net negative even though it succeeded -- retry-heavy traffic keeps draining the
+    // pool, which is what makes the budget bite while an episode is still going on.
+    _retry_quota = std::min(_retry_quota + 1, initial_retry_quota);
     update_client_sending_rate(false);
 }
 
 void aws_throttling_controller::on_error_not_throttled() {
-    // Not throttled, so the curve grows as on success.
+    // Not throttled, so the curve grows as on success -- but it is not a success,
+    // so no quota is returned.
     update_client_sending_rate(false);
+}
+
+bool aws_throttling_controller::try_acquire_retry_quota() {
+    if (_retry_quota == 0) {
+        ++_retry_quota_denials;
+        return false;
+    }
+    --_retry_quota;
+    return true;
 }
 
 // Recomputes the target rate from one response. A throttle records the current
