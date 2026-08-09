@@ -57,6 +57,7 @@
 #include "utils/exceptions.hh"
 #include "utils/lister.hh"
 #include "utils/s3/aws_error.hh"
+#include "utils/s3/aws_throttling_controller.hh"
 #include "utils/s3/client.hh"
 #include "utils/s3/default_aws_retry_strategy.hh"
 #include "utils/UUID_gen.hh"
@@ -77,7 +78,12 @@ class counting_retry_strategy : public aws::default_aws_retry_strategy {
     mutable unsigned _network_errors = 0;
 
 public:
-    explicit counting_retry_strategy(unsigned max_retries) : aws::default_aws_retry_strategy(max_retries) {}
+    // The controller has to be handed in: client::make() injects one only into a
+    // strategy it creates itself, so a strategy supplied by a caller would keep the
+    // no-op controller and report its throttles nowhere -- measuring the unmitigated
+    // behaviour while looking like a test of the mitigated one.
+    counting_retry_strategy(unsigned max_retries, s3::throttling_controller& controller)
+        : aws::default_aws_retry_strategy(max_retries, controller) {}
 
     future<bool> should_retry(std::exception_ptr error, unsigned attempted_retries) const override;
 
@@ -219,6 +225,29 @@ struct endpoint_params {
         return make_lw_shared<s3::endpoint_config>(std::move(cfg));
     }
 };
+
+// Wires a client the way production does: one controller, owned by the client,
+// with the retry strategy referring to that same instance, so retries are paced
+// by the same converged rate as fresh requests and the throttles the strategy
+// sees reach the rate the client applies.
+//
+// The client destroys its retry strategy before its controller, so the reference
+// held here never dangles.
+struct wired_client {
+    shared_ptr<s3::client> client;
+    counting_retry_strategy* retry;    // observer; the client owns it
+    s3::throttling_controller* limiter; // ditto
+};
+
+static wired_client make_wired_client(const endpoint_params& ep, unsigned connections, unsigned max_retries) {
+    // Same seed the production path uses: half the per-shard connection budget.
+    auto controller = std::make_unique<s3::aws_throttling_controller>(connections / 2.0);
+    auto* limiter = controller.get();
+    auto rs = std::make_unique<counting_retry_strategy>(max_retries, *limiter);
+    auto* retry = rs.get();
+    auto client = s3::client::make(ep.host, ep.make_config(connections), std::move(rs), std::move(controller));
+    return {.client = std::move(client), .retry = retry, .limiter = limiter};
+}
 
 // ─── sampling ────────────────────────────────────────────────────────────────
 
@@ -401,7 +430,8 @@ static std::vector<sstable_group> select_fleet_slice(std::vector<sstable_group> 
 // concurrent shards access objects in a different order, spreading the load.
 
 class downloader {
-    counting_retry_strategy* _retry = nullptr; // raw observer; client owns the unique_ptr
+    counting_retry_strategy* _retry = nullptr;     // raw observer; client owns the unique_ptr
+    s3::throttling_controller* _limiter = nullptr; // ditto
     shared_ptr<s3::client> _client;
     std::vector<sstable_group> _sstables; // shuffled per shard
     unsigned _connections;                // connection pool size
@@ -557,9 +587,10 @@ public:
             std::shuffle(_sstables.begin(), _sstables.end(), std::default_random_engine(this_shard_id()));
         }
 
-        auto rs = std::make_unique<counting_retry_strategy>(max_retries);
-        _retry = rs.get();
-        _client = s3::client::make(ep.host, ep.make_config(_connections), std::move(rs));
+        auto wired = make_wired_client(ep, _connections, max_retries);
+        _retry = wired.retry;
+        _limiter = wired.limiter;
+        _client = std::move(wired.client);
     }
 
     future<> run(std::chrono::minutes round_timeout) {
@@ -684,6 +715,7 @@ struct upload_item {
 
 class uploader {
     counting_retry_strategy* _retry = nullptr;
+    s3::throttling_controller* _limiter = nullptr; // raw observer; client owns it
     shared_ptr<s3::client> _client;
     std::vector<upload_item> _items;
     unsigned _connections;
@@ -702,9 +734,10 @@ public:
     uploader(endpoint_params ep, unsigned connections, unsigned file_concurrency, unsigned max_retries, std::chrono::seconds sample_interval,
              std::vector<upload_item> items)
         : _items(std::move(items)), _connections(connections), _file_concurrency(file_concurrency), _sample_interval(sample_interval) {
-        auto rs = std::make_unique<counting_retry_strategy>(max_retries);
-        _retry = rs.get();
-        _client = s3::client::make(ep.host, ep.make_config(_connections), std::move(rs));
+        auto wired = make_wired_client(ep, _connections, max_retries);
+        _retry = wired.retry;
+        _limiter = wired.limiter;
+        _client = std::move(wired.client);
     }
 
     // The slice is handed over after start(): sharded<> copies its constructor
