@@ -74,6 +74,28 @@ async def async_rmtree(directory, *args, **kwargs):
     await loop.run_in_executor(io_executor, partial(shutil.rmtree, directory, *args, **kwargs))
 
 
+# A teardown callback is a Python callable, so it cannot travel over the
+# manager API the way every other request does.  ManagerClient parks it here
+# and sends the handle; ScyllaCluster stores the handles it was given and
+# resolves them when it fires them.  This table is the wire, the cluster owns
+# the callbacks.
+#
+# Each entry also remembers the event loop the callback was registered on.  A
+# cluster is recycled on the ScyllaClusterManager's own loop, in its own
+# thread, while the callbacks own objects the fixtures created on a different
+# loop -- a subprocess handle awaited from the wrong loop hangs instead of
+# failing, so a coroutine is always handed back to the loop that produced it.
+_parked_teardown_callbacks: dict[int, tuple[asyncio.AbstractEventLoop, Callable[[], Any]]] = {}
+_teardown_callback_handles = itertools.count(1)
+
+
+def park_teardown_callback(callback: Callable[[], Any]) -> int:
+    """Park a teardown callback and return the handle to send to the manager."""
+    handle = next(_teardown_callback_handles)
+    _parked_teardown_callbacks[handle] = (asyncio.get_running_loop(), callback)
+    return handle
+
+
 class ReplaceConfig(NamedTuple):
     replaced_id: ServerNum
     reuse_ip_addr: bool
@@ -1176,6 +1198,10 @@ class ScyllaCluster:
         self.keyspace_count = 0
         self.api = ScyllaRESTAPIClient()
         self.stop_lock = asyncio.Lock()
+        # Cleanups a test registered through ManagerClient.add_teardown_callback(),
+        # as (handle, name) pairs.  They are fired by run_teardown_callbacks()
+        # when this cluster is recycled.
+        self.teardown_callbacks: List[Tuple[int, str]] = []
         self.logger.info("Created new cluster %s", self.name)
 
     async def install_and_start(self) -> None:
@@ -1214,6 +1240,9 @@ class ScyllaCluster:
            by a failed test.
         """
         await self.stop()
+        # The servers are down, so a callback may now dispose of a resource
+        # they were using without racing against them.
+        await self.run_teardown_callbacks()
         for srv in self.servers.values():
             if srv.log_file is not None:
                 srv.log_file.close()
@@ -1223,6 +1252,45 @@ class ScyllaCluster:
             self.api.close()
             self.api = None
         await self.release_ips()
+
+    def add_teardown_callback(self, handle: int, name: str) -> None:
+        """Register a cleanup to run when this cluster is recycled.
+
+        The callback itself is parked client-side by park_teardown_callback();
+        this end only tracks which callbacks belong to this cluster and in what
+        order they were registered.
+        """
+        self.logger.info("Cluster %s registers teardown callback %s", self, name)
+        self.teardown_callbacks.append((handle, name))
+
+    async def run_teardown_callbacks(self) -> None:
+        """Fire the registered teardown callbacks in LIFO order.
+
+        Called from recycle(), once the servers are stopped, so that a callback
+        disposing of a resource they were using cannot race with them: an
+        object storage bucket an in-flight tablet migration could otherwise
+        still read from (SCYLLADB-2471).
+
+        An exception in one callback is logged and swallowed, so that it
+        neither hides the others nor aborts the rest of the teardown.
+        """
+        assert not self.running, \
+            f"Cluster {self} still has running servers, teardown callbacks must fire after it is stopped"
+        while self.teardown_callbacks:
+            handle, name = self.teardown_callbacks.pop()
+            loop, callback = _parked_teardown_callbacks.pop(handle)
+            self.logger.info("Cluster %s running teardown callback %s", self, name)
+            try:
+                res = callback()
+                if asyncio.iscoroutine(res):
+                    if loop is asyncio.get_running_loop():
+                        await res
+                    else:
+                        await asyncio.wrap_future(asyncio.run_coroutine_threadsafe(res, loop))
+            except Exception as e:
+                self.logger.warning("Cluster %s teardown callback %s failed: %s", self, name, e)
+            else:
+                self.logger.info("Cluster %s teardown callback %s done", self, name)
 
     async def release_ips(self) -> None:
         """Release all IPs leased from the host registry by this cluster.
@@ -1853,6 +1921,7 @@ class ScyllaClusterManager:
         add_put('/cluster/server/{server_id}/start', self._cluster_server_start)
         add_put('/cluster/server/{server_id}/pause', self._cluster_server_pause)
         add_put('/cluster/server/{server_id}/unpause', self._cluster_server_unpause)
+        add_put('/cluster/teardown-callback', self._cluster_add_teardown_callback)
         add_put('/cluster/addserver', self._cluster_server_add)
         add_put('/cluster/addservers', self._cluster_servers_add)
         add_put('/cluster/remove-node/{initiator}', self._cluster_remove_node)
@@ -2015,6 +2084,12 @@ class ScyllaClusterManager:
         assert self.cluster
         server_id = ServerNum(int(request.match_info["server_id"]))
         self.cluster.server_unpause(server_id)
+
+    async def _cluster_add_teardown_callback(self, request) -> None:
+        """Register a cleanup to run when the current cluster is recycled."""
+        assert self.cluster
+        data = await request.json()
+        self.cluster.add_teardown_callback(data["handle"], data["name"])
 
     async def _cluster_server_add(self, request) -> dict[str, object]:
         """Add a new server."""
