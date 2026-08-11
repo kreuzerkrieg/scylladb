@@ -198,7 +198,10 @@ async def manager_api_sock_path(suite_log_dir: Path,
         yield sock_path
 
         stop_event.set()
-        future.result()
+        # Wait for the manager thread off the event loop.  Stopping the manager
+        # recycles the cluster, and recycling runs teardown callbacks that
+        # belong to this loop; blocking it here would deadlock them.
+        await asyncio.get_running_loop().run_in_executor(None, future.result)
 
 
 @pytest.fixture(scope="module")
