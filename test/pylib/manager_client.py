@@ -21,7 +21,7 @@ from test.pylib.log_browsing import ScyllaLogFile
 from test.pylib.rest_client import UnixRESTClient, ScyllaRESTAPIClient, ScyllaMetricsClient
 from test.pylib.util import gather_safely, wait_for, wait_for_cql_and_get_hosts, universalasync_typed_wrap, Host
 from test.pylib.internal_types import ServerNum, IPAddress, HostID, ServerInfo, ServerUpState
-from test.pylib.scylla_cluster import ReplaceConfig, ScyllaServer, ScyllaVersionDescription
+from test.pylib.scylla_cluster import ReplaceConfig, ScyllaServer, ScyllaVersionDescription, park_teardown_callback, unpark_teardown_callback
 from test.pylib.driver_utils import safe_driver_shutdown
 from cassandra.cluster import Session as CassandraSession, \
     ExecutionProfile, EXEC_PROFILE_DEFAULT  # type: ignore # pylint: disable=no-name-in-module
@@ -564,6 +564,42 @@ class ManagerClient:
         if expected_server_up_state:
             data['expected_server_up_state'] = expected_server_up_state.name
         return data
+
+    async def add_teardown_callback(self, callback: Callable[[], Any], name: str | None = None) -> None:
+        """Register a callback to run once the cluster used by this test has
+        been stopped.
+
+        The callbacks belong to the cluster and fire from its
+        run_teardown_callbacks(), which recycle() calls right after the servers
+        are stopped.  They therefore run against a cluster that is down, and
+        may dispose of a resource it was using without racing against it: an
+        object storage bucket that an in-flight tablet migration could
+        otherwise still read from (SCYLLADB-2471).
+
+        Two consequences of firing that late are worth knowing.  The resource
+        the callback disposes of has to stay alive past the fixture that
+        created it, and a failure inside a callback is reported against the
+        test case that recycled the cluster, not necessarily the one that
+        registered the callback.
+
+        Callbacks fire in LIFO order; both plain callables and coroutine
+        functions are accepted.  Register them from a fixture rather than from
+        a test body, so that a coroutine is handed back to a loop that is still
+        alive when it is awaited.  `name` is what the cluster log calls this
+        callback, and defaults to the callable's qualified name.
+
+        Registration is all-or-nothing: if the request fails the callback is
+        unparked, so a caller that falls back to disposing of the resource
+        itself cannot dispose of it twice.
+        """
+        handle = park_teardown_callback(callback)
+        try:
+            await self.client.put_json("/cluster/teardown-callback",
+                                       {"handle": handle,
+                                        "name": name or getattr(callback, "__qualname__", repr(callback))})
+        except BaseException:
+            unpark_teardown_callback(handle)
+            raise
 
     async def server_add(self,
                          replace_cfg: Optional[ReplaceConfig] = None,
