@@ -76,6 +76,12 @@ class counting_retry_strategy : public aws::default_aws_retry_strategy {
     // mutable: should_retry() is const in the interface, but we count errors.
     mutable unsigned _slowdown_errors = 0;
     mutable unsigned _network_errors = 0;
+    // Requests that ran out of retries while the endpoint was still refusing
+    // them, i.e. a failure to ride out throttling. Every object lost in this
+    // series was one of these, so it is the number the mitigation has to move.
+    // Counted here rather than grepped from the "Retries exhausted" log line,
+    // which a run at the wrong log level reports as zero.
+    mutable unsigned _throttle_exhaustions = 0;
 
 public:
     // The controller has to be handed in: client::make() injects one only into a
@@ -89,7 +95,8 @@ public:
 
     unsigned slowdown_errors() const noexcept { return _slowdown_errors; }
     unsigned network_errors() const noexcept { return _network_errors; }
-    void reset() noexcept { _slowdown_errors = _network_errors = 0; }
+    unsigned throttle_exhaustions() const noexcept { return _throttle_exhaustions; }
+    void reset() noexcept { _slowdown_errors = _network_errors = _throttle_exhaustions = 0; }
 };
 
 future<bool> counting_retry_strategy::should_retry(std::exception_ptr error, unsigned attempted_retries) const {
@@ -100,6 +107,11 @@ future<bool> counting_retry_strategy::should_retry(std::exception_ptr error, uns
         if (type == aws::aws_error_type::SLOW_DOWN || type == aws::aws_error_type::HTTP_TOO_MANY_REQUESTS || type == aws::aws_error_type::SERVICE_UNAVAILABLE ||
             type == aws::aws_error_type::HTTP_SERVICE_UNAVAILABLE) {
             ++_slowdown_errors;
+            // The base class refuses at this point, so this is the last word on
+            // the request: it died still being throttled.
+            if (attempted_retries >= _max_retries) {
+                ++_throttle_exhaustions;
+            }
         } else if (type == aws::aws_error_type::NETWORK_CONNECTION) {
             ++_network_errors;
         }
@@ -149,6 +161,13 @@ struct round_stats {
     // download_errors split by attributed cause; the remainder is "other"
     unsigned failed_throttled = 0; // terminal error said "reduce your request rate"
     unsigned failed_masked = 0;    // "Failed to parse ETag list" — cause swallowed
+    // Throttling recovery. The first is the failure the mitigation exists to
+    // prevent; the second says the retry budget, not the endpoint, did the
+    // refusing. The third proves the brake was actually in the loop -- a run
+    // reporting throttles but no freezes never engaged it.
+    unsigned throttle_exhaustions = 0;
+    uint64_t retry_quota_denials = 0;
+    uint64_t freezes = 0;          // times sending was held back after a throttle
     // GETs actually put on the wire, counted by the HTTP client rather than by
     // this test: chunked_download_source issues one request per chunk plus one
     // per internal retry, none of which are visible from here.
@@ -163,6 +182,9 @@ struct round_stats {
         download_errors += o.download_errors;
         failed_throttled += o.failed_throttled;
         failed_masked += o.failed_masked;
+        throttle_exhaustions += o.throttle_exhaustions;
+        retry_quota_denials += o.retry_quota_denials;
+        freezes += o.freezes;
         read_requests += o.read_requests;
         read_bytes += o.read_bytes;
         completed += o.completed;
@@ -240,8 +262,7 @@ struct wired_client {
 };
 
 static wired_client make_wired_client(const endpoint_params& ep, unsigned connections, unsigned max_retries) {
-    // Same seed the production path uses: half the per-shard connection budget.
-    auto controller = std::make_unique<s3::aws_throttling_controller>(connections / 2.0);
+    auto controller = std::make_unique<s3::aws_throttling_controller>();
     auto* limiter = controller.get();
     auto rs = std::make_unique<counting_retry_strategy>(max_retries, *limiter);
     auto* retry = rs.get();
@@ -666,6 +687,9 @@ public:
             .download_errors = _download_errors,
             .failed_throttled = _download_errors_throttled,
             .failed_masked = _download_errors_masked,
+            .throttle_exhaustions = _retry ? _retry->throttle_exhaustions() : 0u,
+            .retry_quota_denials = _limiter ? _limiter->retry_quota_denials() : 0u,
+            .freezes = _limiter ? _limiter->freezes() : 0u,
             .read_requests = counters.read_ops + counters.read_retries,
             .read_bytes = counters.read_bytes,
             .completed = _latencies._count,
@@ -822,6 +846,9 @@ public:
             .download_errors = _upload_errors,
             .failed_throttled = _upload_errors_throttled,
             .failed_masked = _upload_errors_masked,
+            .throttle_exhaustions = _retry ? _retry->throttle_exhaustions() : 0u,
+            .retry_quota_denials = _limiter ? _limiter->retry_quota_denials() : 0u,
+            .freezes = _limiter ? _limiter->freezes() : 0u,
             .read_requests = c.write_ops + c.write_retries,
             .read_bytes = c.write_bytes,
             .completed = _uploaded_files,
@@ -1074,7 +1101,8 @@ int main(int argc, char** argv) {
             const double mbs = elapsed > 0 ? static_cast<double>(total.read_bytes >> 20) / elapsed : 0.0;
             plog.warn("RESULT {{\"mode\":\"upload\",\"shards\":{},\"elapsed_sec\":{:.1f},"
                       "\"requests\":{},\"requests_per_sec\":{:.0f},\"files\":{},\"mbytes_per_sec\":{:.0f},"
-                      "\"slowdown\":{},\"net_reset\":{},\"failed\":{},\"failed_throttled\":{},\"failed_masked\":{}}}",
+                      "\"slowdown\":{},\"net_reset\":{},\"failed\":{},\"failed_throttled\":{},\"failed_masked\":{},"
+                      "\"throttle_exhaustions\":{},\"retry_quota_denials\":{},\"freezes\":{}}}",
                       this_smp_shard_count(),
                       elapsed,
                       total.read_requests,
@@ -1085,7 +1113,10 @@ int main(int argc, char** argv) {
                       total.network_errors,
                       total.download_errors,
                       total.failed_throttled,
-                      total.failed_masked);
+                      total.failed_masked,
+                      total.throttle_exhaustions,
+                      total.retry_quota_denials,
+                      total.freezes);
             co_return;
         }
 
@@ -1195,7 +1226,8 @@ int main(int argc, char** argv) {
             plog.warn("RESULT {{\"conns_per_shard\":{},\"shards\":{},\"elapsed_sec\":{:.1f},"
                       "\"requests\":{},\"requests_per_sec\":{:.0f},\"objects\":{},\"objects_per_sec\":{:.1f},"
                       "\"sstables\":{},\"mbytes_per_sec\":{:.0f},\"slowdown\":{},\"net_reset\":{},\"failed\":{},"
-                      "\"failed_throttled\":{},\"failed_masked\":{}}}",
+                      "\"failed_throttled\":{},\"failed_masked\":{},"
+                      "\"throttle_exhaustions\":{},\"retry_quota_denials\":{},\"freezes\":{}}}",
                       conns,
                       this_smp_shard_count(),
                       elapsed,
@@ -1209,7 +1241,10 @@ int main(int argc, char** argv) {
                       total.network_errors,
                       total.download_errors,
                       total.failed_throttled,
-                      total.failed_masked);
+                      total.failed_masked,
+                      total.throttle_exhaustions,
+                      total.retry_quota_denials,
+                      total.freezes);
 
             if (total.download_errors > 0) {
                 plog.warn(">>> {} file(s) failed after all retries at {} connections/shard — "
