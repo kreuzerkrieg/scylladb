@@ -124,6 +124,7 @@ client::client(std::string host, endpoint_config_ptr cfg, global_factory gf, pri
     if (!_retry_strategy) {
         _retry_strategy = std::make_unique<aws::default_aws_retry_strategy>(aws::default_aws_retry_strategy::default_max_retries, *_request_limiter);
     }
+    _request_limiter->resize_retry_quota(_cfg->connections_per_shard);
     register_client_metrics();
 }
 
@@ -164,6 +165,7 @@ void client::update_connections_per_shard(unsigned connections_per_shard) {
     auto holder = _config_update_gate.hold();
     (void)with_semaphore(_rebalance_sem, 1, [this, connections_per_shard] {
         _cfg->connections_per_shard = connections_per_shard;
+        _request_limiter->resize_retry_quota(connections_per_shard);
         return rebalance_connections();
     }).handle_exception([holder = std::move(holder)](auto ex) {
         s3l.warn("Failed to rebalance connections after config update: {}", ex);
@@ -345,6 +347,9 @@ void client::register_client_metrics() {
     defs.emplace_back(sm::make_counter("throttles", [this] { return _request_limiter->throttles(); },
             sm::description("Total number of throttling responses (503 SlowDown etc.) from S3"), {ep_label, request_op})
             (sm::skip_when_empty::yes));
+    defs.emplace_back(sm::make_counter("retry_quota_denials", [this] { return _request_limiter->retry_quota_denials(); },
+            sm::description("Retries refused because the client-wide retry budget was exhausted"), {ep_label, request_op})
+            (sm::skip_when_empty::yes));
     defs.emplace_back(sm::make_counter("send_freezes", [this] { return _request_limiter->freezes(); },
             sm::description("Times sending was held back after a throttling response"), {ep_label, request_op})
             (sm::skip_when_empty::yes));
@@ -504,6 +509,8 @@ http::client::reply_handler client::wrap_handler(http::request& request,
             co_await coroutine::return_exception_ptr(std::make_exception_ptr(
                 aws::aws_exception(aws_error(possible_error->get_error_type(), possible_error->get_error_message().c_str(), should_retry))));
         }
+
+        _request_limiter->on_success();
 
         if (expected && rep._status != *expected) {
             throw seastar::httpd::unexpected_status_error(rep._status);

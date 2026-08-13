@@ -24,9 +24,14 @@ public:
         return seastar::make_ready_future<>();
     }
     void on_throttled() override {}
+    void on_success() override {}
+
+    bool try_acquire_retry_quota() override { return true; }
+    void resize_retry_quota(unsigned) override {}
 
     uint64_t throttles() const override { return 0; }
     uint64_t freezes() const override { return 0; }
+    uint64_t retry_quota_denials() const override { return 0; }
 };
 
 } // namespace s3
