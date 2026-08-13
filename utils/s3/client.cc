@@ -124,6 +124,7 @@ client::client(std::string host, endpoint_config_ptr cfg, global_factory gf, pri
     if (!_retry_strategy) {
         _retry_strategy = std::make_unique<aws::default_aws_retry_strategy>(aws::default_aws_retry_strategy::default_max_retries, *_request_limiter);
     }
+    _request_limiter->resize_retry_quota(_cfg->connections_per_shard);
     register_client_metrics();
 }
 
@@ -164,17 +165,15 @@ void client::update_connections_per_shard(unsigned connections_per_shard) {
     auto holder = _config_update_gate.hold();
     (void)with_semaphore(_rebalance_sem, 1, [this, connections_per_shard] {
         _cfg->connections_per_shard = connections_per_shard;
+        _request_limiter->resize_retry_quota(connections_per_shard);
         return rebalance_connections();
     }).handle_exception([holder = std::move(holder)](auto ex) {
         s3l.warn("Failed to rebalance connections after config update: {}", ex);
     });
 }
 
-// Seeded so the controller paces requests from the first one rather than only
-// after the first 503. Half the per-shard connection budget is a conservative
-// starting rate, which the controller scales up on success and down on throttling.
-static std::unique_ptr<throttling_controller> make_default_throttling_controller(const endpoint_config& cfg) {
-    return std::make_unique<aws_throttling_controller>(cfg.connections_per_shard / 2.0);
+static std::unique_ptr<throttling_controller> make_default_throttling_controller() {
+    return std::make_unique<aws_throttling_controller>();
 }
 
 shared_ptr<client> client::make(std::string endpoint, endpoint_config_ptr cfg, global_factory gf) {
@@ -188,7 +187,7 @@ shared_ptr<client> client::make(std::string endpoint, endpoint_config_ptr cfg, s
 shared_ptr<client> client::make(std::string endpoint, endpoint_config_ptr cfg, std::unique_ptr<http::retry_strategy> rs,
                                 std::unique_ptr<throttling_controller> tc, global_factory gf) {
     if (!tc) {
-        tc = make_default_throttling_controller(*cfg);
+        tc = make_default_throttling_controller();
     }
     return seastar::make_shared<client>(std::move(endpoint), std::move(cfg), std::move(gf), private_tag{}, std::move(rs), std::move(tc));
 }
@@ -336,9 +335,9 @@ void client::group_client::register_metrics(std::string class_name, std::string 
 }
 
 // Per-client metrics, as opposed to the per-scheduling-group ones in
-// group_client::register_metrics. The send-rate limiter is shared by every
-// scheduling group on the shard, so registering its numbers per group would
-// produce one series per group all reporting the same thing.
+// group_client::register_metrics. The send brake is shared by every scheduling
+// group on the shard, so registering its numbers per group would produce one
+// series per group all reporting the same thing.
 void client::register_client_metrics() {
     namespace sm = seastar::metrics;
     auto ep_label = sm::label("endpoint")(_host);
@@ -352,10 +351,9 @@ void client::register_client_metrics() {
     defs.emplace_back(sm::make_counter("retry_quota_denials", [this] { return _request_limiter->retry_quota_denials(); },
             sm::description("Retries refused because the client-wide retry budget was exhausted"), {ep_label, request_op})
             (sm::skip_when_empty::yes));
-    defs.emplace_back(sm::make_gauge("send_fill_rate", [this] { return _request_limiter->fill_rate(); },
-            sm::description("Adaptive limiter target send rate (requests/s)"), {ep_label, request_op}));
-    defs.emplace_back(sm::make_gauge("measured_tx_rate", [this] { return _request_limiter->measured_tx_rate(); },
-            sm::description("Adaptive limiter measured send rate (requests/s)"), {ep_label, request_op}));
+    defs.emplace_back(sm::make_counter("send_freezes", [this] { return _request_limiter->freezes(); },
+            sm::description("Times sending was held back after a throttling response"), {ep_label, request_op})
+            (sm::skip_when_empty::yes));
 
     _client_metrics.add_group("s3", defs);
 }

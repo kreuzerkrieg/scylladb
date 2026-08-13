@@ -13,7 +13,6 @@
 #include <seastar/core/sleep.hh>
 
 #include <algorithm>
-#include <random>
 #include <seastar/http/exception.hh>
 #include <seastar/util/short_streams.hh>
 #include "utils/log.hh"
@@ -26,14 +25,6 @@ using namespace std::chrono_literals;
 using namespace seastar::http;
 
 namespace aws {
-
-// Full jitter, uniform in [0, 1). Without it every stream refused at the same
-// instant retries at the same instant, over and over.
-static double jitter() {
-    static thread_local std::mt19937 engine{std::random_device{}()};
-    static thread_local std::uniform_real_distribution<double> dist{0.0, 1.0};
-    return dist(engine);
-}
 
 // Delay before a retry, by error class: a dropped connection can be retried almost
 // immediately, while a 503 means the endpoint is over its limit already. A throttle
@@ -56,7 +47,7 @@ static seastar::future<> sleep_before_retry(size_t attempted_retries, bool is_th
     }
     const double base = is_throttling ? throttling_base_sec : transient_base_sec;
     const double exponential = base * static_cast<double>(1UL << std::min(attempted_retries, size_t{30}));
-    const double delay_sec = std::min(exponential, cap_sec) * jitter();
+    const double delay_sec = std::min(exponential, cap_sec);
     return seastar::sleep(std::chrono::milliseconds(static_cast<int64_t>(delay_sec * 1000.0)));
 }
 
@@ -70,7 +61,7 @@ default_aws_retry_strategy::default_aws_retry_strategy(unsigned max_retries, s3:
 }
 
 // Errors that indicate the S3 endpoint is throttling us (429/503-class).
-// These drive the adaptive send-rate limiter's back-off.
+// These pick the longer backoff base and trip the send brake.
 static bool is_throttling_error(aws::aws_error_type type) {
     using enum aws::aws_error_type;
     switch (type) {
@@ -90,12 +81,10 @@ seastar::future<bool> default_aws_retry_strategy::should_retry(std::exception_pt
     auto err = aws_error::from_exception_ptr(error);
 
     // Report before the caps are consulted, so that the response which exhausts a
-    // request still reaches the control loop.
+    // request still trips the brake.
     const bool is_throttling = is_throttling_error(err.get_error_type());
     if (is_throttling) {
         _controller.on_throttled();
-    } else {
-        _controller.on_error_not_throttled();
     }
 
     if (attempted_retries >= _max_retries) {

@@ -16,8 +16,8 @@ namespace s3 {
 
 // A do-nothing throttling controller: acquire() never waits and outcome
 // feedback is ignored. Used by tests (e.g. the fuzzing S3 proxy) that inject
-// synthetic throttling responses and must not have the client's send rate
-// throttled as a side effect.
+// synthetic throttling responses and must not have the client held back as a
+// side effect.
 class noop_throttling_controller final : public throttling_controller {
 public:
     seastar::future<> acquire(seastar::abort_source*) override {
@@ -25,14 +25,12 @@ public:
     }
     void on_throttled() override {}
     void on_success() override {}
-    void on_error_not_throttled() override {}
 
     bool try_acquire_retry_quota() override { return true; }
+    void resize_retry_quota(unsigned) override {}
 
-    bool enabled() const override { return false; }
-    double fill_rate() const override { return 0.0; }
-    double measured_tx_rate() const override { return 0.0; }
     uint64_t throttles() const override { return 0; }
+    uint64_t freezes() const override { return 0; }
     uint64_t retry_quota_denials() const override { return 0; }
 };
 

@@ -134,8 +134,7 @@ class client : public enable_shared_from_this<client> {
         void register_metrics(std::string class_name, std::string host);
     };
     std::unordered_map<seastar::scheduling_group, group_client> _https;
-    // Send-rate limiter for this client, shared by every scheduling group on
-    // the shard.
+    // Send brake for this client, shared by every scheduling group on the shard.
     std::unique_ptr<throttling_controller> _request_limiter;
     seastar::metrics::metric_groups _client_metrics;
     void register_client_metrics();
