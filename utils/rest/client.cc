@@ -66,18 +66,18 @@ rest::httpclient::httpclient(std::string host, uint16_t port, shared_ptr<tls::ce
     , _tls_options(options.value_or(tls::tls_options{ .server_name = default_server_name(_host) }))
 {}
 
-seastar::future<rest::httpclient::result_type> rest::httpclient::send(seastar::abort_source* as) {
+seastar::future<rest::httpclient::result_type> rest::httpclient::send(seastar::abort_source* as, const http::retry_strategy* strategy) {
     result_type res;
     co_await send([&](const http::reply& r, std::string_view body) {
         res.reply._status = r._status;
         res.reply._content = sstring(body);
         res.reply._headers = r._headers;
         res.reply._version = r._version;
-    }, as);
+    }, as, strategy);
     co_return res;
 }
 
-seastar::future<> rest::httpclient::send(const handler_func& f, seastar::abort_source* as) {
+seastar::future<> rest::httpclient::send(const handler_func& f, seastar::abort_source* as, const http::retry_strategy* strategy) {
     auto addr = co_await net::dns::resolve_name(_host, net::inet_address::family::INET /* TODO: our client does not handle ipv6 well?*/);
 
     // NOTE: similar to utils::http::dns_connection_factory, but that type does
@@ -113,7 +113,7 @@ seastar::future<> rest::httpclient::send(const handler_func& f, seastar::abort_s
             auto& resp_handler = f;
             auto result = co_await util::read_entire_stream_contiguous(in_stream);
             resp_handler(rep, result);
-        }, as);
+        }, strategy, as);
     } catch (...) {
         p = std::current_exception();
     }

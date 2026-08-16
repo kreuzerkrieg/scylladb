@@ -92,8 +92,12 @@ public:
 
     using handler_func = std::function<void(const seastar::http::reply&, std::string_view)>;
 
-    seastar::future<result_type> send(seastar::abort_source* = nullptr);
-    seastar::future<> send(const handler_func&, seastar::abort_source* = nullptr);
+    // The optional retry strategy is handed to the underlying seastar http
+    // client, which re-sends the request on a fresh connection for as long as
+    // the strategy allows. Transport errors reach it on their own; to have it
+    // see an unwanted reply status as well, the handler must throw on one.
+    seastar::future<result_type> send(seastar::abort_source* = nullptr, const http::retry_strategy* = nullptr);
+    seastar::future<> send(const handler_func&, seastar::abort_source* = nullptr, const http::retry_strategy* = nullptr);
 
     const std::string& host() const {
         return _host;
