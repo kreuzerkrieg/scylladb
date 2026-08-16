@@ -32,12 +32,11 @@
 #include "encryption_exceptions.hh"
 #include "symmetric_key.hh"
 #include "utils.hh"
-#include "utils/exponential_backoff_retry.hh"
 #include "utils/hash.hh"
-#include "utils/http_client_error_processing.hh"
 #include "utils/loading_cache.hh"
 #include "utils/http.hh"
 #include "utils/s3/aws_error.hh"
+#include "utils/s3/default_aws_retry_strategy.hh"
 #include "utils/UUID.hh"
 #include "utils/UUID_gen.hh"
 #include "utils/rjson.hh"
@@ -253,7 +252,6 @@ private:
     future<result_type> post(aws_query);
 
     future<rjson::value> post(std::string_view target, std::string_view aws_assume_role_arn, const rjson::value& query);
-    future<rjson::value> do_post(std::string_view target, std::string_view aws_assume_role_arn, const rjson::value& query);
 
     future<key_and_id_type> create_key(const attr_cache_key&);
     future<bytes> find_key(const id_cache_key&);
@@ -387,38 +385,51 @@ struct encryption::kms_host::impl::aws_query {
     std::string_view security_token;
 
     uint16_t port;
+
+    // What to say the error was when a failed reply carries no message of its own.
+    std::string_view error_context = "Unknown error";
 };
 
-future<rjson::value> encryption::kms_host::impl::post(std::string_view target, std::string_view aws_assume_role_arn, const rjson::value& query) {
-    static constexpr auto max_retries = 10;
+// How many times a single request may be re-sent before the failure is reported.
+static constexpr unsigned max_retries = 10;
 
-    exponential_backoff_retry exr(10ms, 10000ms);
+// Shape a failed reply into a kms_error, preferring the error type AWS puts in
+// the body over the one implied by the status. STS answers in XML rather than
+// JSON, so there the parse fails and the status alone names the error.
+static kms_error make_kms_error(httpclient::reply_status status, std::string_view body, std::string_view context) {
+    static constexpr const char* message_lc_header = "message";
+    static constexpr const char* message_cc_header = "Message";
+    static constexpr const char* error_type_header = "x-amzn-ErrorType";
+    static constexpr const char* type_header = "__type";
 
-    for (int retry = 0; ; ++retry) {
+    auto doc = rjson::empty_object();
+    if (!body.empty()) {
         try {
-            co_return co_await do_post(target, aws_assume_role_arn, query);
-        } catch (kms_error& e) {
-            if (retry >= max_retries || !utils::http::from_http_code(e.result())) {
-                throw;
-            }
-            kms_log.debug("Retryable KMS error ({}), retry {}/{}: {}", e.result(), retry + 1, max_retries, e.what());
-        } catch (std::system_error& e) {
-            if (retry >= max_retries || !utils::http::from_system_error(e)) {
-                throw;
-            }
-            kms_log.debug("Retryable system error ({}), retry {}/{}: {}", e.code().message(), retry + 1, max_retries, e.what());
-        } catch (service_error& e) {
-            if (retry >= max_retries) {
-                throw;
-            }
-            kms_log.debug("Retryable service error, retry {}/{}: {}", retry + 1, max_retries, e.what());
+            doc = rjson::parse(body);
+        } catch (...) {
+            // not JSON. fall back to the status below
         }
-
-        co_await exr.retry();
     }
+
+    // try to format as good an error as we can.
+    auto o = rjson::get_opt<std::string>(doc, message_lc_header);
+    if (!o) {
+        o = rjson::get_opt<std::string>(doc, message_cc_header);
+    }
+    auto msg = o.value_or(std::string(context));
+
+    o = rjson::get_opt<std::string>(doc, error_type_header);
+    if (!o) {
+        o = rjson::get_opt<std::string>(doc, type_header);
+    }
+    // this should never happen with aws, but...
+    if (!o) {
+        return kms_error(status, msg);
+    }
+    return kms_error(status, *o, msg);
 }
 
-future<rjson::value> encryption::kms_host::impl::do_post(std::string_view target, std::string_view aws_assume_role_arn, const rjson::value& query) {
+future<rjson::value> encryption::kms_host::impl::post(std::string_view target, std::string_view aws_assume_role_arn, const rjson::value& query) {
     static auto query_ec2_meta = [](std::string_view target, std::string token = {}) -> future<std::tuple<httpclient::result_type, std::string>> {
         static auto get_env_def = [](std::string_view var, std::string_view def) {
             auto val = std::getenv(var.data());
@@ -438,18 +449,33 @@ future<rjson::value> encryption::kms_host::impl::do_post(std::string_view target
 
         static auto logged_send = [](httpclient& client) -> future<result_type> {
             kms_log.trace("Request: {}", client.request());
+            // The metadata service answers 503 while it is still coming up, which is
+            // what this retry was originally here for.
+            // https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/instancedata-data-retrieval.html#instance-metadata-returns
+            aws::default_aws_retry_strategy retry_strategy(max_retries);
             result_type res;
             try {
-                res = co_await client.send();
+                // Throwing from the handler is what brings the reply status within
+                // reach of the strategy.
+                co_await client.send([&](const seastar::http::reply& rep, std::string_view body) {
+                    res.reply._status = rep._status;
+                    res.reply._content = sstring(body);
+                    res.reply._headers = rep._headers;
+                    res.reply._version = rep._version;
+                    if (rep._status != httpclient::reply_status::ok) {
+                        throw kms_error(rep._status, "EC2 metadata query");
+                    }
+                }, nullptr, &retry_strategy);
+            } catch (kms_error&) {
+                // A reply the strategy gave up on, already shaped. The two catches
+                // below are for failures that never produced a reply at all.
+                throw;
             } catch (std::system_error& e) {
                 std::throw_with_nested(network_error(fmt::format("Error sending to host {}:{}: {}", client.host(), client.port(), e.what())));
             } catch (std::exception& e) {
                 std::throw_with_nested(service_error(fmt::format("Error sending to host {}:{}: {}", client.host(), client.port(), e.what())));
             }
             kms_log.trace("Result: status={}, response={}", res.result_int(), res);
-            if (res.result() != httpclient::reply_status::ok) {
-                throw kms_error(res, "EC2 metadata query");
-            }
             co_return res;
         };
 
@@ -631,11 +657,8 @@ future<rjson::value> encryption::kms_host::impl::do_post(std::string_view target
             .aws_secret_access_key = aws_secret_access_key,
             .security_token = session,
             .port = _options.port,
+            .error_context = "AssumeRole",
         });
-
-        if (res.result() != httpclient::reply_status::ok) {
-            throw kms_error(res, "AssumeRole");
-        }
 
         rapidxml::xml_document<> doc;
         try {
@@ -683,39 +706,7 @@ future<rjson::value> encryption::kms_host::impl::do_post(std::string_view target
     auto body = rjson::empty_object();
 
     if (!res.body().empty()) {
-        try {
-            body = rjson::parse(std::string_view(res.body().data(), res.body().size()));
-        } catch (...) {
-            if (res.result() == httpclient::reply_status::ok) {
-                throw;
-            }
-            // assume non-json formatted error. fall back to parsing below
-        }
-    } 
-
-    if (res.result() != httpclient::reply_status::ok) {
-        // try to format as good an error as we can.
-        static const char* message_lc_header = "message";
-        static const char* message_cc_header = "Message";
-        static const char* error_type_header = "x-amzn-ErrorType";
-        static const char* type_header = "__type";
-
-        auto o = rjson::get_opt<std::string>(body, message_lc_header);
-        if (!o) {
-            o = rjson::get_opt<std::string>(body, message_cc_header);
-        }
-        auto msg = o.value_or("Unknown error");
-
-        o = rjson::get_opt<std::string>(body, error_type_header);
-        if (!o) {
-            o = rjson::get_opt<std::string>(body, type_header);
-        }
-        // this should never happen with aws, but...
-        if (!o) {
-            throw kms_error(res, msg);
-        }
-
-        throw kms_error(res.result(), *o, msg);
+        body = rjson::parse(std::string_view(res.body().data(), res.body().size()));
     }
 
     co_return body;    
@@ -876,7 +867,25 @@ future<encryption::kms_host::impl::result_type> encryption::kms_host::impl::post
 
     kms_log.trace("Request: {}", client.request());
 
-    auto res = co_await client.send();
+    // Retrying one request, rather than the whole operation around it, means a
+    // transient failure re-sends this POST instead of replaying the credential
+    // lookup and AssumeRole that produced its signature. The signature is
+    // replayed as-is, which is fine: the retry budget stays well inside the
+    // five minutes AWS allows a request timestamp to age.
+    aws::default_aws_retry_strategy retry_strategy(max_retries);
+
+    result_type res;
+    // Throwing from the handler is what brings the reply status within reach of
+    // the strategy.
+    co_await client.send([&](const seastar::http::reply& rep, std::string_view body) {
+        res.reply._status = rep._status;
+        res.reply._content = sstring(body);
+        res.reply._headers = rep._headers;
+        res.reply._version = rep._version;
+        if (rep._status != httpclient::reply_status::ok) {
+            throw make_kms_error(rep._status, body, query.error_context);
+        }
+    }, nullptr, &retry_strategy);
 
     kms_log.trace("Result: status={}, response={}", res.result_int(), res);
 
