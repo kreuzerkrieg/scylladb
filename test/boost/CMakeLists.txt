@@ -97,10 +97,6 @@ add_scylla_test(encryption_at_rest_test
   KIND SEASTAR
   LIBRARIES
     encryption)
-add_scylla_test(http_error_classification_test
-  KIND SEASTAR
-  LIBRARIES
-    encryption)
 add_scylla_test(enum_option_test
   KIND BOOST)
 add_scylla_test(enum_set_test
@@ -366,6 +362,7 @@ add_scylla_test(combined_tests
     disk_space_monitor_test.cc
     digest_checked_data_source_test.cc
     error_injection_test.cc
+    exponential_backoff_retry_test.cc
     extensions_test.cc
     filtering_test.cc
     group0_cmd_merge_test.cc
