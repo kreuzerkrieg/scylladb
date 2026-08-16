@@ -94,7 +94,14 @@ class S3Server:
         resource.Bucket(self.bucket_name).create()
 
     def destroy_test_bucket(self):
-        """Empty and delete the per-test bucket using boto3."""
+        """Empty and delete the per-test bucket using boto3.
+
+        A no-op once the bucket is gone, so a caller that cannot tell whether
+        its deferred destroy was registered may call this and let the callback
+        run too.
+        """
+        if not self.bucket_name:
+            return
         try:
             resource = self.get_resource()
             bucket = resource.Bucket(self.bucket_name)
@@ -102,6 +109,7 @@ class S3Server:
             bucket.delete()
         except Exception as e:
             logging.warning("Failed to destroy test bucket %s: %s", self.bucket_name, e)
+        self.bucket_name = None
 
     async def start(self):
         pass
@@ -146,7 +154,9 @@ class MinioWrapper(S3Server):
 
     async def stop(self):
         try:
-            await self.server.stop()
+            if self.server is not None:
+                server, self.server = self.server, None
+                await server.stop()
         finally:
             if self.leased_host is not None:
                 await self.host_registry.release_host(self.leased_host)
@@ -189,7 +199,14 @@ class GSFront:
         resource.Bucket(self.bucket_name).create()
 
     def destroy_test_bucket(self):
-        """Empty and delete the per-test bucket using boto3."""
+        """Empty and delete the per-test bucket using boto3.
+
+        A no-op once the bucket is gone, so a caller that cannot tell whether
+        its deferred destroy was registered may call this and let the callback
+        run too.
+        """
+        if not self.bucket_name:
+            return
         try:
             resource = self.get_resource()
             bucket = resource.Bucket(self.bucket_name)
@@ -197,6 +214,7 @@ class GSFront:
             bucket.delete()
         except Exception as e:
             logging.warning("Failed to destroy test bucket %s: %s", self.bucket_name, e)
+        self.bucket_name = None
 
     async def start(self):
         pass
@@ -268,7 +286,12 @@ class GSServerImpl(GSFront):
             raise Exception(f'Could not create test bucket: {response}')
 
     def destroy_test_bucket(self):
-        """Empty and delete the per-test bucket using GCS HTTP API."""
+        """Empty and delete the per-test bucket using GCS HTTP API.
+
+        A no-op once the bucket is gone, see S3Server.destroy_test_bucket().
+        """
+        if not self.bucket_name:
+            return
         try:
             # List and delete all objects first using boto3 (listing works on fake GCS)
             resource = self.get_resource()
@@ -278,10 +301,12 @@ class GSServerImpl(GSFront):
             requests.delete(f'{self.endpoint}/storage/v1/b/{self.bucket_name}', timeout=10)
         except Exception as e:
             logging.warning("Failed to destroy test bucket %s: %s", self.bucket_name, e)
+        self.bucket_name = None
 
     async def stop(self):
         if self.server:
-            await self.server.stop()
+            server, self.server = self.server, None
+            await server.stop()
         self.unpublish()
 
 
