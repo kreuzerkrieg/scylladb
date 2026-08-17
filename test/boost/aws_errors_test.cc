@@ -323,3 +323,31 @@ BOOST_AUTO_TEST_CASE(TestNestedException) {
         BOOST_REQUIRE_EQUAL(error.is_retryable(), utils::http::retryable::yes);
     }
 }
+
+BOOST_AUTO_TEST_CASE(TestKmsErrorsAreRegistered) {
+    const auto& errors = aws::aws_error::get_errors();
+
+    // Names kms_host reports that only the KMS model provides.
+    for (const auto* name : {"KMSInternalException", "KMSInvalidStateException", "DependencyTimeoutException",
+                             "NotFoundException", "AlreadyExistsException", "InvalidArnException",
+                             "LimitExceededException", "KeyUnavailableException", "DisabledException"}) {
+        BOOST_TEST_CONTEXT("KMS error name: " << name) {
+            BOOST_REQUIRE(errors.contains(name));
+        }
+    }
+
+    // STS and KMS spell the same error differently; both resolve to one type.
+    BOOST_REQUIRE_EQUAL(errors.at("MalformedPolicyDocument").get_error_type(),
+                        errors.at("MalformedPolicyDocumentException").get_error_type());
+
+    // KMS models its server faults with "fault": true and no httpStatusCode, so
+    // the rule that maps 5xx to retryable never fires for them and the registry
+    // reports them non-retryable, exactly as aws-sdk-cpp generates in
+    // KMSErrors.cpp. kms_host departs from that on purpose -- see
+    // classify_kms_error() -- so pin what it is departing from.
+    for (const auto* name : {"KMSInternalException", "DependencyTimeoutException", "KeyUnavailableException"}) {
+        BOOST_TEST_CONTEXT("KMS server fault: " << name) {
+            BOOST_REQUIRE_EQUAL(errors.at(name).is_retryable(), utils::http::retryable::no);
+        }
+    }
+}

@@ -4,8 +4,8 @@
 # SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
 #
 # Generate ScyllaDB `aws_error_type` enum entries and wire-name → enum
-# mapping entries for S3 and STS by pulling the c2j models from
-# aws/aws-sdk-cpp main on GitHub.
+# mapping entries for the AWS services Scylla talks to, by pulling the c2j
+# models from aws/aws-sdk-cpp main on GitHub.
 #
 # Ports the relevant bits of the aws-sdk-cpp Java generator:
 #   * ErrorFormatter.formatErrorConstName()  → _format_error_const_name()
@@ -63,11 +63,12 @@ RETRYABLE_ERRORS: set[str] = {
 }
 RESPONSE_CODES_TO_RETRY: set[int] = {500, 502, 503, 504}
 
-# The two services we care about, with their c2j model filenames on
+# The services we care about, with their c2j model filenames on
 # aws-sdk-cpp main.
 SERVICES: dict[str, str] = {
     "s3":  "s3-2006-03-01.normal.json",
     "sts": "sts-2011-06-15.normal.json",
+    "kms": "kms-2014-11-01.normal.json",
 }
 MODEL_URL_TEMPLATE = (
     "https://raw.githubusercontent.com/aws/aws-sdk-cpp/main/"
