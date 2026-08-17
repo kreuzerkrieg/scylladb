@@ -37,6 +37,7 @@
 #include "utils/http_client_error_processing.hh"
 #include "utils/loading_cache.hh"
 #include "utils/http.hh"
+#include "utils/s3/aws_error.hh"
 #include "utils/UUID.hh"
 #include "utils/UUID_gen.hh"
 #include "utils/rjson.hh"
@@ -65,19 +66,43 @@ static std::string get_response_error(httpclient::reply_status res) {
     }
 };
 
-class kms_error : public std::exception {
+// Classify a KMS failure through the registry shared with S3 and STS. A name the
+// registry does not know falls back to the status alone, and the status is a
+// floor on retryability: it can make an error retryable, never the reverse.
+//
+// That floor is a deliberate departure from aws-sdk-cpp, so it is here rather
+// than in the registry. KMS models its server faults -- KMSInternalException,
+// DependencyTimeoutException, KeyUnavailableException -- with "fault": true and
+// no httpStatusCode, so the generated registry marks them non-retryable, and
+// every strategy the SDK ships asks the registry and nothing else
+// (DefaultRetryStrategy and StandardRetryStrategy both gate on
+// AWSError::ShouldRetry). Upstream therefore never retries them. The KMS API
+// reference documents all three as retryable and they arrive as 500, so we do.
+static aws::aws_error classify_kms_error(httpclient::reply_status res, const std::string& type, std::string_view msg) {
+    using retryable = utils::http::retryable;
+
+    auto from_status = aws::aws_error::from_http_code(res);
+    const auto& registry = aws::aws_error::get_errors();
+    auto i = registry.find(type);
+    bool known = i != registry.end();
+    bool is_retryable = (known && i->second.is_retryable() == retryable::yes) || from_status.is_retryable() == retryable::yes;
+
+    return aws::aws_error(known ? i->second.get_error_type() : from_status.get_error_type(),
+                          fmt::format("{}: {}", type, msg),
+                          retryable(is_retryable));
+}
+
+class kms_error : public aws::aws_exception {
     httpclient::reply_status _res;
-    std::string _type, _msg;
+    std::string _type;
 public:
     kms_error(httpclient::reply_status res, std::string type, std::string_view msg)
-        : _res(res)
+        : aws_exception(classify_kms_error(res, type, msg))
+        , _res(res)
         , _type(std::move(type))
-        , _msg(fmt::format("{}: {}", _type, msg))
     {}
     kms_error(httpclient::reply_status res, std::string_view msg)
-        : _res(res)
-        , _type(get_response_error(res))
-        , _msg(fmt::format("{}: {}", _type, msg))
+        : kms_error(res, get_response_error(res), msg)
     {}
     kms_error(const httpclient::result_type& res, std::string_view msg)
         : kms_error(res.result(), msg)
@@ -87,9 +112,6 @@ public:
     }
     const std::string& type() const {
         return _type;
-    }
-    const char* what() const noexcept override {
-        return _msg.c_str();
     }
 };
 
