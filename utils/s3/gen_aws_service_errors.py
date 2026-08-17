@@ -121,15 +121,14 @@ def _is_retryable(shape: dict, wire_code: str) -> bool:
 
 
 def _extract_service_errors(model: dict) -> list[ServiceError]:
-    """Collect every error shape referenced by any operation, dedupe by enum
-    name, skip core error names."""
+    """Collect every error shape referenced by any operation, skip core error
+    names."""
     shapes = model.get("shapes", {})
     error_shape_names: set[str] = set()
     for op in model.get("operations", {}).values():
         for err in op.get("errors", []):
             error_shape_names.add(err["shape"])
 
-    seen: set[str] = set()
     errors: list[ServiceError] = []
     for shape_name in sorted(error_shape_names):
         shape = shapes.get(shape_name, {})
@@ -138,18 +137,34 @@ def _extract_service_errors(model: dict) -> list[ServiceError]:
         # Shape names in c2j are already UpperCamel, so no transformation
         # needed before feeding to _format_error_const_name.
         enum_name = _format_error_const_name(shape_name)
-        if enum_name in CORE_ERROR_CONSTANTS or enum_name in seen:
+        if enum_name in CORE_ERROR_CONSTANTS:
             continue
-        seen.add(enum_name)
         errors.append(ServiceError(enum_name, wire_code, _is_retryable(shape, wire_code)))
 
-    errors.sort(key=lambda e: e.enum_name)
     return errors
+
+
+def _merge_service_errors(per_service: list[list[ServiceError]]) -> tuple[list[str], list[ServiceError]]:
+    """Fold the per-service models into the two things the registry is: a set of
+    error types, and a lookup from every wire name that means one.
+
+    An error name identifies an error, not a service, so services that model the
+    same one share a type -- STS spells it MalformedPolicyDocument and KMS spells
+    it MalformedPolicyDocumentException, exactly as the core mapper already lists
+    five spellings of THROTTLING. Nothing is lost by sharing: the reply carries
+    the message, the registry only says what kind of error it is."""
+    errors = sorted((e for service in per_service for e in service),
+                    key=lambda e: (e.enum_name, e.wire_code))
+    enum_names = sorted({e.enum_name for e in errors})
+    by_wire_code: dict[str, ServiceError] = {}
+    for e in errors:
+        by_wire_code.setdefault(e.wire_code, e)
+    return enum_names, list(by_wire_code.values())
 
 # --- renderers -----------------------------------------------------------------
 
-def _render_enum_lines(errors: list[ServiceError], indent: str) -> str:
-    return "\n".join(f"{indent}{e.enum_name}," for e in errors)
+def _render_enum_lines(enum_names: list[str], indent: str) -> str:
+    return "\n".join(f"{indent}{name}," for name in enum_names)
 
 
 def _render_mapping_lines(errors: list[ServiceError], indent: str) -> str:
@@ -173,21 +188,17 @@ GENERATED_SOURCE_NAME = "aws_error_definitions_generated.cc"
 HASHES_NAME = "aws_error_definitions.hashes.json"
 
 
-def _substitute_tags(text: str, per_service: dict[str, str], context: str) -> str:
-    """Replace `// @SCYLLA_AWS_ERRORS_<SERVICE>@` marker lines with the
-    corresponding generated block. Preserves the indentation of the marker
-    line so the emitted block matches the surrounding code."""
-    for service, generated in per_service.items():
-        tag = f"@SCYLLA_AWS_ERRORS_{service.upper()}@"
-        marker_line = None
-        for line in text.splitlines(keepends=False):
-            if tag in line:
-                marker_line = line
-                break
-        if marker_line is None:
-            raise RuntimeError(f"{context}: marker {tag} not found")
-        text = text.replace(marker_line, generated, 1)
-    return text
+TAG = "@SCYLLA_AWS_ERRORS@"
+
+
+def _substitute_tag(text: str, generated: str, context: str) -> str:
+    """Replace the `// @SCYLLA_AWS_ERRORS@` marker line with the generated block.
+    Preserves the indentation of the marker line so the emitted block matches the
+    surrounding code."""
+    for line in text.splitlines(keepends=False):
+        if TAG in line:
+            return text.replace(line, generated, 1)
+    raise RuntimeError(f"{context}: marker {TAG} not found")
 
 
 def _write_if_changed(path: Path, text: str) -> bool:
@@ -341,26 +352,23 @@ def main() -> int:
               "sidefile; nothing to do", file=sys.stderr)
         return 0
 
-    per_service = {
-        s: _extract_service_errors(json.loads(raw_models[s]))
-        for s in SERVICES
-    }
+    enum_names, mappings = _merge_service_errors(
+        [_extract_service_errors(json.loads(raw_models[s])) for s in SERVICES])
 
     if args.dry_run:
-        for service, errors in per_service.items():
-            print(f"\n=== {service}: enum entries ===")
-            print(_render_enum_lines(errors, "    "))
-            print(f"\n=== {service}: mapping entries ===")
-            print(_render_mapping_lines(errors, "        "))
+        print("\n=== enum entries ===")
+        print(_render_enum_lines(enum_names, "    "))
+        print("\n=== mapping entries ===")
+        print(_render_mapping_lines(mappings, "        "))
         return 0
 
-    header_text = _substitute_tags(
+    header_text = _substitute_tag(
         HEADER_TEMPLATE.read_text(),
-        {s: _render_enum_lines(e, "    ") for s, e in per_service.items()},
+        _render_enum_lines(enum_names, "    "),
         context=HEADER_TEMPLATE.name)
-    source_text = _substitute_tags(
+    source_text = _substitute_tag(
         SOURCE_TEMPLATE.read_text(),
-        {s: _render_mapping_lines(e, "        ") for s, e in per_service.items()},
+        _render_mapping_lines(mappings, "        "),
         context=SOURCE_TEMPLATE.name)
 
     _write_if_changed(header_out, header_text)

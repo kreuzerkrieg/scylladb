@@ -66,10 +66,8 @@ enum class aws_error_type : uint8_t {
     HTTP_NETWORK_CONNECT_TIMEOUT = 126,
     HTTP_NETWORK_READ_TIMEOUT = 127,
     SERVICE_EXTENSION_START_RANGE = 128,
-    // S3-specific error enum values are substituted here at build time.
-    // @SCYLLA_AWS_ERRORS_S3@
-    // STS-specific error enum values are substituted here at build time.
-    // @SCYLLA_AWS_ERRORS_STS@
+    // Service-specific error enum values are substituted here at build time.
+    // @SCYLLA_AWS_ERRORS@
     // No error set
     OK = 255
 };

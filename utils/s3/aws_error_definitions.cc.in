@@ -90,10 +90,8 @@ const aws_errors& aws_error::get_errors() {
         {"HTTP_GATEWAY_TIMEOUT", aws_error(aws_error_type::HTTP_GATEWAY_TIMEOUT, retryable::yes)},
         {"HTTP_NETWORK_CONNECT_TIMEOUT", aws_error(aws_error_type::HTTP_NETWORK_CONNECT_TIMEOUT, retryable::yes)},
         {"HTTP_NETWORK_READ_TIMEOUT", aws_error(aws_error_type::HTTP_NETWORK_READ_TIMEOUT, retryable::yes)},
-        // S3-specific wire-code → aws_error entries are substituted here at build time.
-        // @SCYLLA_AWS_ERRORS_S3@
-        // STS-specific wire-code → aws_error entries are substituted here at build time.
-        // @SCYLLA_AWS_ERRORS_STS@
+        // Service-specific wire-code → aws_error entries are substituted here at build time.
+        // @SCYLLA_AWS_ERRORS@
     };
     return aws_error_map;
 }
