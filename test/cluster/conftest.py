@@ -17,6 +17,8 @@ from typing import TYPE_CHECKING
 from test import TOP_SRC_DIR, MODES_TIMEOUT_FACTOR, path_to
 from test.pylib.runner import PHASE_REPORT_KEY, MANAGER_LOGS_KEY, make_failed_test_dir
 from test.cluster.object_store.conftest import make_object_storage
+from test.cluster.util import FeatureConfig
+from test.pylib.object_storage import format_tuples
 from test.pylib.random_tables import RandomTables
 from test.pylib.skip_types import skip_env
 from test.pylib.util import unique_name
@@ -318,5 +320,30 @@ async def storage(request, pytestconfig, tmpdir, suite_log_dir, manager: ScyllaC
         yield None
         return
 
+    # Skip before provisioning: a test that skips itself in its body has already
+    # paid for a backend, and leaves the cluster clean, so the teardown callback
+    # that stops the backend never fires.
+    for marker in request.node.iter_markers('skip_storage'):
+        if request.param in marker.args:
+            skip_env(marker.kwargs['reason'])
+
     async with make_object_storage(request.param, pytestconfig, tmpdir, suite_log_dir, request.node.name, manager) as server:
         yield server
+
+
+@pytest.fixture
+def storage_config(storage) -> FeatureConfig:
+    """Express the storage fixture's backend as a FeatureConfig.
+
+    Lets a test apply the object-storage cluster config and keyspace STORAGE
+    clause the same way it applies any other configuration, and combine the
+    two by chaining: storage_config.get_cluster_cfg(feature_config.get_cluster_cfg(cfg)).
+    """
+    if storage is None:
+        return FeatureConfig()
+
+    storage_opts = format_tuples(type=storage.type,
+                                 endpoint=storage.address,
+                                 bucket=storage.bucket_name)
+    return FeatureConfig(ks_opts=f" WITH STORAGE = {storage_opts}",
+                         cluster_cfg={'object_storage_endpoints': storage.create_endpoint_conf()})
