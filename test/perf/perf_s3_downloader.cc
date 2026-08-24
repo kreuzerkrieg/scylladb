@@ -938,7 +938,7 @@ static constexpr std::array generated_components = {
 
 static future<corpus_plan> generate_corpus(const std::filesystem::path& corpus_dir, size_t sstables, size_t component_size,
                                            unsigned components_per_sstable) {
-    const auto per_sstable = std::min(size_t(components_per_sstable), generated_components.size());
+    const size_t per_sstable = components_per_sstable;
     if (per_sstable == 0) {
         throw std::invalid_argument("generate_components must be >= 1");
     }
@@ -955,7 +955,9 @@ static future<corpus_plan> generate_corpus(const std::filesystem::path& corpus_d
         const auto dir = corpus_dir / fmt::to_string(fresh_sstable_id());
         co_await recursive_touch_directory(dir.native());
         for (size_t c = 0; c < per_sstable; c++) {
-            const auto path = dir / std::string(generated_components[c]);
+            const auto path = c < generated_components.size()
+                    ? dir / std::string(generated_components[c])
+                    : dir / fmt::format("Data.db_{}", c - generated_components.size());
             auto f = co_await open_file_dma(path.native(), open_flags::wo | open_flags::create | open_flags::truncate);
             auto out = co_await make_file_output_stream(std::move(f));
             std::exception_ptr ex;
@@ -1100,7 +1102,8 @@ int main(int argc, char** argv) {
         "requests per second, not bytes, so this sets the requests-per-byte ratio")(
         "generate_components",
         bpo::value<unsigned>()->default_value(1),
-        "generate mode: components per sstable, 1..10");
+        "generate mode: components per sstable. The first ten get real component names; beyond that "
+        "the extras are named Data.db_N, which keeps the per-sstable request count adjustable");
 
     return app.run(argc, argv, [&app]() -> future<> {
         const sstring bucket = app.configuration()["bucket"].as<sstring>().empty() ? sstring(tests::getenv_safe("S3_BUCKET_FOR_TEST"))
