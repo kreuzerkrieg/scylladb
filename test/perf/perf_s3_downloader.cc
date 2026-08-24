@@ -753,6 +753,10 @@ class uploader {
     unsigned _upload_errors_throttled = 0;
     unsigned _upload_errors_masked = 0;
     utils::estimated_histogram _latencies;
+    uint64_t _deleted_files = 0;
+    unsigned _delete_errors = 0;
+    unsigned _delete_errors_throttled = 0;
+    utils::estimated_histogram _delete_latencies;
 
     std::chrono::steady_clock::time_point _now() const noexcept { return std::chrono::steady_clock::now(); }
 
@@ -860,6 +864,100 @@ public:
                 break;
             }
         }
+    }
+
+    // Deletes the keys the upload phase just wrote, at the same concurrency and
+    // over the same connections. A DELETE carries no body, so this phase issues
+    // requests as fast as the client can sign and dispatch them rather than at
+    // the rate the network can move object data. That is the point of the phase:
+    // PUT/COPY/POST/DELETE share one per-prefix write budget, and a single
+    // machine can exceed it with DELETEs while it cannot with PUTs.
+    future<> run_deletes() {
+        abort_source as;
+        std::atomic<size_t> next{0};
+
+        const auto round_start = _now();
+        round_stats prev = collect_delete_stats();
+        double prev_at = 0;
+        timer<lowres_clock> sample_timer;
+        sample_timer.set_callback([this, round_start, &prev, &prev_at] {
+            const auto at_sec = std::chrono::duration_cast<std::chrono::duration<double>>(_now() - round_start).count();
+            auto stats = collect_delete_stats();
+            log_sample("DELETE", at_sec, stats, prev, prev_at);
+            prev = stats;
+            prev_at = at_sec;
+        });
+        sample_timer.arm_periodic(_sample_interval);
+
+        co_await coroutine::parallel_for_each(std::views::iota(0u, _file_concurrency), [this, &as, &next](unsigned) -> future<> {
+            while (!as.abort_requested()) {
+                const size_t first = next.fetch_add(_upload_batch);
+                if (first >= _items.size()) {
+                    co_return;
+                }
+                const size_t last = std::min(first + _upload_batch, _items.size());
+                for (size_t i = first; i < last; i++) {
+                    if (as.abort_requested()) {
+                        co_return;
+                    }
+                    co_await delete_one(_items[i], as);
+                }
+            }
+        });
+        sample_timer.cancel();
+    }
+
+    future<> delete_one(const upload_item& item, abort_source& as) {
+        const auto t0 = _now();
+        std::exception_ptr failure;
+        try {
+            co_await _client->delete_object(item.key, &as);
+            ++_deleted_files;
+            _delete_latencies.add(std::chrono::duration_cast<std::chrono::milliseconds>(_now() - t0).count());
+        } catch (...) {
+            failure = std::current_exception();
+        }
+        if (failure && !as.abort_requested()) {
+            plog.info("shard {}: error deleting {}: {}", this_shard_id(), item.key, failure);
+            ++_delete_errors;
+            if (classify_failure(failure) == failure_kind::throttled) {
+                ++_delete_errors_throttled;
+            }
+        }
+    }
+
+    // The HTTP client counts only PUT in write_ops, so DELETEs have to be counted
+    // here. read_requests therefore holds logical delete calls, not wire requests:
+    // a retried DELETE is one call and several requests. The retry-strategy and
+    // controller counters are cumulative over both phases; the caller subtracts.
+    round_stats collect_delete_stats() const noexcept {
+        return {
+            .slowdown_errors = _retry ? _retry->slowdown_errors() : 0u,
+            .network_errors = _retry ? _retry->network_errors() : 0u,
+            .download_errors = _delete_errors,
+            .failed_throttled = _delete_errors_throttled,
+            .throttle_exhaustions = _retry ? _retry->throttle_exhaustions() : 0u,
+            .retry_quota_denials = _limiter ? _limiter->retry_quota_denials() : 0u,
+            .freezes = _limiter ? _limiter->freezes() : 0u,
+            .read_requests = _deleted_files + _delete_errors,
+            .completed = _deleted_files,
+        };
+    }
+
+    future<> log_delete_stats(double elapsed_sec) const {
+        if (_delete_latencies._count == 0) {
+            plog.info("  shard {:2d}: no objects deleted", this_shard_id());
+            co_return;
+        }
+        plog.info("  shard {:2d}: deleted={:6}  rate={:.0f}/s  del-errors={}  lat min/p50/p99/max = {}/{}/{}/{} ms",
+                  this_shard_id(),
+                  _delete_latencies._count,
+                  elapsed_sec > 0 ? static_cast<double>(_deleted_files) / elapsed_sec : 0.0,
+                  _delete_errors,
+                  _delete_latencies.percentile(0.0),
+                  _delete_latencies.percentile(0.5),
+                  _delete_latencies.percentile(0.99),
+                  _delete_latencies.percentile(1.0));
     }
 
     future<> stop() { co_await _client->close(); }
@@ -981,6 +1079,10 @@ static future<corpus_plan> generate_corpus(const std::filesystem::path& corpus_d
         const auto dir = corpus_dir / fmt::to_string(fresh_sstable_id());
         co_await recursive_touch_directory(dir.native());
         for (size_t c = 0; c < per_sstable; c++) {
+            // Past the canonical set the names are synthesised. The point of going
+            // beyond ten is the operation count per sstable, which is what the
+            // endpoint's write budget actually counts; the names stop being
+            // realistic there and that is deliberate.
             const auto path = c < generated_components.size()
                     ? dir / std::string(generated_components[c])
                     : dir / fmt::format("Data.db_{}", c - generated_components.size());
@@ -1129,14 +1231,19 @@ int main(int argc, char** argv) {
         "generate_components",
         bpo::value<unsigned>()->default_value(1),
         "generate mode: components per sstable. The first ten get real component names; beyond that "
-        "the extras are named Data.db_N, which keeps the per-sstable request count adjustable")(
+        "they are synthesised, because what raises the offered rate is the operation count per "
+        "sstable rather than the naming")(
         "upload_batch", bpo::value<size_t>()->default_value(1),
         "items each upload fiber takes per work-queue round trip. A backup writes an sstable's "
         "components as a straight-line chain on one fiber; 1 pays the queue round trip per request")(
         "upload_from_memory", bpo::bool_switch(),
         "read each component into memory and PUT it, instead of streaming it from a file. "
         "upload_file() builds a 128 KiB read-ahead file stream per object, which for components of "
-        "a few KiB costs more than the transfer");
+        "a few KiB costs more than the transfer")(
+        "delete_after_upload", bpo::bool_switch(),
+        "after uploading, delete the same keys at the same concurrency and report the phase "
+        "separately. DELETEs carry no body, so they reach a far higher request rate than PUTs "
+        "against the same shared per-prefix write budget");
 
     return app.run(argc, argv, [&app]() -> future<> {
         const sstring bucket = app.configuration()["bucket"].as<sstring>().empty() ? sstring(tests::getenv_safe("S3_BUCKET_FOR_TEST"))
@@ -1167,8 +1274,9 @@ int main(int argc, char** argv) {
         const size_t generate_sstables = app.configuration()["generate_sstables"].as<size_t>();
         const size_t generate_component_size = app.configuration()["generate_component_size"].as<size_t>();
         const unsigned generate_components = app.configuration()["generate_components"].as<unsigned>();
-        const size_t upload_batch = app.configuration()["upload_batch"].as<size_t>();
         const bool upload_from_memory = app.configuration()["upload_from_memory"].as<bool>();
+        const bool delete_after_upload = app.configuration()["delete_after_upload"].as<bool>();
+        const size_t upload_batch = app.configuration()["upload_batch"].as<size_t>();
 
         if (mode != "download" && mode != "upload" && mode != "generate") {
             throw std::invalid_argument(format("unknown mode '{}', expected download, generate or upload", mode));
@@ -1234,8 +1342,6 @@ int main(int argc, char** argv) {
             for (unsigned sh = 0; sh < this_smp_shard_count(); ++sh) {
                 total += co_await uploaders.invoke_on(sh, &uploader::collect_stats);
             }
-            co_await uploaders.stop();
-
             const double puts = elapsed > 0 ? static_cast<double>(total.read_requests) / elapsed : 0.0;
             const double mbs = elapsed > 0 ? static_cast<double>(total.read_bytes >> 20) / elapsed : 0.0;
             plog.warn("RESULT {{\"mode\":\"upload\",\"shards\":{},\"elapsed_sec\":{:.1f},"
@@ -1256,6 +1362,44 @@ int main(int argc, char** argv) {
                       total.throttle_exhaustions,
                       total.retry_quota_denials,
                       total.freezes);
+
+            if (delete_after_upload) {
+                plog.info("Deleting the same {} keys ({} concurrent per shard x {} shards)",
+                          total.completed,
+                          file_concurrency,
+                          this_smp_shard_count());
+                const auto d0 = std::chrono::steady_clock::now();
+                co_await uploaders.invoke_on_all([](uploader& u) { return u.run_deletes(); });
+                const double d_elapsed = std::chrono::duration_cast<std::chrono::duration<double>>(std::chrono::steady_clock::now() - d0).count();
+
+                co_await uploaders.invoke_on_all([d_elapsed](uploader& u) { return u.log_delete_stats(d_elapsed); });
+                round_stats dtotal;
+                for (unsigned sh = 0; sh < this_smp_shard_count(); ++sh) {
+                    dtotal += co_await uploaders.invoke_on(sh, &uploader::collect_delete_stats);
+                }
+
+                // The retry-strategy and controller counters run over both phases,
+                // so the upload totals are the baseline for the delete phase.
+                const double dels = d_elapsed > 0 ? static_cast<double>(dtotal.read_requests) / d_elapsed : 0.0;
+                plog.warn("RESULT {{\"mode\":\"delete\",\"shards\":{},\"elapsed_sec\":{:.1f},"
+                          "\"requests\":{},\"requests_per_sec\":{:.0f},\"deleted\":{},"
+                          "\"slowdown\":{},\"net_reset\":{},\"failed\":{},\"failed_throttled\":{},"
+                          "\"throttle_exhaustions\":{},\"retry_quota_denials\":{},\"freezes\":{}}}",
+                          this_smp_shard_count(),
+                          d_elapsed,
+                          dtotal.read_requests,
+                          dels,
+                          dtotal.completed,
+                          dtotal.slowdown_errors - total.slowdown_errors,
+                          dtotal.network_errors - total.network_errors,
+                          dtotal.download_errors,
+                          dtotal.failed_throttled,
+                          dtotal.throttle_exhaustions - total.throttle_exhaustions,
+                          dtotal.retry_quota_denials - total.retry_quota_denials,
+                          dtotal.freezes - total.freezes);
+            }
+
+            co_await uploaders.stop();
             co_return;
         }
 
