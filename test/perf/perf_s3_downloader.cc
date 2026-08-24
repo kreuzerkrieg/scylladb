@@ -744,6 +744,7 @@ class uploader {
     std::vector<upload_item> _items;
     unsigned _connections;
     unsigned _file_concurrency;
+    size_t _upload_batch = 1;
     std::chrono::seconds _sample_interval;
     uint64_t _uploaded_bytes = 0;
     uint64_t _uploaded_files = 0;
@@ -756,8 +757,9 @@ class uploader {
 
 public:
     uploader(endpoint_params ep, unsigned connections, unsigned file_concurrency, unsigned max_retries, std::chrono::seconds sample_interval,
-             std::vector<upload_item> items)
-        : _items(std::move(items)), _connections(connections), _file_concurrency(file_concurrency), _sample_interval(sample_interval) {
+             std::vector<upload_item> items, size_t upload_batch = 1)
+        : _items(std::move(items)), _connections(connections), _file_concurrency(file_concurrency), _upload_batch(std::max<size_t>(upload_batch, 1)),
+          _sample_interval(sample_interval) {
         auto wired = make_wired_client(ep, _connections, max_retries);
         _retry = wired.retry;
         _limiter = wired.limiter;
@@ -775,7 +777,7 @@ public:
     // then segfaults walking a null node.
     future<> run() {
         abort_source as;
-        size_t next = 0;
+        std::atomic<size_t> next{0};
 
         // Upload had no in-flight reporting at all: throttling surfaced only in
         // the closing RESULT line. That is how a fleet run accumulated ~25k
@@ -794,13 +796,23 @@ public:
         });
         sample_timer.arm_periodic(_sample_interval);
 
+        // Each fiber takes a contiguous run of items rather than one at a time. A
+        // backup writes an sstable's components as a straight-line chain on one
+        // fiber, so this is the shape the production path has; taking one item per
+        // loop iteration instead pays the work-queue round trip per request.
         co_await coroutine::parallel_for_each(std::views::iota(0u, _file_concurrency), [this, &as, &next](unsigned) -> future<> {
             while (!as.abort_requested()) {
-                const size_t i = next++;
-                if (i >= _items.size()) {
+                const size_t first = next.fetch_add(_upload_batch);
+                if (first >= _items.size()) {
                     co_return;
                 }
-                co_await upload_one(_items[i], as);
+                const size_t last = std::min(first + _upload_batch, _items.size());
+                for (size_t i = first; i < last; i++) {
+                    if (as.abort_requested()) {
+                        co_return;
+                    }
+                    co_await upload_one(_items[i], as);
+                }
             }
         });
         sample_timer.cancel();
@@ -1103,7 +1115,10 @@ int main(int argc, char** argv) {
         "generate_components",
         bpo::value<unsigned>()->default_value(1),
         "generate mode: components per sstable. The first ten get real component names; beyond that "
-        "the extras are named Data.db_N, which keeps the per-sstable request count adjustable");
+        "the extras are named Data.db_N, which keeps the per-sstable request count adjustable")(
+        "upload_batch", bpo::value<size_t>()->default_value(1),
+        "items each upload fiber takes per work-queue round trip. A backup writes an sstable's "
+        "components as a straight-line chain on one fiber; 1 pays the queue round trip per request");
 
     return app.run(argc, argv, [&app]() -> future<> {
         const sstring bucket = app.configuration()["bucket"].as<sstring>().empty() ? sstring(tests::getenv_safe("S3_BUCKET_FOR_TEST"))
@@ -1134,6 +1149,7 @@ int main(int argc, char** argv) {
         const size_t generate_sstables = app.configuration()["generate_sstables"].as<size_t>();
         const size_t generate_component_size = app.configuration()["generate_component_size"].as<size_t>();
         const unsigned generate_components = app.configuration()["generate_components"].as<unsigned>();
+        const size_t upload_batch = app.configuration()["upload_batch"].as<size_t>();
 
         if (mode != "download" && mode != "upload" && mode != "generate") {
             throw std::invalid_argument(format("unknown mode '{}', expected download, generate or upload", mode));
@@ -1180,7 +1196,8 @@ int main(int argc, char** argv) {
             for (size_t i = 0; i < items.size(); ++i) {
                 per_shard[i % this_smp_shard_count()].push_back(std::move(items[i]));
             }
-            co_await uploaders.start(endpoint, initial_connections, file_concurrency, max_retries, sample_interval, std::vector<upload_item>{});
+            co_await uploaders.start(endpoint, initial_connections, file_concurrency, max_retries, sample_interval, std::vector<upload_item>{},
+                                     upload_batch);
             // hand each shard its slice
             for (unsigned sh = 0; sh < this_smp_shard_count(); ++sh) {
                 co_await uploaders.invoke_on(sh, [slice = std::move(per_shard[sh])](uploader& u) mutable -> future<> {
