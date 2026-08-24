@@ -907,6 +907,81 @@ static std::string get_random_prefix(size_t length) {
 }
 } // namespace random_prefix
 
+// ─── corpus generation ───────────────────────────────────────────────────────
+//
+// Writes a synthetic corpus in the layout the upload phase expects, so that a
+// run needs no download phase and no real backup to copy from. This exists to
+// make the request-rate ceiling reachable from one machine: what S3 refuses is
+// requests per second per prefix, not bytes, and a real sstable corpus averages
+// ~43 MB per component, so a single node saturates its NIC long before it
+// reaches the request rate that gets refused. Small components invert that
+// ratio -- the same object count for a thousandth of the bytes.
+//
+// The files are not sstables and are never parsed: plan_uploads() walks the
+// directory tree and PUTs every regular file it finds, so from the endpoint's
+// side a synthetic component and a real one are the same request. What is kept
+// faithful is the shape -- one directory per sstable, components named as the
+// real ones are, so the key layout under test is unchanged.
+struct corpus_plan {
+    uint64_t sstables = 0;
+    uint64_t components = 0;
+    uint64_t bytes = 0;
+};
+
+// The components a real sstable carries, TOC first as the download path orders
+// them. Truncated to --generate_components, so a run can trade object count per
+// sstable against sstable count.
+static constexpr std::array generated_components = {
+    "TOC.txt"sv, "Scylla.db"sv, "Data.db"sv, "Index.db"sv, "Statistics.db"sv,
+    "Summary.db"sv, "Filter.db"sv, "CompressionInfo.db"sv, "Digest.crc32"sv, "CRC.db"sv,
+};
+
+static future<corpus_plan> generate_corpus(const std::filesystem::path& corpus_dir, size_t sstables, size_t component_size,
+                                           unsigned components_per_sstable) {
+    const auto per_sstable = std::min(size_t(components_per_sstable), generated_components.size());
+    if (per_sstable == 0) {
+        throw std::invalid_argument("generate_components must be >= 1");
+    }
+    corpus_plan plan;
+
+    // One buffer reused for every component: the contents are never read back,
+    // and filling gigabytes with random data would make the generator the
+    // bottleneck rather than S3.
+    temporary_buffer<char> filler(std::min(component_size, size_t(128 * 1024)));
+    std::fill_n(filler.get_write(), filler.size(), 'x');
+
+    co_await recursive_touch_directory(corpus_dir.native());
+    for (size_t i = 0; i < sstables; i++) {
+        const auto dir = corpus_dir / fmt::to_string(fresh_sstable_id());
+        co_await recursive_touch_directory(dir.native());
+        for (size_t c = 0; c < per_sstable; c++) {
+            const auto path = dir / std::string(generated_components[c]);
+            auto f = co_await open_file_dma(path.native(), open_flags::wo | open_flags::create | open_flags::truncate);
+            auto out = co_await make_file_output_stream(std::move(f));
+            std::exception_ptr ex;
+            try {
+                for (size_t written = 0; written < component_size; written += filler.size()) {
+                    const auto chunk = std::min(filler.size(), component_size - written);
+                    co_await out.write(filler.get(), chunk);
+                }
+            } catch (...) {
+                ex = std::current_exception();
+            }
+            co_await out.close();
+            if (ex) {
+                std::rethrow_exception(ex);
+            }
+            plan.components++;
+            plan.bytes += component_size;
+        }
+        plan.sstables++;
+        if (plan.sstables % 1000 == 0) {
+            plog.info("generated {} of {} sstables", plan.sstables, sstables);
+        }
+    }
+    co_return plan;
+}
+
 static std::vector<upload_item> plan_uploads(const std::filesystem::path& corpus_dir, const sstring& bucket, const sstring& prefix,
                                             size_t random_prefix_len) {
     std::vector<upload_item> items;
@@ -1006,7 +1081,7 @@ int main(int argc, char** argv) {
         "sample_interval", bpo::value<unsigned>()->default_value(10), "seconds between in-round rate samples")(
         "sstable_concurrency",
         bpo::value<unsigned>()->default_value(default_sstable_concurrency),
-        "sstables downloaded concurrently per shard (restore uses 16)")("mode", bpo::value<sstring>()->default_value("download"), "download or upload")(
+        "sstables downloaded concurrently per shard (restore uses 16)")("mode", bpo::value<sstring>()->default_value("download"), "download, generate or upload")(
         "upload_bucket", bpo::value<sstring>()->default_value("manager-backup-tests-us-east-1"), "bucket to upload the corpus into")(
         "upload_prefix", bpo::value<sstring>()->default_value("sstables_ewz"), "key prefix for uploads")(
         "upload_random_prefix", bpo::value<unsigned>()->default_value(0),
@@ -1015,7 +1090,17 @@ int main(int argc, char** argv) {
         "omit --upload_prefix from the key entirely (boost rejects an empty --upload_prefix value)")(
         "file_concurrency",
         bpo::value<unsigned>()->default_value(default_file_concurrency),
-        "components uploaded concurrently per shard (backup uses initial_sstable_loading_concurrency, 4)");
+        "components uploaded concurrently per shard (backup uses initial_sstable_loading_concurrency, 4)")(
+        "generate_sstables",
+        bpo::value<size_t>()->default_value(4000),
+        "generate mode: how many sstable directories to write")(
+        "generate_component_size",
+        bpo::value<size_t>()->default_value(5500),
+        "generate mode: bytes per component. Small values are the point: the endpoint refuses "
+        "requests per second, not bytes, so this sets the requests-per-byte ratio")(
+        "generate_components",
+        bpo::value<unsigned>()->default_value(1),
+        "generate mode: components per sstable, 1..10");
 
     return app.run(argc, argv, [&app]() -> future<> {
         const sstring bucket = app.configuration()["bucket"].as<sstring>().empty() ? sstring(tests::getenv_safe("S3_BUCKET_FOR_TEST"))
@@ -1043,9 +1128,12 @@ int main(int argc, char** argv) {
         const unsigned file_concurrency = app.configuration()["file_concurrency"].as<unsigned>();
         const auto upload_random_prefix = app.configuration()["upload_random_prefix"].as<unsigned>();
         const bool upload_no_prefix = app.configuration()["upload_no_prefix"].as<bool>();
+        const size_t generate_sstables = app.configuration()["generate_sstables"].as<size_t>();
+        const size_t generate_component_size = app.configuration()["generate_component_size"].as<size_t>();
+        const unsigned generate_components = app.configuration()["generate_components"].as<unsigned>();
 
-        if (mode != "download" && mode != "upload") {
-            throw std::invalid_argument(format("unknown mode '{}', expected download or upload", mode));
+        if (mode != "download" && mode != "upload" && mode != "generate") {
+            throw std::invalid_argument(format("unknown mode '{}', expected download, generate or upload", mode));
         }
 
         if (fleet_size < 1) {
@@ -1053,6 +1141,18 @@ int main(int argc, char** argv) {
         }
         if (fleet_index >= fleet_size) {
             throw std::invalid_argument(format("fleet_index {} is out of range for fleet_size {}", fleet_index, fleet_size));
+        }
+
+        if (mode == "generate") {
+            if (corpus_dir.empty()) {
+                throw std::invalid_argument("generate mode needs --corpus_dir");
+            }
+            const auto planned = co_await generate_corpus(corpus_dir, generate_sstables, generate_component_size, generate_components);
+            plog.warn("RESULT {{\"mode\":\"generate\",\"sstables\":{},\"components\":{},\"bytes\":{}}}",
+                      planned.sstables,
+                      planned.components,
+                      planned.bytes);
+            co_return;
         }
 
         if (mode == "upload") {
