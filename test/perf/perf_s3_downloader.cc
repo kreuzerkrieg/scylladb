@@ -744,6 +744,7 @@ class uploader {
     std::vector<upload_item> _items;
     unsigned _connections;
     unsigned _file_concurrency;
+    bool _in_memory = false;
     size_t _upload_batch = 1;
     std::chrono::seconds _sample_interval;
     uint64_t _uploaded_bytes = 0;
@@ -757,9 +758,9 @@ class uploader {
 
 public:
     uploader(endpoint_params ep, unsigned connections, unsigned file_concurrency, unsigned max_retries, std::chrono::seconds sample_interval,
-             std::vector<upload_item> items, size_t upload_batch = 1)
-        : _items(std::move(items)), _connections(connections), _file_concurrency(file_concurrency), _upload_batch(std::max<size_t>(upload_batch, 1)),
-          _sample_interval(sample_interval) {
+             std::vector<upload_item> items, bool in_memory = false, size_t upload_batch = 1)
+        : _items(std::move(items)), _connections(connections), _file_concurrency(file_concurrency), _in_memory(in_memory),
+          _upload_batch(std::max<size_t>(upload_batch, 1)), _sample_interval(sample_interval) {
         auto wired = make_wired_client(ep, _connections, max_retries);
         _retry = wired.retry;
         _limiter = wired.limiter;
@@ -822,8 +823,21 @@ public:
         const auto t0 = _now();
         std::exception_ptr failure;
         try {
-            const auto size = co_await file_size(item.local.native());
-            co_await _client->upload_file(item.local, item.key, std::nullopt, std::nullopt, &as);
+            size_t size = 0;
+            if (_in_memory) {
+                // Skips open_file_dma() and the 128 KiB read-ahead file stream that
+                // upload_file() builds per object. For components of a few KiB that
+                // machinery costs far more than the transfer, and a backup writing
+                // through sstables::storage does not pay it either -- it PUTs from
+                // memory buffers it already holds.
+                auto contents = co_await seastar::util::read_entire_file_contiguous(item.local);
+                size = contents.size();
+                temporary_buffer<char> buf(contents.data(), contents.size());
+                co_await _client->put_object(item.key, std::move(buf), &as);
+            } else {
+                size = co_await file_size(item.local.native());
+                co_await _client->upload_file(item.local, item.key, std::nullopt, std::nullopt, &as);
+            }
             _uploaded_bytes += size;
             ++_uploaded_files;
             _latencies.add(std::chrono::duration_cast<std::chrono::milliseconds>(_now() - t0).count());
@@ -1118,7 +1132,11 @@ int main(int argc, char** argv) {
         "the extras are named Data.db_N, which keeps the per-sstable request count adjustable")(
         "upload_batch", bpo::value<size_t>()->default_value(1),
         "items each upload fiber takes per work-queue round trip. A backup writes an sstable's "
-        "components as a straight-line chain on one fiber; 1 pays the queue round trip per request");
+        "components as a straight-line chain on one fiber; 1 pays the queue round trip per request")(
+        "upload_from_memory", bpo::bool_switch(),
+        "read each component into memory and PUT it, instead of streaming it from a file. "
+        "upload_file() builds a 128 KiB read-ahead file stream per object, which for components of "
+        "a few KiB costs more than the transfer");
 
     return app.run(argc, argv, [&app]() -> future<> {
         const sstring bucket = app.configuration()["bucket"].as<sstring>().empty() ? sstring(tests::getenv_safe("S3_BUCKET_FOR_TEST"))
@@ -1150,6 +1168,7 @@ int main(int argc, char** argv) {
         const size_t generate_component_size = app.configuration()["generate_component_size"].as<size_t>();
         const unsigned generate_components = app.configuration()["generate_components"].as<unsigned>();
         const size_t upload_batch = app.configuration()["upload_batch"].as<size_t>();
+        const bool upload_from_memory = app.configuration()["upload_from_memory"].as<bool>();
 
         if (mode != "download" && mode != "upload" && mode != "generate") {
             throw std::invalid_argument(format("unknown mode '{}', expected download, generate or upload", mode));
@@ -1197,7 +1216,7 @@ int main(int argc, char** argv) {
                 per_shard[i % this_smp_shard_count()].push_back(std::move(items[i]));
             }
             co_await uploaders.start(endpoint, initial_connections, file_concurrency, max_retries, sample_interval, std::vector<upload_item>{},
-                                     upload_batch);
+                                     upload_from_memory, upload_batch);
             // hand each shard its slice
             for (unsigned sh = 0; sh < this_smp_shard_count(); ++sh) {
                 co_await uploaders.invoke_on(sh, [slice = std::move(per_shard[sh])](uploader& u) mutable -> future<> {
