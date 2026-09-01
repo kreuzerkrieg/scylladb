@@ -122,9 +122,17 @@ public:
             } catch (...) {
                 _exception = std::current_exception();
             }
-            if (auto ex = std::exchange(_exception, {})) {
-                co_await remove_upload();
-                std::rethrow_exception(ex);
+            if (_exception) {
+                // Cancelling is best effort: whether it fails in remove_upload() itself or
+                // in the request under it, the upload's own error is the one the caller
+                // needs. Keep it set for remove_upload()'s own guard, and never let the
+                // cancel replace it.
+                try {
+                    co_await remove_upload();
+                } catch (...) {
+                    gcp_storage.warn("Could not cancel upload of {}:{}: {}", _bucket, _object_name, std::current_exception());
+                }
+                std::rethrow_exception(std::exchange(_exception, {}));
             }
         }
     }
