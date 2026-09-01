@@ -75,6 +75,47 @@ class registry:
 SESSIONS = registry()
 
 
+class injector:
+    """Faults a test asked for over the control path, see handler._control()."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._unacknowledged_chunks = 0
+        self._failed_chunks = 0
+        self._failed_cancels = 0
+
+    def arm(self, unacknowledged_chunks=None, failed_chunks=None, failed_cancels=None):
+        with self._lock:
+            if unacknowledged_chunks is not None:
+                self._unacknowledged_chunks = unacknowledged_chunks
+            if failed_chunks is not None:
+                self._failed_chunks = failed_chunks
+            if failed_cancels is not None:
+                self._failed_cancels = failed_cancels
+
+    def _take(self, name):
+        with self._lock:
+            left = getattr(self, name)
+            if left <= 0:
+                return False
+            setattr(self, name, left - 1)
+            return True
+
+    def take_unacknowledged_chunk(self):
+        return self._take("_unacknowledged_chunks")
+
+    def take_failed_chunk(self):
+        return self._take("_failed_chunks")
+
+    def take_failed_cancel(self):
+        return self._take("_failed_cancels")
+
+
+INJECTED = injector()
+
+CONTROL_PATH = "/__inject"
+
+
 class limited_reader:
     """Hands http.client exactly `remaining` bytes off a socket, no buffering."""
 
@@ -229,7 +270,56 @@ class handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(payload)
 
+    def _control(self):
+        """Arm faults. PUT /__inject?<fault>=<n>[&<fault>=<n>...]
+
+        unacknowledged_chunks -- answer a chunk with a Range-less 308
+        failed_chunks         -- answer a chunk with 400
+        failed_cancels        -- answer a session DELETE with 403
+
+        Each count is absolute and applies to the next <n> matching requests whatever
+        session they belong to, so a test arms it immediately before the upload it
+        wants faulted.
+        """
+        q = parse_qs(urlparse(self.path).query)
+        counts = {name: int(q[name][0]) for name in
+                  ("unacknowledged_chunks", "failed_chunks", "failed_cancels") if name in q}
+        INJECTED.arm(**counts)
+        self._note(f"arming {counts}")
+        body_len = self._body_length() or 0
+        if body_len:
+            self.rfile.read(body_len)
+        self.send_response(200)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def _unacknowledged(self, body_len, buffered):
+        """Answer a chunk with "308, nothing persisted": a 308 carrying no Range.
+
+        Google documents a Range-less 308 as "start your upload from the beginning",
+        so the client has to send the chunk again. The body is dropped instead of
+        forwarded, which makes the reply true -- the session's received count does
+        not move, so a client that skips ahead instead trips the Content-Range check
+        on its next chunk.
+        """
+        self._note(f"dropping chunk {self.headers.get('Content-Range')!r}, "
+                   f"answering 308 with no Range")
+        if buffered is None:
+            remaining = body_len
+            while remaining > 0:
+                got = self.rfile.read(min(BLOCK, remaining))
+                if not got:
+                    break
+                remaining -= len(got)
+        self.send_response(308)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
     def _proxy(self):
+        if urlparse(self.path).path == CONTROL_PATH:
+            self._control()
+            return
+
         body_len = self._body_length()
         buffered = None
         if body_len is None:
@@ -246,6 +336,25 @@ class handler(BaseHTTPRequestHandler):
             if err:
                 self._reject(err, 0 if buffered is not None else body_len)
                 return
+            # only a chunk carrying bytes can go unacknowledged
+            if CONTENT_RANGE_RE.match(content_range).group(1) is not None \
+                    and INJECTED.take_unacknowledged_chunk():
+                self._unacknowledged(body_len, buffered)
+                return
+            if INJECTED.take_failed_chunk():
+                self._reject("injected chunk failure", 0 if buffered is not None else body_len)
+                return
+
+        if self.command == "DELETE" and upload_id and INJECTED.take_failed_cancel():
+            # 403 rather than a 5xx: the client retries retryable statuses, and this
+            # fault is only useful if it survives to the caller
+            self._note("failing the cancel of an upload")
+            self.close_connection = True
+            self.send_response(403)
+            self.send_header("Content-Length", "0")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            return
 
         conn = http.client.HTTPConnection(self.server.upstream_host,
                                           self.server.upstream_port, timeout=600)
