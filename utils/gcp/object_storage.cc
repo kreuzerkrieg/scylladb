@@ -762,6 +762,10 @@ future<> utils::gcp::storage::client::object_data_sink::do_single_upload(std::de
     auto last = offset + std::max(len, size_t(1)) - 1; // inclusive.
     auto end = offset + len;
 
+    // A server that keeps answering "nothing persisted" would otherwise spin here.
+    constexpr unsigned max_unacknowledged = 10;
+    unsigned unacknowledged = 0;
+
     for (;;) {
         // A zero-length chunk names no bytes, so it must not name a last byte:
         // "bytes 0-0/0" claims byte 0 exists in an object declared to be empty,
@@ -809,8 +813,29 @@ future<> utils::gcp::storage::client::object_data_sink::do_single_upload(std::de
             default:
                 if (int(res.result()) == 308) {
                     uint64_t first = 0, new_last = 0;
-                    if (parse_response_range(res.reply, first, new_last) && last != new_last) {
-                        auto written = (new_last + 1) - offset;
+                    // Without a readable Range the server persisted nothing of the chunk and
+                    // wants it again; the same goes for one naming no more than was already
+                    // acknowledged. Content-Range names absolute offsets, so sending the chunk
+                    // again writes the same bytes in the same place.
+                    // https://docs.cloud.google.com/storage/docs/performing-resumable-uploads
+                    auto acknowledged = parse_response_range(res.reply, first, new_last) && new_last >= offset
+                        ? (new_last + 1) - offset
+                        : 0;
+
+                    // len == 0 is the "bytes */<total>" finalize, which names no chunk to resend
+                    if (len > 0 && acknowledged == 0) {
+                        if (++unacknowledged > max_unacknowledged) {
+                            throw failed_upload_error(int(res.result()), fmt::format("{}:{} made no progress at offset {} in {} attempts"
+                                , _bucket, _object_name, offset, unacknowledged
+                            ));
+                        }
+                        gcp_storage.debug("{}:{} chunk {}:{} not persisted, sending it again", _bucket, _object_name, offset, offset+len);
+                        continue;
+                    }
+                    unacknowledged = 0;
+
+                    if (acknowledged < len) {
+                        auto written = acknowledged;
 
                         gcp_storage.debug("{}:{} partial upload ({} bytes)", _bucket, _object_name, written);
 
@@ -836,7 +861,7 @@ future<> utils::gcp::storage::client::object_data_sink::do_single_upload(std::de
                         assert(len == total);
                         continue;
                     }
-                    // incomplete. ok for partial
+                    // the whole chunk landed
                     gcp_storage.debug("{}:{} chunk {}:{} done", _bucket, _object_name, offset, offset+len);
                     co_return;
                 }
