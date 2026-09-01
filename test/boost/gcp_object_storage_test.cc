@@ -22,6 +22,10 @@
 #include <seastar/core/file.hh>
 #include <seastar/core/sleep.hh>
 #include <seastar/core/with_timeout.hh>
+#include <seastar/http/client.hh>
+#include <seastar/http/reply.hh>
+#include <seastar/http/request.hh>
+#include <seastar/util/short_streams.hh>
 
 #include "ent/encryption/symmetric_key.hh"
 #include "ent/encryption/encrypted_file_impl.hh"
@@ -35,6 +39,7 @@
 #include "utils/assert.hh"
 #include "utils/UUID_gen.hh"
 #include "utils/io-wrappers.hh"
+#include "utils/http.hh"
 #include "utils/error_injection.hh"
 
 #include <seastar/testing/test_fixture.hh>
@@ -153,6 +158,30 @@ static std::string make_name() {
     return fmt::format("{}{}", prefix, utils::UUID_gen::get_time_UUID());
 }
 
+// Arm a fault in the validator sitting in front of the mock.
+// See test/pylib/gcs_upload_validator.py for the fault names.
+static future<> inject(const local_gcs_wrapper& env, std::string_view fault, unsigned count) {
+    auto url = utils::http::parse_simple_url(env.endpoint);
+    auto cln = seastar::http::client(socket_address(net::inet_address(url.host), url.port));
+
+    std::exception_ptr ex;
+    try {
+        auto req = seastar::http::request::make("PUT", url.host, "/__inject");
+        req._headers["Content-Length"] = "0";
+        req.set_query_param(sstring(fault), std::to_string(count));
+        co_await cln.make_request(std::move(req), [](const seastar::http::reply&, seastar::input_stream<char>&& in) -> future<> {
+            auto body = std::move(in);
+            co_await util::skip_entire_stream(body);
+        }, seastar::http::reply::status_type::ok);
+    } catch (...) {
+        ex = std::current_exception();
+    }
+    co_await cln.close();
+    if (ex) {
+        std::rethrow_exception(ex);
+    }
+}
+
 static future<> test_read_write_helper(const local_gcs_wrapper& env, size_t dest_size, std::optional<size_t> specific_buffer_size = std::nullopt) {
     auto& c = env.client();
     auto name = make_name();
@@ -198,6 +227,54 @@ SEASTAR_FIXTURE_TEST_CASE(test_gcp_storage_create_small_object_64kbuf, local_gcs
 
 SEASTAR_FIXTURE_TEST_CASE(test_gcp_storage_create_large_object_64kbuf, local_gcs_wrapper, *check_gcp_storage_test_enabled()) {
     co_await test_read_write_helper(*this, 32*1024*1024 + 357 + 1022*67, 64*1024);
+}
+
+// A 308 with no Range header says the server persisted nothing of the chunk, so the
+// chunk has to be sent again. Treating it as an acknowledgement skips those bytes and
+// the object ends up short of what was written.
+//
+// https://scylladb.atlassian.net/browse/SCYLLADB-4027
+SEASTAR_FIXTURE_TEST_CASE(test_gcp_storage_resend_unacknowledged_chunk, local_gcs_wrapper, *check_gcp_storage_test_enabled()) {
+    // Big enough that the flush in create_object_of_size() writes a whole 256k chunk
+    // and leaves a tail for the final one - only a non-final chunk can be answered
+    // with a 308.
+    constexpr size_t dest_size = 300*1024;
+
+    co_await inject(*this, "unacknowledged_chunks", 1);
+
+    auto name = make_name();
+    objects_to_delete.emplace_back(name);
+
+    std::vector<temporary_buffer<char>> written;
+    co_await create_object_of_size(client(), bucket, name, dest_size, &written);
+    co_await compare_object_data(*this, name, std::move(written));
+}
+
+// Cancelling a failed upload is best effort, and its reply - 499 when it works, an
+// error when it does not - must never take the place of the reason the upload failed.
+//
+// https://scylladb.atlassian.net/browse/SCYLLADB-4027
+SEASTAR_FIXTURE_TEST_CASE(test_gcp_storage_failed_upload_error_survives_cancel, local_gcs_wrapper, *check_gcp_storage_test_enabled()) {
+    auto name = make_name();
+    objects_to_delete.emplace_back(name);
+
+    co_await inject(*this, "failed_chunks", 1);
+    // more cancel failures than the sink can issue, so none of them is the last word
+    co_await inject(*this, "failed_cancels", 8);
+
+    std::string what;
+    try {
+        co_await create_object_of_size(client(), bucket, name, 300*1024);
+        BOOST_FAIL("upload of a rejected chunk should have thrown");
+    } catch (const storage_io_error& e) {
+        what = e.what();
+    }
+
+    BOOST_TEST_MESSAGE(fmt::format("upload failed with: {}", what));
+    // the chunk's own 400, not 403 from the cancel and not 499 from a cancel that worked
+    BOOST_REQUIRE(what.contains("400"));
+    BOOST_REQUIRE(!what.contains("403"));
+    BOOST_REQUIRE(!what.contains("499"));
 }
 
 SEASTAR_FIXTURE_TEST_CASE(test_gcp_storage_list_objects, local_gcs_wrapper, *check_gcp_storage_test_enabled()) {
