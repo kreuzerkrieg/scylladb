@@ -322,7 +322,17 @@ future<size_t> encrypted_file_impl::read_dma(uint64_t pos, std::vector<iovec> io
         return f.then([this, pos, iov = std::move(iov)](size_t len) mutable {
             size_t off = 0;
             for (auto& i : iov) {
-                off += transform(pos + off, i.iov_base, i.iov_len, i.iov_base, mode::decrypt);
+                if (off >= len) {
+                    break;
+                }
+                auto n = transform(pos + off, i.iov_base, std::min(i.iov_len, len - off), i.iov_base, mode::decrypt);
+                off += n;
+                if (n < i.iov_len) {
+                    // End of data, or a read that stopped short. Either way the next
+                    // iovec has no block of its own, and off is no longer a block
+                    // boundary, which transform() requires of its position.
+                    break;
+                }
             }
             return off;
         });
