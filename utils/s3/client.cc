@@ -782,6 +782,12 @@ future<temporary_buffer<char>> client::get_object_contiguous(sstring object_name
             gc.read_bytes += off;
         });
     }, expected, as);
+    utils::get_local_injector().inject("s3_client_short_body", [&off] {
+        // Drop a byte to stand in for a response body that ended early. The http
+        // client reports that as a clean end of stream, so there is no error to
+        // inject at a lower layer.
+        off -= off > 0 ? 1 : 0;
+    });
     ret->trim(off);
     s3l.trace("Consumed {} bytes of {}", off, object_name);
     co_return std::move(*ret);
