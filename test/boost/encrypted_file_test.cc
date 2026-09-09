@@ -384,7 +384,12 @@ public:
         co_return n;
     }
     future<size_t> read_dma(uint64_t pos, std::vector<iovec> iov, io_intent* intent) override {
-        co_return co_await _f.dma_read(pos, std::move(iov), intent);
+        auto n = co_await _f.dma_read(pos, std::move(iov), intent);
+        if (pos == _at && _deliver < n) {
+            testlog.info("truncating iovec read at {} from {} to {} bytes", pos, n, _deliver);
+            n = std::exchange(_deliver, std::numeric_limits<size_t>::max());
+        }
+        co_return n;
     }
     future<temporary_buffer<uint8_t>> dma_read_bulk(uint64_t pos, size_t range_size, io_intent* intent) override {
         temporary_buffer<uint8_t> buf(range_size);
@@ -443,6 +448,59 @@ SEASTAR_TEST_CASE(test_short_read_mid_file_is_not_eof) {
             "caller's buffer were never written by this read", n, delivered, n - delivered));
 
     // And whatever it does claim must be the real plaintext, not poison.
+    auto good = std::min(n, plaintext_size);
+    for (size_t i = 0; i < good; ++i) {
+        if (rbuf.get()[i] != written.get()[i]) {
+            BOOST_ERROR(seastar::format(
+                    "byte {} of {} reported bytes differs from the plaintext "
+                    "(got {:#x}, expected {:#x}) -- corrupt data reported as a successful read",
+                    i, n, uint8_t(rbuf.get()[i]), uint8_t(written.get()[i])));
+            break;
+        }
+    }
+    co_await f.close();
+}
+
+// The iovec counterpart of the case above. read_dma(pos, iov) ignored the byte
+// count it was handed and transformed every iovec at its full length, so a read
+// that stopped after the first iovec still reported both as decoded, having
+// decrypted the caller's own buffer contents into the second one.
+SEASTAR_TEST_CASE(test_short_read_mid_file_iovec_is_not_eof) {
+    key_info kinfo{"AES/CBC", 256};
+    auto k = ::make_shared<symmetric_key>(kinfo);
+    constexpr auto& filename = "short_read_mid_file_iovec";
+
+    constexpr size_t plaintext_size = 4 * 4096;
+    auto written = generate_random<char>(plaintext_size, 4096);
+    {
+        auto [f, _] = co_await make_file(filename, open_flags::create | open_flags::wo, k);
+        co_await f.dma_write(0, written.get(), written.size());
+        co_await f.close();
+    }
+
+    auto [dst, _] = make_filename(filename, k);
+    auto raw = co_await open_file_dma(dst, open_flags::ro);
+
+    // Deliver only the first of the two 4096 byte iovecs. Both lengths stay
+    // block-aligned, so nothing here depends on the truncated-block path.
+    constexpr uint64_t read_pos = 0;
+    constexpr size_t delivered = 4096;
+
+    file f(make_encrypted_file(file(seastar::make_shared<truncating_file_impl>(raw, read_pos, delivered)), k));
+
+    auto rbuf = temporary_buffer<char>::aligned(f.memory_dma_alignment(), 2 * 4096);
+    std::fill(rbuf.get_write(), rbuf.get_write() + rbuf.size(), '\xa5'); // poison
+    std::vector<iovec> iov;
+    iov.push_back({rbuf.get_write(), 4096});
+    iov.push_back({rbuf.get_write() + 4096, 4096});
+    auto n = co_await f.dma_read(read_pos, std::move(iov));
+
+    testlog.info("underlying delivered {} bytes; encrypted_file reported {}", delivered, n);
+
+    BOOST_CHECK_MESSAGE(n <= delivered, seastar::format(
+            "reported {} bytes from an iovec read that delivered only {} -- {} bytes of the "
+            "caller's buffer were never written by this read", n, delivered, n - delivered));
+
     auto good = std::min(n, plaintext_size);
     for (size_t i = 0; i < good; ++i) {
         if (rbuf.get()[i] != written.get()[i]) {
