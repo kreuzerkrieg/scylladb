@@ -166,6 +166,13 @@ struct round_stats {
     // reporting throttles but no freezes never engaged it.
     unsigned throttle_exhaustions = 0;
     uint64_t freezes = 0;          // times sending was held back after a throttle
+    // The brake's own input, so ratio_threshold can be judged against a real
+    // workload rather than only by how often it fired. A share does not sum, so it
+    // is carried twice: a sum to divide by the reporting shard count for a mean,
+    // and a max, because the brake is per-shard and one hot shard is what fires it.
+    double refused_ratio_sum = 0.0;
+    double refused_ratio_max = 0.0;
+    unsigned refused_ratio_shards = 0; // divisor for the mean
     // GETs actually put on the wire, counted by the HTTP client rather than by
     // this test: chunked_download_source issues one request per chunk plus one
     // per internal retry, none of which are visible from here.
@@ -182,6 +189,9 @@ struct round_stats {
         failed_masked += o.failed_masked;
         throttle_exhaustions += o.throttle_exhaustions;
         freezes += o.freezes;
+        refused_ratio_sum += o.refused_ratio_sum;
+        refused_ratio_max = std::max(refused_ratio_max, o.refused_ratio_max);
+        refused_ratio_shards += o.refused_ratio_shards;
         read_requests += o.read_requests;
         read_bytes += o.read_bytes;
         completed += o.completed;
@@ -292,18 +302,31 @@ static void log_sample(std::string_view verb, double at_sec, const round_stats& 
     const auto slowdown = now.slowdown_errors - prev.slowdown_errors;
     const auto netreset = now.network_errors - prev.network_errors;
     const auto failed = now.download_errors - prev.download_errors;
+    // The refused share and the freeze count ride on every sample, not just the ones
+    // that saw a refusal: choosing ratio_threshold needs the share's whole time
+    // series, including the stretches where it sat below the trigger.
+    const auto freezes = now.freezes - prev.freezes;
     if (slowdown || netreset || failed) {
-        plog.warn("shard {:2d} t={:6.1f}s {}/s={:7.0f} MB/s={:6.0f} slowdown+={} netreset+={} failed+={}",
+        plog.warn("shard {:2d} t={:6.1f}s {}/s={:7.0f} MB/s={:6.0f} refused={:.3f} freeze+={} slowdown+={} netreset+={} failed+={}",
                   this_shard_id(),
                   at_sec,
                   verb,
                   r.requests_per_sec,
                   r.mbytes_per_sec,
+                  now.refused_ratio_max,
+                  freezes,
                   slowdown,
                   netreset,
                   failed);
     } else {
-        plog.info("shard {:2d} t={:6.1f}s {}/s={:7.0f} MB/s={:6.0f}", this_shard_id(), at_sec, verb, r.requests_per_sec, r.mbytes_per_sec);
+        plog.info("shard {:2d} t={:6.1f}s {}/s={:7.0f} MB/s={:6.0f} refused={:.3f} freeze+={}",
+                  this_shard_id(),
+                  at_sec,
+                  verb,
+                  r.requests_per_sec,
+                  r.mbytes_per_sec,
+                  now.refused_ratio_max,
+                  freezes);
     }
 }
 
@@ -686,6 +709,9 @@ public:
             .failed_masked = _download_errors_masked,
             .throttle_exhaustions = _retry ? _retry->throttle_exhaustions() : 0u,
             .freezes = _limiter ? _limiter->freezes() : 0u,
+            .refused_ratio_sum = _limiter ? _limiter->refused_ratio() : 0.0,
+            .refused_ratio_max = _limiter ? _limiter->refused_ratio() : 0.0,
+            .refused_ratio_shards = _limiter ? 1u : 0u,
             .read_requests = counters.read_ops + counters.read_retries,
             .read_bytes = counters.read_bytes,
             .completed = _latencies._count,
@@ -934,6 +960,9 @@ public:
             .failed_throttled = _delete_errors_throttled,
             .throttle_exhaustions = _retry ? _retry->throttle_exhaustions() : 0u,
             .freezes = _limiter ? _limiter->freezes() : 0u,
+            .refused_ratio_sum = _limiter ? _limiter->refused_ratio() : 0.0,
+            .refused_ratio_max = _limiter ? _limiter->refused_ratio() : 0.0,
+            .refused_ratio_shards = _limiter ? 1u : 0u,
             .read_requests = _deleted_files + _delete_errors,
             .completed = _deleted_files,
         };
@@ -967,6 +996,9 @@ public:
             .failed_masked = _upload_errors_masked,
             .throttle_exhaustions = _retry ? _retry->throttle_exhaustions() : 0u,
             .freezes = _limiter ? _limiter->freezes() : 0u,
+            .refused_ratio_sum = _limiter ? _limiter->refused_ratio() : 0.0,
+            .refused_ratio_max = _limiter ? _limiter->refused_ratio() : 0.0,
+            .refused_ratio_shards = _limiter ? 1u : 0u,
             .read_requests = c.write_ops + c.write_retries,
             .read_bytes = c.write_bytes,
             .completed = _uploaded_files,
@@ -1341,7 +1373,7 @@ int main(int argc, char** argv) {
             plog.warn("RESULT {{\"mode\":\"upload\",\"shards\":{},\"elapsed_sec\":{:.1f},"
                       "\"requests\":{},\"requests_per_sec\":{:.0f},\"files\":{},\"mbytes_per_sec\":{:.0f},"
                       "\"slowdown\":{},\"net_reset\":{},\"failed\":{},\"failed_throttled\":{},\"failed_masked\":{},"
-                      "\"throttle_exhaustions\":{},\"freezes\":{}}}",
+                      "\"throttle_exhaustions\":{},\"freezes\":{},\"refused_ratio_mean\":{:.4f},\"refused_ratio_max\":{:.4f}}}",
                       this_smp_shard_count(),
                       elapsed,
                       total.read_requests,
@@ -1354,7 +1386,9 @@ int main(int argc, char** argv) {
                       total.failed_throttled,
                       total.failed_masked,
                       total.throttle_exhaustions,
-                      total.freezes);
+                      total.freezes,
+                      total.refused_ratio_shards ? total.refused_ratio_sum / total.refused_ratio_shards : 0.0,
+                      total.refused_ratio_max);
 
             if (delete_after_upload) {
                 plog.info("Deleting the same {} keys ({} concurrent per shard x {} shards)",
@@ -1377,7 +1411,7 @@ int main(int argc, char** argv) {
                 plog.warn("RESULT {{\"mode\":\"delete\",\"shards\":{},\"elapsed_sec\":{:.1f},"
                           "\"requests\":{},\"requests_per_sec\":{:.0f},\"deleted\":{},"
                           "\"slowdown\":{},\"net_reset\":{},\"failed\":{},\"failed_throttled\":{},"
-                          "\"throttle_exhaustions\":{},\"freezes\":{}}}",
+                          "\"throttle_exhaustions\":{},\"freezes\":{},\"refused_ratio_mean\":{:.4f},\"refused_ratio_max\":{:.4f}}}",
                           this_smp_shard_count(),
                           d_elapsed,
                           dtotal.read_requests,
@@ -1388,7 +1422,9 @@ int main(int argc, char** argv) {
                           dtotal.download_errors,
                           dtotal.failed_throttled,
                           dtotal.throttle_exhaustions - total.throttle_exhaustions,
-                          dtotal.freezes - total.freezes);
+                          dtotal.freezes - total.freezes,
+                          dtotal.refused_ratio_shards ? dtotal.refused_ratio_sum / dtotal.refused_ratio_shards : 0.0,
+                          dtotal.refused_ratio_max);
             }
 
             co_await uploaders.stop();
@@ -1502,7 +1538,7 @@ int main(int argc, char** argv) {
                       "\"requests\":{},\"requests_per_sec\":{:.0f},\"objects\":{},\"objects_per_sec\":{:.1f},"
                       "\"sstables\":{},\"mbytes_per_sec\":{:.0f},\"slowdown\":{},\"net_reset\":{},\"failed\":{},"
                       "\"failed_throttled\":{},\"failed_masked\":{},"
-                      "\"throttle_exhaustions\":{},\"freezes\":{}}}",
+                      "\"throttle_exhaustions\":{},\"freezes\":{},\"refused_ratio_mean\":{:.4f},\"refused_ratio_max\":{:.4f}}}",
                       conns,
                       this_smp_shard_count(),
                       elapsed,
@@ -1518,7 +1554,9 @@ int main(int argc, char** argv) {
                       total.failed_throttled,
                       total.failed_masked,
                       total.throttle_exhaustions,
-                      total.freezes);
+                      total.freezes,
+                      total.refused_ratio_shards ? total.refused_ratio_sum / total.refused_ratio_shards : 0.0,
+                      total.refused_ratio_max);
 
             if (total.download_errors > 0) {
                 plog.warn(">>> {} file(s) failed after all retries at {} connections/shard — "
