@@ -426,6 +426,16 @@ public:
                 httpclient::method_type::GET,
                 rest::key_values({{ RANGE, range }}),
                 _as);
+        // A satisfiable range is answered in full or not at all, so anything short
+        // is a body that ended early - which the http client reports as a clean end
+        // of stream rather than an error. Returning it would be a short read at an
+        // offset that is not the end of the object, and callers are entitled to
+        // assume a positional read either fills the range or fails.
+        if (result != to_read) {
+            throw storage_io_error(EIO, fmt::format("Short read of object {}:{}: asked for {} bytes at offset {}, got {}"
+                , _bucket, _object_name, to_read, pos, result
+            ));
+        }
         co_return result;
     }
 
