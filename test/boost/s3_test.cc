@@ -558,6 +558,35 @@ void client_readable_file(const client_maker_function& client_maker) {
     BOOST_REQUIRE_EQUAL(to_sstring(std::move(buf)), sstring("67890ABC"));
 }
 
+// A readable_file learns where the object ends from the reply, not from a local
+// file size, so a range that starts inside the object and runs past its end comes
+// back short. That is a legal read: both paths must report the bytes that arrived.
+void client_readable_file_read_past_end(const client_maker_function& client_maker) {
+    s3_test_fixture guard(client_maker);
+    auto cln = guard.client();
+    const auto name = guard.object_path("testshortreadobject");
+
+    temporary_buffer<char> data = sstring("1234567890ABCDEF").release();
+    cln->put_object(name, std::move(data)).get();
+
+    auto f = cln->make_readable_file(name);
+    auto close_readable_file = deferred_close(f);
+    BOOST_REQUIRE_EQUAL(f.size().get(), 16);
+
+    testlog.info("A read straddling the end of the object returns what remains");
+    char buffer[64];
+    BOOST_REQUIRE_EQUAL(f.dma_read(10, buffer, 32).get(), 6);
+    BOOST_REQUIRE_EQUAL(sstring(buffer, 6), sstring("ABCDEF"));
+
+    auto buf = f.dma_read_bulk<char>(12, 64).get();
+    BOOST_REQUIRE_EQUAL(to_sstring(std::move(buf)), sstring("CDEF"));
+
+}
+
+SEASTAR_THREAD_TEST_CASE(test_client_readable_file_read_past_end_s3) {
+    client_readable_file_read_past_end(make_s3_client);
+}
+
 SEASTAR_THREAD_TEST_CASE(test_client_readable_file_s3) {
     client_readable_file(make_s3_client);
 }
