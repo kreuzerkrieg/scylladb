@@ -270,8 +270,25 @@ loss.
 
 ## Fleet driver and the traps that cost runs
 
-The driver is `s3-fleet.sh` (kept outside this repo). Canonical invocation, and **anything extra is
-a deviation that must be stated**:
+The driver is `test/perf/s3-fleet/s3-fleet.sh`, with `remote-setup.sh` beside it as the
+per-instance provisioning step it copies over. Both are committed so a session on another
+machine can drive a fleet without reconstructing them.
+
+`BIN` defaults to `build/release/test/perf/perf_s3_downloader` relative to the script's own
+location and `OUT` to a repo-local `fleet-runs/`; both are overridable by environment. The
+binary **must** be a release build -- a dev build links seastar dynamically and dies on the
+instance with `libseastar_perf_testing.so: cannot open shared object file`.
+
+`setup` is the slow step (~4 min) and is worth keeping warm across runs. It RAID-0s the
+instance-store NVMe with the geometry `dist/common/scripts/scylla_raid_setup` uses -- 1024 KB chunks
+and `mkfs.xfs -K -m rmapbt=0 -m reflink=0`, not ext4 on mdadm's default -- because the disk write is
+the consumer that decides whether a large object arrives as one ranged GET or as many 5 MiB chunks,
+so filesystem throughput moves the request rate being measured. It then installs the ~14 sonames the
+Fedora Cloud Base image lacks, upgrades `libstdc++`/`libgcc` to cover point-release drift against the
+build host, and prints `SETUP_OK` only once `ldd` is clean and the binary runs `--help`. A node that
+does not print it must not be counted as ready. The reasoning for each step is in the script.
+
+Canonical invocation, and **anything extra is a deviation that must be stated**:
 
     FLEET=<name> TYPES=i4i.16xlarge MARKET=ondemand ./s3-fleet.sh launch 16
     FLEET=<name> ./s3-fleet.sh setup
