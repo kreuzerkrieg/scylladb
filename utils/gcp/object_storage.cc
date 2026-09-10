@@ -422,6 +422,16 @@ public:
                         result += n;
                         _impl->count_read_bytes(n);
                     }
+                    // Inside the handler, because send_with_retry() has already
+                    // reported the attempt as a success by the time it returns.
+                    bool ended_early = utils::http::body_ended_early(rep);
+                    utils::get_local_injector().inject("gcp_client_truncated_body", [&ended_early] {
+                        ended_early = true;
+                    });
+                    if (ended_early) {
+                        utils::http::throw_body_ended_early(fmt::format("Body of {}:{} ended early: got {} of the {} bytes it declared",
+                                _bucket, _object_name, result, rep.content_length));
+                    }
                 },
                 httpclient::method_type::GET,
                 rest::key_values({{ RANGE, range }}),
