@@ -422,15 +422,22 @@ public:
                         result += n;
                         _impl->count_read_bytes(n);
                     }
+                    // Inside the handler, because send_with_retry() has already
+                    // reported the attempt as a success by the time it returns.
+                    bool ended_early = utils::http::body_ended_early(rep);
+                    utils::get_local_injector().inject("gcp_client_truncated_body", [&ended_early] {
+                        ended_early = true;
+                    });
+                    if (ended_early) {
+                        utils::http::throw_body_ended_early(fmt::format("Body of {}:{} ended early: got {} of the {} bytes it declared",
+                                _bucket, _object_name, result, rep.content_length));
+                    }
                 },
                 httpclient::method_type::GET,
                 rest::key_values({{ RANGE, range }}),
                 _as);
-        // A satisfiable range is answered in full or not at all, so anything short
-        // is a body that ended early - which the http client reports as a clean end
-        // of stream rather than an error. Returning it would be a short read at an
-        // offset that is not the end of the object, and callers are entitled to
-        // assume a positional read either fills the range or fails.
+        // A truncated body was already retried in the handler, so anything short
+        // here is a reply that described a different range than the one asked for.
         if (result != to_read) {
             throw storage_io_error(EIO, fmt::format("Short read of object {}:{}: asked for {} bytes at offset {}, got {}"
                 , _bucket, _object_name, to_read, pos, result

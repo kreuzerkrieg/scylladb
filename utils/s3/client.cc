@@ -45,6 +45,7 @@
 #include "utils/s3/credentials_providers/sts_assume_role_credentials_provider.hh"
 #include "utils/div_ceil.hh"
 #include "utils/http.hh"
+#include "utils/http_client_error_processing.hh"
 #include "utils/memory_data_sink.hh"
 #include "utils/chunked_vector.hh"
 #include "utils/aws_sigv4.hh"
@@ -781,11 +782,22 @@ future<temporary_buffer<char>> client::get_object_contiguous(sstring object_name
         }).then([&gc, &off] {
             gc.read_bytes += off;
         });
+        // Inside the handler, because make_request() has already reported the
+        // attempt as a success by the time it returns.  Moving this out disables
+        // the retry.
+        bool ended_early = utils::http::body_ended_early(rep);
+        utils::get_local_injector().inject("s3_client_truncated_body", [&ended_early] {
+            ended_early = true;
+        });
+        if (ended_early) {
+            utils::http::throw_body_ended_early(format("Body of {} ended early: got {} of the {} bytes it declared",
+                    object_name, off, rep.content_length));
+        }
     }, expected, as);
     utils::get_local_injector().inject("s3_client_short_body", [&off] {
-        // Drop a byte to stand in for a response body that ended early. The http
-        // client reports that as a clean end of stream, so there is no error to
-        // inject at a lower layer.
+        // Drop a byte once the body has been read whole, standing in for a reply
+        // that declared and delivered less than the range asked for. That is not a
+        // truncation and not retryable, so it has to reach the caller's check.
         off -= off > 0 ? 1 : 0;
     });
     ret->trim(off);
@@ -1990,11 +2002,10 @@ class client::readable_file : public file_impl {
         });
     }
 
-    // A range that lies inside the object is answered in full or not at all, so
-    // anything short is a body that ended early - which the http client reports as
-    // a clean end of stream rather than an error. Returning it would be a short
-    // read at an offset that is not the end of the object, and callers are
-    // entitled to assume a positional read either fills the range or fails.
+    // A truncated body was already retried below, so anything short here is a
+    // reply that described a different range than the one asked for.  Clamped
+    // because a range running past the end of the object is answered short by
+    // design.
     void verify_full_read(uint64_t pos, size_t requested, size_t got) const {
         auto expected = std::min<uint64_t>(requested, _stats->size - pos);
         if (got != expected) {
