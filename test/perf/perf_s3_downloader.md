@@ -195,6 +195,20 @@ One JSON line per phase, per process, aggregated across that node's shards.
   shards, so it travels as a sum with its own divisor plus a max. The max is a **snapshot at
   collect time**, not a running peak; the per-second sample lines carry the real series.
 
+## Where the full record lives
+
+This document is the summary. The run-by-run record sits next to the driver:
+
+| file | what it holds |
+|---|---|
+| `test/perf/s3-fleet/measurements-fleet.md` | every fleet run NV1..NV9 with its parameters, per-phase numbers, what each was testing, and the conclusions that were later withdrawn and why |
+| `test/perf/s3-fleet/measurements-local.md` | the single-machine investigation: what was eliminated by measurement, and five retracted readings |
+| `test/perf/s3-fleet/run-config.md` | the canonical parameter set with the transcript-swept evidence for each knob, plus the deviation log |
+
+The retractions are kept deliberately. Several of them are conclusions that looked solid for hours --
+"the endpoint got faster", "the brake cuts throttling", "prefix concentration explains it" -- and were
+overturned by a control run. Reading which arguments failed is cheaper than repeating them.
+
 ## Fleet results
 
 All rows: 16 x `i4i.16xlarge` on-demand, 64 shards, 20-minute download then 2 upload passes,
