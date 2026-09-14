@@ -2648,6 +2648,37 @@ sstable_id sstable::ensure_sstable_identifier() {
     return *sid;
 }
 
+// DIAGNOSTIC, SCYLLADB-4293. Anomaly-only and rate limited, so a healthy
+// sstable logs nothing and a systemic mismatch reports its rate.
+static logging::logger sst_diag("sstable_diag");
+
+void sstable::note_component_origin(sstable_id sid, component_type type) const {
+    auto origin = std::make_pair(sid, _generation);
+    if (!_diag_component_origin) {
+        _diag_component_origin = origin;
+        return;
+    }
+    if (*_diag_component_origin == origin) {
+        return;
+    }
+    // The components this sstable is addressing no longer all belong to the same
+    // sstable. Whichever of them is read next is a genuine object, so nothing
+    // downstream objects; it just is not the one the rest of the sstable
+    // describes. On object storage the identifier is the object's path, so it
+    // names the file to fetch directly.
+    //
+    // Record the new origin before logging: formatting an sstable's name goes
+    // back through the storage to resolve the component location, which arrives
+    // here again.
+    auto previous = *_diag_component_origin;
+    _diag_component_origin = origin;
+    static thread_local logging::logger::rate_limit rl(std::chrono::seconds(10));
+    sst_diag.log(log_level::info, rl,
+            "{}.{}: component {} resolves from identifier {} generation {}, but an earlier component of the same sstable resolved from identifier {} generation {}",
+            _schema->ks_name(), _schema->cf_name(), type, sid, _generation,
+            previous.first, previous.second);
+}
+
 void sstable::validate_sstable_identifier() const {
     if (!_sstable_identifier || !_components->scylla_metadata) {
         return;
@@ -3328,10 +3359,10 @@ future<input_stream<char>> sstable::data_stream(uint64_t pos, size_t len,
     if (_components->compression && raw == raw_stream::no) {
         if (_version >= sstable_version_types::mc) {
             co_return make_compressed_file_m_format_input_stream(stream_creator, &_components->compression,
-               pos, len, std::move(options), permit, digest);
+               pos, len, std::move(options), permit, digest, this);
         } else {
             co_return make_compressed_file_k_l_format_input_stream(stream_creator, &_components->compression,
-                pos, len, std::move(options), permit, digest);
+                pos, len, std::move(options), permit, digest, this);
         }
     }
 
@@ -4731,6 +4762,15 @@ generation_type::from_string(const std::string& s) {
 }
 
 sstring component_name::format() const {
+    // DIAGNOSTIC, SCYLLADB-4293. On object storage the component's name is not
+    // its location: the live layout keys objects by sstable identifier, so the
+    // basename addresses nothing. Every message and every API that reports an
+    // sstable by name goes through here, `nodetool getsstables` included, so
+    // resolving it once here is what turns a corruption report into a file
+    // somebody can download and look at.
+    if (sst._storage->is_object_storage()) {
+        return sst._storage->component_fqn(sst, component);
+    }
     return fmt::format("{}/{}", sst._storage->prefix(), sst.component_basename(component));
 }
 

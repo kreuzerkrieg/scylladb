@@ -18,10 +18,17 @@
 #include "encryption.hh"
 #include "utils/serialization.hh"
 #include "encrypted_file_impl.hh"
+#include "utils/log.hh"
 
 namespace encryption {
 
 using namespace seastar;
+
+// DIAGNOSTIC, SCYLLADB-4293. Both hooks below fire only when an invariant this
+// code relies on does not hold, so a healthy read logs nothing. Both are rate
+// limited: if an invariant turns out to be broken on every read, what we want
+// from it is that it happens and how often, not one line per read.
+static logger enc_diag("encryption_diag");
 
 static inline bool is_aligned(size_t n, size_t a) {
     return (n & (a - 1)) == 0;
@@ -726,18 +733,51 @@ class encrypted_data_source : public data_source_impl, public block_encryption_b
     size_t _current_position = 0;
     size_t _skip = 0;
 
+    // DIAGNOSTIC, SCYLLADB-4293. Every byte ever taken out of _input, whether read
+    // or skipped.
+    uint64_t _in_bytes = 0;
+    // DIAGNOSTIC, SCYLLADB-4293. Which component this source is decrypting, so a
+    // report names an object that can be fetched.
+    std::string _what;
+
+    // DIAGNOSTIC, SCYLLADB-4293. Away from eof, every byte drawn from the input has
+    // been decrypted and accounted for in _current_position, is held in _next, or
+    // was skipped. The IV for each block is derived from that position alone
+    // (iv_for: block = pos / block_size), so a position that has drifted from the
+    // file decrypts every block after it under the wrong IV - correct up to the
+    // drift, garbage from there to the end, which is the shape SCYLLADB-4293 has.
+    void check_position(const char* where) const {
+        auto accounted = _current_position + _next.size();
+        if (accounted == _in_bytes) {
+            return;
+        }
+        static thread_local logger::rate_limit rl(std::chrono::seconds(10));
+        enc_diag.log(log_level::info, rl,
+                "{}: position drifted at {}: decrypt position {} + buffered {} = {}, but {} bytes came out of the input (delta {}, {} blocks); next IV would use block {}",
+                _what, where, _current_position, _next.size(), accounted, _in_bytes,
+                int64_t(accounted) - int64_t(_in_bytes),
+                (int64_t(accounted) - int64_t(_in_bytes)) / int64_t(block_size),
+                _current_position / block_size);
+    }
+
 public:
-    encrypted_data_source(data_source source, shared_ptr<symmetric_key> k) 
+    encrypted_data_source(data_source source, shared_ptr<symmetric_key> k, std::string what)
         : block_encryption_base(std::move(k))
-        , _input(std::move(source)) 
+        , _input(std::move(source))
+        , _what(std::move(what))
     {}
 
     future<temporary_buffer<char>> get() override {
+        check_position("get");
         // First, get as much as we can get now (or the remainder of previous call)
-        auto buf1 = _next.empty()
+        const bool buf1_from_input = _next.empty();
+        auto buf1 = buf1_from_input
             ? co_await _input.read()
             : std::exchange(_next, {})
             ;
+        if (buf1_from_input) {
+            _in_bytes += buf1.size();
+        }
 
         // eof?
         if (buf1.empty()) {
@@ -752,6 +792,7 @@ public:
         auto buf2 = _input.eof()
             ? temporary_buffer<char>()
             : co_await _input.read_exactly(fill_size);
+        _in_bytes += buf2.size();
 
         temporary_buffer<char> output(buf1.size() + buf2.size());
 
@@ -783,6 +824,15 @@ public:
         // now, if the output buffer is not aligned, we are at eof, and
         // also need to trim result.
         if (!is_aligned(output.size(), key_block_size)) {
+            // That reasoning only holds at the real end of the stream. If the
+            // input still has data, this trims live bytes and the position we
+            // decrypt from afterwards no longer matches the file.
+            if (!_input.eof()) {
+                static thread_local logger::rate_limit rl(std::chrono::seconds(10));
+                enc_diag.log(log_level::info, rl,
+                             "unaligned output away from eof: position={}, output={}, trimming {}",
+                             _current_position, output.size(), std::min(output.size(), key_block_size));
+            }
             output.trim(output.size() - std::min(output.size(), key_block_size));
         }
 
@@ -799,10 +849,22 @@ public:
             // a client would only ever skip from a block boundary.
             auto to_skip = align_down(n, block_size);
             assert(is_aligned(_next.size(), block_size));
+            // _next holds one whole block of the stream we are skipping over, so
+            // the input only owes us the remainder. If that ever stops holding,
+            // the position we decrypt from drifts from the file and every block
+            // after it gets the wrong IV.
+            if (!is_aligned(_next.size(), block_size) || to_skip < _next.size()) {
+                static thread_local logger::rate_limit rl(std::chrono::seconds(10));
+                enc_diag.log(log_level::info, rl,
+                             "suspect skip: n={}, to_skip={}, next={}, position={}",
+                             n, to_skip, _next.size(), _current_position);
+            }
+            _in_bytes += to_skip - _next.size();
             co_await _input.skip(to_skip - _next.size());
             n -= to_skip;
             _current_position += to_skip;
             _next = {};
+            check_position("skip");
         }
         _skip = n;
         co_return temporary_buffer<char>{};
@@ -814,8 +876,8 @@ public:
 };
 
 
-std::unique_ptr<data_source_impl> make_encrypted_source(data_source source, shared_ptr<symmetric_key> k) {
-    return std::make_unique<encrypted_data_source>(std::move(source), std::move(k));
+std::unique_ptr<data_source_impl> make_encrypted_source(data_source source, shared_ptr<symmetric_key> k, std::string what) {
+    return std::make_unique<encrypted_data_source>(std::move(source), std::move(k), std::move(what));
 }
 }
 

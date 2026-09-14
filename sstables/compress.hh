@@ -365,20 +365,25 @@ public:
 
 using stream_creator_fn = std::function<future<input_stream<char>>(uint64_t, uint64_t, file_input_stream_options)>;
 
+class sstable;
+
 // Note: compression_metadata is passed by reference; The caller is
 // responsible for keeping the compression_metadata alive as long as there
 // are open streams on it. This should happen naturally on a higher level -
 // as long as we have *sstables* work in progress, we need to keep the whole
 // sstable alive, and the compression metadata is only a part of it.
+// DIAGNOSTIC, SCYLLADB-4293. `sst` is only ever read to name the component in a
+// message, so that a read that fails or trips a probe says which object to
+// download. It may be null; callers outside the sstable read path pass nothing.
 input_stream<char> make_compressed_file_k_l_format_input_stream(stream_creator_fn stream_creator,
                 sstables::compression* cm, uint64_t offset, size_t len,
                 class file_input_stream_options options, reader_permit permit,
-                std::optional<uint32_t> digest);
+                std::optional<uint32_t> digest, const sstable* sst = nullptr);
 
 input_stream<char> make_compressed_file_m_format_input_stream(stream_creator_fn stream_creator,
                 sstables::compression* cm, uint64_t offset, size_t len,
                 class file_input_stream_options options, reader_permit permit,
-                std::optional<uint32_t> digest);
+                std::optional<uint32_t> digest, const sstable* sst = nullptr);
 
 // Raw compressed data stream function that return compressed chunks without decompression
 // while still calculating digests and verifying checksums. Compatible with SSTables version 3.x and later.

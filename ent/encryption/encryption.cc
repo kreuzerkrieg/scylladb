@@ -887,7 +887,10 @@ public:
             auto [id, esx] = get_encryption_schema_extension(sst, type);
             if (esx) {
                 auto key = co_await esx->key_for_read(std::move(id));
-                co_return data_source(make_encrypted_source(std::move(src), std::move(key)));
+                // DIAGNOSTIC, SCYLLADB-4293. Name the component so a position
+                // drift report points at an object that can be fetched.
+                co_return data_source(make_encrypted_source(std::move(src), std::move(key),
+                        fmt::to_string(sst.get_filename(type))));
             }
             co_return src;
         }

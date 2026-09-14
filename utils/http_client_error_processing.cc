@@ -9,6 +9,7 @@
 #include "http_client_error_processing.hh"
 #include <seastar/http/exception.hh>
 #include <gnutls/gnutls.h>
+#include <charconv>
 #include <limits>
 #include <system_error>
 
@@ -80,6 +81,54 @@ bool body_ended_early(const seastar::http::reply& rep) {
 
 [[noreturn]] void throw_body_ended_early(std::string_view what) {
     throw std::system_error(std::make_error_code(std::errc::protocol_error), std::string(what));
+}
+
+std::optional<answered_range> content_range(const seastar::http::reply& rep) {
+    auto i = rep._headers.find("Content-Range");
+    if (i == rep._headers.end()) {
+        return std::nullopt;
+    }
+    std::string_view v(i->second);
+    constexpr std::string_view unit = "bytes ";
+    if (!v.starts_with(unit)) {
+        return std::nullopt;
+    }
+    v.remove_prefix(unit.size());
+
+    auto number = [](std::string_view& in, uint64_t& out) {
+        auto [ptr, ec] = std::from_chars(in.data(), in.data() + in.size(), out);
+        if (ec != std::errc{}) {
+            return false;
+        }
+        in.remove_prefix(ptr - in.data());
+        return true;
+    };
+
+    uint64_t first = 0, last = 0;
+    if (!number(v, first) || !v.starts_with('-')) {
+        return std::nullopt;
+    }
+    v.remove_prefix(1);
+    if (!number(v, last) || !v.starts_with('/')) {
+        return std::nullopt;
+    }
+    v.remove_prefix(1);
+    uint64_t total = 0;
+    if (!number(v, total)) {
+        return answered_range{first, last, std::nullopt};
+    }
+    return answered_range{first, last, total};
+}
+
+bool answered_other_range(const answered_range& answered, uint64_t want_first, uint64_t want_last) {
+    if (answered.first != want_first || answered.last > want_last) {
+        return true;
+    }
+    if (answered.last == want_last) {
+        return false;
+    }
+    // Short. Legitimate only when it stops because the object does.
+    return !answered.total || answered.last + 1 != *answered.total;
 }
 
 } // namespace utils::http
