@@ -1558,10 +1558,20 @@ class client::chunked_download_source final : public seastar::data_source_impl {
     future<> _filling_fiber = make_ready_future<>();
 
     future<> make_filling_fiber() {
-        seastar::http::no_retry_strategy no_retry;
         s3l.trace("Fiber starts cycle for object '{}'", _object_name);
         auto units = try_get_units(_client->_buffered_dl_sem, 1);
+        // Lowered by tests, so that a bounded cycle does not have to sit out the full
+        // backoff ladder.
+        const auto max_stalled = utils::get_local_injector()
+                                     .inject_parameter<unsigned>("chunked_download_max_stalled")
+                                     .value_or(aws::default_aws_retry_strategy::default_max_retries);
+        // Consecutive requests that fetched nothing. Kept here because the fiber is what
+        // knows whether the download moved; the strategy only paces a single request.
+        unsigned stalled = 0;
         while (!_is_finished) {
+            const auto consumed_before = _range.offset();
+            std::exception_ptr failure;
+            aws::chunked_download_pacing_strategy pacer{*_client->_request_limiter, stalled, max_stalled};
             try {
                 if (!_is_finished && _buffers_size >= _max_buffers_size * _buffers_low_watermark) {
                     co_await _bg_fiber_cv.when([this] { return _is_finished || (_buffers_size < _max_buffers_size * _buffers_low_watermark); });
@@ -1640,6 +1650,11 @@ class client::chunked_download_source final : public seastar::data_source_impl {
                                 // Inject non-retryable error to emulate source failure
                                 throw aws::aws_exception(aws::aws_error(aws::aws_error_type::RESOURCE_NOT_FOUND, "Injected ResourceNotFound", utils::http::retryable::no));
                             });
+                            utils::get_local_injector().inject("throttle_s3_inflight_req", [] {
+                                // Inject a retryable throttling error to emulate the endpoint refusing us.
+                                // Thrown before any buffer is pushed, so it never counts as progress.
+                                throw aws::aws_exception(aws::aws_error(aws::aws_error_type::SLOW_DOWN, "Injected SlowDown", utils::http::retryable::yes));
+                            });
 
                             s3l.trace("Fiber for object '{}' will try to read within range {}", _object_name, _range);
                             temporary_buffer<char> buf;
@@ -1678,7 +1693,7 @@ class client::chunked_download_source final : public seastar::data_source_impl {
                         }
                         co_await in.close();
                     },
-                    no_retry,
+                    pacer,
                     [](std::exception_ptr ex) { std::rethrow_exception(std::move(ex)); },
                     {},
                     _as);
@@ -1691,6 +1706,19 @@ class client::chunked_download_source final : public seastar::data_source_impl {
                     _get_cv.broken(ex);
                     co_return;
                 }
+                failure = std::move(ex);
+            }
+            // The download advances by the bytes the handler appends, so the offset
+            // moving is the only sign this request fetched anything. It is also true of
+            // one that delivered bytes and then broke, which neither succeeded nor can
+            // be replayed -- counting those against the budget would end a download that
+            // is advancing.
+            if (_range.offset() != consumed_before) {
+                stalled = 0;
+            } else if (failure && ++stalled >= max_stalled) {
+                s3l.warn("Fiber for object '{}' fetched nothing in {} requests in a row, last error: {}. Exiting", _object_name, stalled, failure);
+                _get_cv.broken(failure);
+                co_return;
             }
         }
         s3l.trace("Fiber for object '{}' completed", _object_name);
