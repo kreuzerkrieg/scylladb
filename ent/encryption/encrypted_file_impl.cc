@@ -840,6 +840,14 @@ public:
         // finally trim front to handle any skip remainders
         output.trim_front(std::min(std::exchange(_skip, 0), output.size()));
 
+        // DIAGNOSTIC, SCYLLADB-4293. Also on the way out, not just on the way in.
+        // The checksum check sits above this layer, so a drift introduced here is
+        // reported by the next call only if there is one - and if these bytes fail
+        // their checksum the read throws and there is not.
+        if (!_input.eof()) {
+            check_position("get-end");
+        }
+
         co_return output;
     }
 
