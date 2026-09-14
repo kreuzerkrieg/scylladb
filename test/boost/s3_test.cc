@@ -19,6 +19,7 @@
 #include <seastar/core/sleep.hh>
 #include <seastar/http/exception.hh>
 #include <seastar/util/closeable.hh>
+#include <seastar/util/defer.hh>
 #include <seastar/util/short_streams.hh>
 #include <seastar/core/units.hh>
 #include <seastar/core/metrics_api.hh>
@@ -836,6 +837,141 @@ void test_chunked_download_data_source(const client_maker_function& client_maker
     testlog.info("Skipping error injection test, as it requires SCYLLA_ENABLE_ERROR_INJECTION to be enabled");
 #endif
 }
+
+// Records what is reported to it and never freezes, so a test can assert on the
+// reporting without sitting out a brake.
+class counting_throttling_controller final : public s3::throttling_controller {
+    uint64_t _throttled = 0;
+    uint64_t _not_throttled = 0;
+    uint64_t _acquires = 0;
+
+public:
+    future<> acquire(seastar::abort_source*) override {
+        ++_acquires;
+        return make_ready_future<>();
+    }
+    void on_throttled() override { ++_throttled; }
+    void on_not_throttled() override { ++_not_throttled; }
+    uint64_t throttles() const override { return _throttled; }
+    uint64_t freezes() const override { return 0; }
+    double refused_ratio() const override { return 0.0; }
+
+    uint64_t not_throttles() const { return _not_throttled; }
+    uint64_t acquires() const { return _acquires; }
+};
+
+// A retryable refusal the endpoint would answer with.
+static std::exception_ptr make_slow_down() {
+    return std::make_exception_ptr(aws::aws_exception(aws::aws_error(aws::aws_error_type::SLOW_DOWN, "SlowDown", utils::http::retryable::yes)));
+}
+
+SEASTAR_THREAD_TEST_CASE(test_chunked_download_pacing_strategy_reports_and_never_retries) {
+    counting_throttling_controller tc;
+
+    // Stall 0 of a budget of 2: the endpoint refused us, so this must reach the brake,
+    // must hold the next dispatch back, and must still not ask the transport to replay.
+    {
+        aws::chunked_download_pacing_strategy pacer{tc, 0, 2};
+        BOOST_REQUIRE_EQUAL(pacer.should_retry(make_slow_down(), 0).get(), false);
+    }
+    BOOST_REQUIRE_EQUAL(tc.throttles(), 1u);
+    BOOST_REQUIRE_EQUAL(tc.not_throttles(), 0u);
+    BOOST_REQUIRE_EQUAL(tc.acquires(), 1u);
+
+    // The stall that spends the budget is still counted by the brake, and must not back
+    // off or wait: the fiber gives up as soon as this answer comes back.
+    {
+        aws::chunked_download_pacing_strategy pacer{tc, 1, 2};
+        const auto before = seastar::lowres_clock::now();
+        BOOST_REQUIRE_EQUAL(pacer.should_retry(make_slow_down(), 0).get(), false);
+        BOOST_REQUIRE_LT(seastar::lowres_clock::now() - before, std::chrono::seconds(1));
+    }
+    BOOST_REQUIRE_EQUAL(tc.throttles(), 2u);
+    BOOST_REQUIRE_EQUAL(tc.acquires(), 1u);
+
+    // An error that is not a refusal still reaches the brake, on the other side of the
+    // ratio.
+    {
+        aws::chunked_download_pacing_strategy pacer{tc, 0, 2};
+        auto non_throttling = std::make_exception_ptr(std::system_error(ECONNRESET, std::system_category()));
+        BOOST_REQUIRE_EQUAL(pacer.should_retry(non_throttling, 0).get(), false);
+    }
+    BOOST_REQUIRE_EQUAL(tc.throttles(), 2u);
+    BOOST_REQUIRE_EQUAL(tc.not_throttles(), 1u);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_chunked_download_pacing_strategy_does_not_pace_a_dead_cycle) {
+    counting_throttling_controller tc;
+    aws::chunked_download_pacing_strategy pacer{tc, 0, 10};
+
+    // A non-retryable error ends the fiber's cycle whatever the budget says, so backing
+    // off before it gives up would only delay the failure. It is still an outcome, so it
+    // is still reported.
+    auto fatal = std::make_exception_ptr(aws::aws_exception(aws::aws_error(aws::aws_error_type::RESOURCE_NOT_FOUND, "NoSuchKey", utils::http::retryable::no)));
+    BOOST_REQUIRE_EQUAL(pacer.should_retry(fatal, 0).get(), false);
+    BOOST_REQUIRE_EQUAL(tc.not_throttles(), 1u);
+    BOOST_REQUIRE_EQUAL(tc.acquires(), 0u);
+}
+
+#ifdef SCYLLA_ENABLE_ERROR_INJECTION
+// A sustained refusal must fail the read rather than cycle against the endpoint
+// forever, and every attempt must be reported to the brake.
+void test_chunked_download_bounded_by_refusals() {
+    constexpr unsigned max_stalled = 2;
+    counting_throttling_controller* tc = nullptr;
+    s3_test_fixture guard([&tc] {
+        auto controller = std::make_unique<counting_throttling_controller>();
+        tc = controller.get();
+        s3::endpoint_config cfg = {
+            .port = std::stoul(tests::getenv_safe("S3_SERVER_PORT_FOR_TEST")),
+            .use_https = ::getenv("AWS_DEFAULT_REGION") != nullptr,
+            .region = ::getenv("AWS_DEFAULT_REGION") ? : "local",
+        };
+        return s3::client::make(tests::getenv_safe("S3_SERVER_ADDRESS_FOR_TEST"), make_lw_shared<s3::endpoint_config>(std::move(cfg)), make_test_retry_strategy(),
+                                std::move(controller));
+    });
+    auto cln = guard.client();
+    const auto object_name = guard.object_path("test_object");
+
+    auto out = output_stream<char>(cln->make_upload_sink(object_name));
+    auto rnd = tests::random::get_bytes(1_MiB);
+    out.write(reinterpret_cast<char*>(rnd.begin()), rnd.size()).get();
+    out.flush().get();
+    out.close().get();
+
+    // The upload above reported its own outcomes; only the download's are of interest.
+    const auto throttles_before = tc->throttles();
+
+    utils::get_local_injector().enable("throttle_s3_inflight_req");
+    utils::get_local_injector().enable("chunked_download_max_stalled", false, {{"value", std::to_string(max_stalled)}});
+    auto disable = seastar::defer([] () noexcept {
+        utils::get_local_injector().disable("throttle_s3_inflight_req");
+        utils::get_local_injector().disable("chunked_download_max_stalled");
+    });
+
+    auto in = input_stream<char>(cln->make_chunked_download_source(object_name, s3::full_range));
+    auto close = seastar::deferred_close(in);
+
+    auto reader = [&in] {
+        while (true) {
+            auto buf = in.read().get();
+            if (buf.empty()) {
+                break;
+            }
+        }
+    };
+    // Before the budget existed this read never returned at all.
+    BOOST_REQUIRE_EXCEPTION(reader(), aws::aws_exception, [](const aws::aws_exception& e) {
+        return e.error().get_error_type() == aws::aws_error_type::SLOW_DOWN;
+    });
+
+    BOOST_REQUIRE_EQUAL(tc->throttles() - throttles_before, max_stalled);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_chunked_download_bounded_by_refusals_minio) {
+    test_chunked_download_bounded_by_refusals();
+}
+#endif
 
 SEASTAR_THREAD_TEST_CASE(test_chunked_download_data_source_with_delays_minio) {
     test_chunked_download_data_source(make_minio_client, 20_MiB);
