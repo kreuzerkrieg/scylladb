@@ -7,6 +7,7 @@
  */
 
 #include "io-wrappers.hh"
+#include "utils/log.hh"
 #include "seekable_source.hh"
 #include <seastar/util/internal/iovec_utils.hh>
 #include <seastar/util/memory-data-sink.hh>
@@ -265,6 +266,11 @@ seastar::file create_file_for_seekable_source(seekable_data_source src, seekable
     return file{seastar::make_shared<seekable_data_source_file_impl>(std::move(src), std::move(src_func))};
 }
 
+// DIAGNOSTIC, SCYLLADB-4293. Fires only on the anomaly, so it costs nothing on a
+// healthy read, and is rate limited so a systemic one reports its rate rather
+// than a line per read.
+static logger iow_diag("io_wrappers_diag");
+
 seastar::data_source create_ranged_source(data_source src, uint64_t offset, std::optional<uint64_t> len) {
     class ranged_data_source : public data_source_impl {
         data_source _src;
@@ -287,6 +293,19 @@ seastar::data_source create_ranged_source(data_source src, uint64_t offset, std:
             _read += buf.size();
             return buf;
         }
+        // The underlying stream said end of stream. That is only legitimate once
+        // the whole range has been handed over; anything less means the extent we
+        // were asked for was not delivered, and the reader will report it as a
+        // premature end of input somewhere further up.
+        void note_short_stream() const {
+            if (_read < _len && _len != std::numeric_limits<uint64_t>::max()) {
+                static thread_local logger::rate_limit rl(std::chrono::seconds(10));
+                iow_diag.log(log_level::info, rl,
+                             "ranged source ended early: delivered {} of {} bytes from offset {}",
+                             _read, _len, _offset);
+            }
+        }
+
         future<temporary_buffer<char>> skip(uint64_t n) override {
             if (_read == _len) {
                 co_return temporary_buffer<char>{};
@@ -300,7 +319,11 @@ seastar::data_source create_ranged_source(data_source src, uint64_t offset, std:
                     co_return trim(std::move(res));
                 }
             }
-            co_return trim(co_await _src.get());
+            auto buf = trim(co_await _src.get());
+            if (buf.empty()) {
+                note_short_stream();
+            }
+            co_return buf;
         }
         future<temporary_buffer<char>> get() override {
             return skip(0);

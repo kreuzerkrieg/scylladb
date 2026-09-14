@@ -671,6 +671,15 @@ private:
     std::optional<scylla_metadata::ext_timestamp_stats> _ext_timestamp_stats;
     optimized_optional<sstable_id> _sstable_identifier;
 
+    // DIAGNOSTIC, SCYLLADB-4293. The identifier and generation this sstable's
+    // component object names have been resolved from so far. On object storage
+    // the component's name is derived from them, so every component of one
+    // sstable has to resolve from the same pair. A Data.db and a
+    // CompressionInfo.db that came from different ones read genuine bytes
+    // through offsets that do not describe them, which passes the per-chunk
+    // checksum and every other check on the way up.
+    mutable std::optional<std::pair<sstable_id, generation_type>> _diag_component_origin;
+
     // Total reclaimable memory from all the components of the SSTable.
     // It is initialized to 0 to prevent the sstables manager from reclaiming memory
     // from the components before the SSTable has been fully loaded.
@@ -754,6 +763,11 @@ private:
     // Verifies that the sstable identifier persisted in the Scylla metadata
     // agrees with the one this sstable is known by, when both are known.
     void validate_sstable_identifier() const;
+
+    // DIAGNOSTIC, SCYLLADB-4293. Records the identifier and generation used to
+    // address one component of this sstable and reports a later one that does
+    // not match. Anomaly-only and rate limited.
+    void note_component_origin(sstable_id sid, component_type type) const;
 
     future<> read_filter(sstable_open_config cfg = {});
 

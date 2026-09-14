@@ -37,6 +37,14 @@
 
 static logger gcp_storage("gcp_storage");
 
+// DIAGNOSTIC, SCYLLADB-4293. Anomaly-only: a read that gets the range it asked
+// for, in the order it asked for it, logs nothing. Every site below is rate
+// limited, because an anomaly that turns out to be systemic would otherwise
+// arrive once per read; the interval carries a count of what it dropped, which
+// is the number we would want from it anyway. utils/s3/client.cc carries the
+// same two checks - the corruption reproduces on both backends.
+static logger gcp_diag("gcp_storage_diag");
+
 static constexpr uint64_t min_gcp_storage_chunk_size =  256*1024;
 static constexpr uint64_t default_gcp_storage_chunk_size =  8*1024*1024;
 
@@ -192,9 +200,19 @@ class utils::gcp::storage::client::object_data_source : public seekable_data_sou
     uint64_t _size = 0;
     std::chrono::system_clock::time_point _timestamp;
     seastar::abort_source* _as;
-
+    // DIAGNOSTIC, SCYLLADB-4293. Survives the state being discarded, so a source
+    // that starts over can be told apart from one that legitimately begins at the
+    // start of the object.
+    bool _ever_served = false;
     struct state {
         uint64_t position = 0;
+        // DIAGNOSTIC, SCYLLADB-4293. Where the previous ranged GET made through
+        // this state ended, so the next one can say whether it continues from
+        // there. Per state, not per source: hold_state hands each in-flight call
+        // its own state, and two calls reading different parts of one object are
+        // legitimate - only a jump within one of them is not.
+        uint64_t last_range_end = 0;
+        bool ranged_any = false;
         std::deque<temporary_buffer<char>> buffers;
         seastar::semaphore_units<> limits;
 
@@ -257,6 +275,18 @@ class utils::gcp::storage::client::object_data_source : public seekable_data_sou
             _state->adjust_lease();
             if (!std::uncaught_exceptions()) {
                 _src._state = std::move(_state);
+                return;
+            }
+            // DIAGNOSTIC, SCYLLADB-4293. Leaving through an exception discards
+            // the state, and the next call on this source builds a fresh one at
+            // position zero - a rewind to the start of the object rather than a
+            // resume. Nothing reuses a source after a failed read today, which
+            // is the only reason this is quiet.
+            if (_state->position != 0) {
+                static thread_local logger::rate_limit rl(std::chrono::seconds(10));
+                gcp_diag.log(log_level::info, rl,
+                        "read state for {}:{} discarded at position {}; the next read on this source starts at 0",
+                        _src._bucket, _src._object_name, _state->position);
             }
         }
         operator state&() const {
@@ -1001,6 +1031,32 @@ future<temporary_buffer<char>> utils::gcp::storage::client::object_data_source::
                 , _generation
             );
             auto range = fmt::format("bytes={}-{}", s.position, s.position+to_read-1); // inclusive range
+            // DIAGNOSTIC, SCYLLADB-4293. Nothing below this point checks that the
+            // bytes handed back are the bytes asked for: the source advances by
+            // what it receives and every layer above it stays self-consistent
+            // whether the server answered this range or another one.
+            const uint64_t want_first = s.position;
+            const uint64_t want_last = s.position + to_read - 1;
+            // DIAGNOSTIC, SCYLLADB-4293. hold_state discards the state when a call
+            // leaves through an exception, and the next call builds a fresh one at
+            // zero. This is that rewind actually happening rather than merely being
+            // possible: a source that has already handed out bytes is asking for the
+            // start of the object again. The encrypted source above keeps its own
+            // position, so from here it would decrypt the start of the object under
+            // the IVs for wherever it had reached.
+            if (_ever_served && s.position == 0 && !s.ranged_any) {
+                static thread_local logger::rate_limit rl(std::chrono::seconds(10));
+                gcp_diag.log(log_level::info, rl,
+                        "{}:{} restarted at offset 0 after already serving data from this source",
+                        _bucket, _object_name);
+            }
+            if (s.ranged_any && s.position != s.last_range_end) {
+                static thread_local logger::rate_limit rl(std::chrono::seconds(10));
+                gcp_diag.log(log_level::info, rl,
+                        "read of {}:{} starts at {} but the previous range ended at {} (delta {})",
+                        _bucket, _object_name, s.position, s.last_range_end,
+                        int64_t(s.position) - int64_t(s.last_range_end));
+            }
 
             size_t got = 0;
 
@@ -1041,6 +1097,26 @@ future<temporary_buffer<char>> utils::gcp::storage::client::object_data_source::
                         s.buffers.emplace_back(std::move(buf));
                     }
                     gcp_storage.debug("Read object {}:{} ({}-{}/{})", _bucket, _object_name, old, s.position, _size);
+
+                    // DIAGNOSTIC, SCYLLADB-4293. Content-Range is the only thing the
+                    // server says about which bytes it actually sent, and it is the
+                    // one statement no layer of ours compares against the request.
+                    auto answered = utils::http::content_range(rep);
+                    if (answered) {
+                        if (utils::http::answered_other_range(*answered, want_first, want_last)) {
+                            static thread_local logger::rate_limit rl(std::chrono::seconds(10));
+                            gcp_diag.log(log_level::info, rl,
+                                    "{}:{} generation {}: asked for bytes {}-{}, answered bytes {}-{} of {}",
+                                    _bucket, _object_name, _generation, want_first, want_last,
+                                    answered->first, answered->last,
+                                    answered->total ? fmt::to_string(*answered->total) : "?");
+                        }
+                    } else if (rep._status == status_type::partial_content) {
+                        static thread_local logger::rate_limit rl(std::chrono::seconds(10));
+                        gcp_diag.log(log_level::info, rl,
+                                "{}:{} generation {}: partial content for bytes {}-{} carries no usable Content-Range ('{}')",
+                                _bucket, _object_name, _generation, want_first, want_last, rep.get_header(CONTENT_RANGE));
+                    }
                 }
                 , httpclient::method_type::GET
                 , rest::key_values({ { RANGE, range } })
@@ -1056,6 +1132,9 @@ future<temporary_buffer<char>> utils::gcp::storage::client::object_data_source::
                 throw storage_io_error(EIO, fmt::format("Read of {}:{} answered {} bytes for the {} bytes asked for at offset {} of {}",
                         _bucket, _object_name, got, to_read, s.position - got, _size));
             }
+            s.last_range_end = s.position;
+            s.ranged_any = true;
+            _ever_served = true;
         }
     }
 
@@ -1097,8 +1176,12 @@ future<> utils::gcp::storage::client::object_data_source::seek(uint64_t pos, sta
     if (pos < read_pos || pos >= s.position) {
         s.buffers.clear();
         s.position = std::min(pos, _size);
+        s.last_range_end = s.position;
         co_return;
     }
+    // DIAGNOSTIC, SCYLLADB-4293. An explicit reposition is legitimate, so it
+    // re-anchors the continuity check rather than tripping it.
+    s.last_range_end = s.position;
     auto n = pos - read_pos;
     // Drop superfluous cache
     while (n > 0 && !s.buffers.empty()) {

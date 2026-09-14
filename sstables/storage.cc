@@ -821,6 +821,12 @@ public:
 };
 
 object_name object_storage_base::make_object_name(const sstable& sst, component_type type) const {
+    // DIAGNOSTIC, SCYLLADB-4293. Every component of one sstable is addressed
+    // from this sstable's identifier and generation, so this is the one place
+    // that sees them all and can say when they stop agreeing.
+    if (!uses_foreign_layout()) {
+        sst.note_component_origin(get_sstable_identifier(sst), type);
+    }
     auto comp = sstable_version_constants::get_component_map(sst.get_version()).at(type);
     return make_object_name(sst, std::move(comp), sst.generation());
 }

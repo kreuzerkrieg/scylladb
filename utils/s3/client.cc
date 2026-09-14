@@ -82,6 +82,38 @@ namespace s3 {
 
 logging::logger s3l("s3");
 
+// DIAGNOSTIC, SCYLLADB-4293. Anomaly-only and rate limited, so a healthy read
+// logs nothing and a systemic anomaly reports its rate instead of a line per
+// read. utils/gcp/object_storage.cc carries the same check - the corruption
+// reproduces on both backends.
+static logging::logger s3_diag("s3_client_diag");
+
+// DIAGNOSTIC, SCYLLADB-4293. Nothing above this layer checks that the bytes
+// handed back are the bytes asked for: a source advances by what it receives
+// and every layer over it stays self-consistent whether the server answered
+// this range or another one.
+static void check_answered_range(const http::reply& rep, const s3::range& asked, std::string_view object_name) {
+    if (asked == s3::full_range) {
+        return;
+    }
+    const uint64_t want_first = asked.offset();
+    const uint64_t want_last = asked.offset() + asked.length() - 1;
+    auto answered = utils::http::content_range(rep);
+    if (answered) {
+        if (utils::http::answered_other_range(*answered, want_first, want_last)) {
+            static thread_local logging::logger::rate_limit rl(std::chrono::seconds(10));
+            s3_diag.log(log_level::info, rl, "{}: asked for bytes {}-{}, answered bytes {}-{} of {}",
+                    object_name, want_first, want_last, answered->first, answered->last,
+                    answered->total ? fmt::to_string(*answered->total) : "?");
+        }
+    } else if (rep._status == http::reply::status_type::partial_content) {
+        static thread_local logging::logger::rate_limit rl(std::chrono::seconds(10));
+        s3_diag.log(log_level::info, rl,
+                "{}: partial content for bytes {}-{} carries no usable Content-Range ('{}')",
+                object_name, want_first, want_last, rep.get_header("Content-Range"));
+    }
+}
+
 future<> ignore_reply(const http::reply& rep, input_stream<char>&& in_) {
     auto in = std::move(in_);
     co_await util::skip_entire_stream(in);
@@ -820,7 +852,8 @@ future<temporary_buffer<char>> client::get_object_contiguous(sstring object_name
 
     size_t off = 0;
     std::optional<temporary_buffer<char>> ret;
-    co_await make_request(std::move(req), [&off, &ret, &object_name] (group_client& gc, const http::reply& rep, input_stream<char>&& in_) mutable -> future<> {
+    co_await make_request(std::move(req), [&off, &ret, &object_name, download_range] (group_client& gc, const http::reply& rep, input_stream<char>&& in_) mutable -> future<> {
+        check_answered_range(rep, download_range, object_name);
         auto in = std::move(in_);
         ret = temporary_buffer<char>(rep.content_length);
         off = 0;
@@ -1638,11 +1671,14 @@ class client::chunked_download_source final : public seastar::data_source_impl {
                 }
                 co_await _client->make_request(
                     std::move(req),
-                    [this, &units, discover_size, pf_length = discover_size ? 0 : current_range.length()](
+                    [this, &units, discover_size, asked = current_range, pf_length = discover_size ? 0 : current_range.length()](
                         group_client& gc, const http::reply& reply, input_stream<char>&& in_) mutable -> future<> {
                         if (reply._status != http::reply::status_type::ok && reply._status != http::reply::status_type::partial_content) {
                             s3l.warn("Fiber for object '{}' failed: {}. Exiting", _object_name, reply._status);
                             throw httpd::unexpected_status_error(reply._status);
+                        }
+                        if (!discover_size) {
+                            check_answered_range(reply, asked, _object_name);
                         }
                         gc.prefetch_bytes += pf_length;
                         if (discover_size) {
@@ -1807,11 +1843,12 @@ auto client::download_source::request_body() -> future<external_body> {
     auto& p = *bp;
     future<external_body> f = p->get_future();
 
-    (void)_client->make_request(std::move(req), [this, &p] (group_client& gc, const http::reply& rep, input_stream<char>&& in_) mutable -> future<> {
+    (void)_client->make_request(std::move(req), [this, &p, asked = _range] (group_client& gc, const http::reply& rep, input_stream<char>&& in_) mutable -> future<> {
         s3l.trace("GET {} got the body ({} {} bytes)", _object_name, rep._status, rep.content_length);
         if (rep._status != http::reply::status_type::partial_content && rep._status != http::reply::status_type::ok) {
             co_await coroutine::return_exception(httpd::unexpected_status_error(rep._status));
         }
+        check_answered_range(rep, asked, _object_name);
 
         auto in = std::move(in_);
         external_body xb(in);
