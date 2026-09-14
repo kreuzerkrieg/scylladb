@@ -17,6 +17,7 @@
 
 #include "compress.hh"
 #include "compressor.hh"
+#include "sstables.hh"
 #include "exceptions.hh"
 #include "unimplemented.hh"
 #include "segmented_compress_params.hh"
@@ -28,6 +29,23 @@
 namespace sstables {
 
 extern logging::logger sstlog;
+
+// DIAGNOSTIC, SCYLLADB-4293. Anomaly-only, so a healthy read logs nothing, and
+// rate limited, so an anomaly that turns out to hold for every read reports its
+// rate instead of filling the journal.
+static logging::logger compress_diag("compress_diag");
+
+// DIAGNOSTIC, SCYLLADB-4293. On object storage a component's name is not its
+// location: the live layout keys objects by sstable identifier, so a message
+// that prints the basename names nothing anyone can fetch. component_name
+// resolves to the full object location, which is what a reader of these
+// messages needs in order to download the file and look at it.
+static sstring describe(const sstable* sst, component_type c = component_type::Data) {
+    if (!sst) {
+        return "<unknown sstable>";
+    }
+    return fmt::to_string(sst->get_filename(c));
+}
 
 enum class mask_type : uint8_t {
     set,
@@ -315,13 +333,17 @@ class compressed_file_data_source_impl : public data_source_impl {
     uint64_t _pos;
     uint64_t _beg_pos;
     uint64_t _end_pos;
+    // DIAGNOSTIC, SCYLLADB-4293. Only ever read to name the file in a message.
+    const sstables::sstable* _sst;
 public:
     compressed_file_data_source_impl(sstables::stream_creator_fn stream_creator, sstables::compression* cm,
                 uint64_t pos, size_t len, file_input_stream_options options,
-                reader_permit permit, std::optional<uint32_t> digest)
+                reader_permit permit, std::optional<uint32_t> digest,
+                const sstables::sstable* sst = nullptr)
             : _compression_metadata(cm)
             , _offsets(_compression_metadata->offsets.get_accessor())
             , _permit(std::move(permit))
+            , _sst(sst)
     {
         _pos = _beg_pos = pos;
         if (pos > _compression_metadata->uncompressed_file_length()) {
@@ -368,17 +390,30 @@ public:
             _input_stream = co_await _stream_creator();
         }
         auto addr = _compression_metadata->locate(_pos, _offsets);
+        // DIAGNOSTIC, SCYLLADB-4293. This reader never seeks: it trusts the
+        // underlying stream to be sitting exactly where the previous chunk
+        // ended. If that ever stops holding it reads a different chunk, which
+        // has a valid checksum of its own, so nothing downstream complains and
+        // the caller gets correct-looking bytes from the wrong place. Fires
+        // only when the invariant breaks.
+        if (_underlying_pos != addr.chunk_start) {
+            static thread_local logging::logger::rate_limit rl(std::chrono::seconds(10));
+            sstables::compress_diag.log(log_level::info, rl,
+                    "underlying stream drifted in {}: at {} but chunk for pos {} starts at {} (delta {})",
+                    describe(_sst), _underlying_pos, _pos, addr.chunk_start,
+                    int64_t(addr.chunk_start) - int64_t(_underlying_pos));
+        }
         // Uncompress the next chunk. We need to skip part of the first
         // chunk, but then continue to read from beginning of chunks.
         if (_pos != _beg_pos && addr.offset != 0) {
-            throw std::runtime_error(format("compressed reader not aligned to chunk boundary: pos={} offset={}", _pos, addr.offset));
+            throw std::runtime_error(format("compressed reader not aligned to chunk boundary in {}: pos={} offset={}", describe(_sst), _pos, addr.offset));
         }
         if (!addr.chunk_len) {
-            sstables::throw_malformed_sstable_exception(format("compressed chunk_len must be greater than zero, chunk_start={}", addr.chunk_start));
+            sstables::throw_malformed_sstable_exception(format("compressed chunk_len must be greater than zero in {}, chunk_start={}", describe(_sst), addr.chunk_start));
         }
         auto buf = co_await _input_stream->read_exactly(addr.chunk_len);
         if (buf.size() != addr.chunk_len) {
-            sstables::throw_malformed_sstable_exception(format("compressed reader hit premature end-of-file at file offset {}, expected chunk_len={}, actual={}", _underlying_pos, addr.chunk_len, buf.size()));
+            sstables::throw_malformed_sstable_exception(format("compressed reader hit premature end-of-file in {} at file offset {}, expected chunk_len={}, actual={}", describe(_sst), _underlying_pos, addr.chunk_len, buf.size()));
         }
         auto res_units = co_await _permit.request_memory(_compression_metadata->uncompressed_chunk_length());
         // The last 4 bytes of the chunk are the adler32/crc32 checksum
@@ -389,7 +424,7 @@ public:
         auto expected_checksum = read_be<uint32_t>(buf.get() + compressed_len);
         auto actual_checksum = ChecksumType::checksum(buf.get(), compressed_len);
         if (expected_checksum != actual_checksum) {
-            sstables::throw_malformed_sstable_exception(format("compressed chunk of size {} at file offset {} failed checksum, expected={}, actual={}", addr.chunk_len, _underlying_pos, expected_checksum, actual_checksum));
+            sstables::throw_malformed_sstable_exception(format("compressed chunk of size {} in {} at file offset {} failed checksum, expected={}, actual={}", addr.chunk_len, describe(_sst), _underlying_pos, expected_checksum, actual_checksum));
         }
 
         if constexpr (check_digest) {
@@ -421,7 +456,7 @@ public:
             if (_digests.can_calculate_digest
                     && _pos == _compression_metadata->uncompressed_file_length()
                     && _digests.expected_digest != _digests.actual_digest) {
-                sstables::throw_malformed_sstable_exception(seastar::format("Digest mismatch: expected={}, actual={}", _digests.expected_digest, _digests.actual_digest));
+                sstables::throw_malformed_sstable_exception(seastar::format("Digest mismatch in {}: expected={}, actual={}", describe(_sst), _digests.expected_digest, _digests.actual_digest));
             }
         }
         co_return make_tracked_temporary_buffer(std::move(out), std::move(res_units));
@@ -578,23 +613,23 @@ class compressed_file_data_source : public data_source {
 public:
     compressed_file_data_source(sstables::stream_creator_fn stream_creator, sstables::compression* cm,
             uint64_t offset, size_t len, file_input_stream_options options, reader_permit permit,
-            std::optional<uint32_t> digest)
+            std::optional<uint32_t> digest, const sstables::sstable* sst)
         : data_source(std::make_unique<compressed_file_data_source_impl<ChecksumType, check_digest, mode>>(
-                std::move(stream_creator), cm, offset, len, std::move(options), std::move(permit), digest))
+                std::move(stream_creator), cm, offset, len, std::move(options), std::move(permit), digest, sst))
         {}
 };
 
 template <ChecksumUtils ChecksumType, compressed_checksum_mode mode>
 inline input_stream<char> make_compressed_file_input_stream(sstables::stream_creator_fn stream_creator, sstables::compression *cm, uint64_t offset, size_t len,
         file_input_stream_options options, reader_permit permit,
-        std::optional<uint32_t> digest)
+        std::optional<uint32_t> digest, const sstables::sstable* sst)
 {
     if (digest) [[unlikely]] {
         return input_stream<char>(compressed_file_data_source<ChecksumType, true, mode>(
-                std::move(stream_creator), cm, offset, len, std::move(options), std::move(permit), digest));
+                std::move(stream_creator), cm, offset, len, std::move(options), std::move(permit), digest, sst));
     }
     return input_stream<char>(compressed_file_data_source<ChecksumType, false, mode>(
-            std::move(stream_creator), cm, offset, len, std::move(options), std::move(permit), digest));
+            std::move(stream_creator), cm, offset, len, std::move(options), std::move(permit), digest, sst));
 }
 
 // compressed_file_data_sink_impl works as a filter for a file output stream,
@@ -703,18 +738,18 @@ inline output_stream<char> make_compressed_file_output_stream(output_stream<char
 input_stream<char> sstables::make_compressed_file_k_l_format_input_stream(stream_creator_fn stream_creator,
         sstables::compression* cm, uint64_t offset, size_t len,
         class file_input_stream_options options, reader_permit permit,
-        std::optional<uint32_t> digest)
+        std::optional<uint32_t> digest, const sstable* sst)
 {
     return make_compressed_file_input_stream<adler32_utils, compressed_checksum_mode::checksum_chunks_only>(
-            std::move(stream_creator), cm, offset, len, std::move(options), std::move(permit), digest);
+            std::move(stream_creator), cm, offset, len, std::move(options), std::move(permit), digest, sst);
 }
 
 input_stream<char> sstables::make_compressed_file_m_format_input_stream(stream_creator_fn stream_creator,
         sstables::compression *cm, uint64_t offset, size_t len,
         class file_input_stream_options options, reader_permit permit,
-        std::optional<uint32_t> digest) {
+        std::optional<uint32_t> digest, const sstable* sst) {
     return make_compressed_file_input_stream<crc32_utils, compressed_checksum_mode::checksum_all>(
-            std::move(stream_creator), cm, offset, len, std::move(options), std::move(permit), digest);
+            std::move(stream_creator), cm, offset, len, std::move(options), std::move(permit), digest, sst);
 }
 
 output_stream<char> sstables::make_compressed_file_m_format_output_stream(output_stream<char> out,

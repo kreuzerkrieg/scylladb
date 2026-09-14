@@ -18,10 +18,17 @@
 #include "encryption.hh"
 #include "utils/serialization.hh"
 #include "encrypted_file_impl.hh"
+#include "utils/log.hh"
 
 namespace encryption {
 
 using namespace seastar;
+
+// DIAGNOSTIC, SCYLLADB-4293. Both hooks below fire only when an invariant this
+// code relies on does not hold, so a healthy read logs nothing. Both are rate
+// limited: if an invariant turns out to be broken on every read, what we want
+// from it is that it happens and how often, not one line per read.
+static logger enc_diag("encryption_diag");
 
 static inline bool is_aligned(size_t n, size_t a) {
     return (n & (a - 1)) == 0;
@@ -783,6 +790,15 @@ public:
         // now, if the output buffer is not aligned, we are at eof, and
         // also need to trim result.
         if (!is_aligned(output.size(), key_block_size)) {
+            // That reasoning only holds at the real end of the stream. If the
+            // input still has data, this trims live bytes and the position we
+            // decrypt from afterwards no longer matches the file.
+            if (!_input.eof()) {
+                static thread_local logger::rate_limit rl(std::chrono::seconds(10));
+                enc_diag.log(log_level::info, rl,
+                             "unaligned output away from eof: position={}, output={}, trimming {}",
+                             _current_position, output.size(), std::min(output.size(), key_block_size));
+            }
             output.trim(output.size() - std::min(output.size(), key_block_size));
         }
 
@@ -799,6 +815,16 @@ public:
             // a client would only ever skip from a block boundary.
             auto to_skip = align_down(n, block_size);
             assert(is_aligned(_next.size(), block_size));
+            // _next holds one whole block of the stream we are skipping over, so
+            // the input only owes us the remainder. If that ever stops holding,
+            // the position we decrypt from drifts from the file and every block
+            // after it gets the wrong IV.
+            if (!is_aligned(_next.size(), block_size) || to_skip < _next.size()) {
+                static thread_local logger::rate_limit rl(std::chrono::seconds(10));
+                enc_diag.log(log_level::info, rl,
+                             "suspect skip: n={}, to_skip={}, next={}, position={}",
+                             n, to_skip, _next.size(), _current_position);
+            }
             co_await _input.skip(to_skip - _next.size());
             n -= to_skip;
             _current_position += to_skip;
