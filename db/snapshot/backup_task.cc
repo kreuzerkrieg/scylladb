@@ -313,6 +313,11 @@ void backup_task_impl::worker::abort() {
     _as.request_abort();
 }
 
+future<> backup_task_impl::worker::stop() {
+    unsubscribe();
+    return _notifications.close();
+}
+
 future<> backup_task_impl::worker::deleted_sstable(sstables::generation_type gen) const {
     // The notification is called for any sstable, so `gen` may belong
     // to another table, or to an sstable that was created after the snapshot
@@ -326,6 +331,13 @@ future<> backup_task_impl::worker::deleted_sstable(sstables::generation_type gen
         co_return;
     }
 
+    // Keep this worker alive until the notification has been delivered. The
+    // gate is closed by stop(), which sharded<worker> runs before destroying us.
+    auto gh = _notifications.try_hold();
+    if (!gh) {
+        co_return;
+    }
+
     snap_log.debug("SSTable with generation {} was deleted from the table", gen);
 
     // Notification break point. Lets tests park a notification that is on its
@@ -333,8 +345,8 @@ future<> backup_task_impl::worker::deleted_sstable(sstables::generation_type gen
     // it deterministically.
     co_await utils::get_local_injector().inject("backup_task_deleted_sstable", utils::wait_for_message(std::chrono::minutes(2)));
 
-    co_await smp::submit_to(_task._backup_shard, [this, gen] {
-        _task.on_sstable_deletion(gen);
+    co_await smp::submit_to(_task._backup_shard, [&task = _task, gen] {
+        task.on_sstable_deletion(gen);
     });
 }
 

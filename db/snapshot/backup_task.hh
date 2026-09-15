@@ -67,12 +67,19 @@ class backup_task_impl : public tasks::task_manager::task::impl {
         shared_ptr<sstables::object_storage_client> _client;
         abort_source _as;
         std::exception_ptr _ex;
+        // Deletion notifications are delivered by a detached fiber (the
+        // sstables_manager signal drops the slot's future), so they have to be
+        // drained explicitly before the worker goes away.
+        mutable named_gate _notifications{"backup_task::deletion_notifications"};
 
     public:
         worker(const replica::database& db, backup_task_impl& task);
         ~worker();
 
         future<> start_uploading();
+
+        // Called by sharded<worker>::stop() before the instances are destroyed.
+        future<> stop();
 
         void abort();
 
