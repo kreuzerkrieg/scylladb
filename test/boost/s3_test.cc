@@ -7,6 +7,7 @@
  */
 
 
+#include <algorithm>
 #include <unordered_set>
 #include <regex>
 #include <boost/test/unit_test.hpp>
@@ -795,8 +796,18 @@ void test_chunked_download_data_source(const client_maker_function& client_maker
     auto file_input = make_file_input_stream(std::move(rf));
     auto close_file = seastar::deferred_close(file_input);
 
+    // The fiber gives up after default_max_retries failed requests in a row, so the
+    // whole read has to stay under that -- the proxy flavour spends part of the budget
+    // on its own injected errors. Buffers arrive socket-sized, so the loop spins about
+    // object_size / 128 KiB times; spacing the injections over that spreads them across
+    // the download rather than bunching them at the start.
+    constexpr size_t injected_failures = 3;
+    static_assert(injected_failures < aws::default_aws_retry_strategy::default_max_retries);
+    const size_t trigger_interval = std::max(1ul, object_size / 128_KiB / (injected_failures + 1));
+
     size_t total_size = 0;
     size_t trigger_counter = 0;
+    size_t injected = 0;
     while (true) {
         // We want the background fiber to fill the buffer queue and start waiting to drain it
         seastar::sleep(100us).get();
@@ -806,8 +817,9 @@ void test_chunked_download_data_source(const client_maker_function& client_maker
             break;
         }
         ++trigger_counter;
-        if (trigger_counter % 10 == 0) {
+        if (injected < injected_failures && trigger_counter % trigger_interval == 0) {
             utils::get_local_injector().enable("break_s3_inflight_req", true);
+            ++injected;
         }
 
         auto file_buf = file_input.read_exactly(buf.size()).get();
