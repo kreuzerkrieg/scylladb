@@ -34,4 +34,23 @@ public:
     seastar::future<bool> should_retry(std::exception_ptr error, unsigned attempted_retries) const override;
 };
 
+// Reports, backs off and waits on the send brake exactly as default_aws_retry_strategy
+// does, and then refuses to retry: the chunked download fiber consumes the reply body
+// as it arrives, so its request cannot be replayed at the transport layer. The fiber
+// resumes from the offset it has consumed instead.
+//
+// One instance per request, taking the ladder index from the fiber: seastar only
+// advances the count it passes on the branch that retries, which this never takes. The
+// base's ceiling is set one past that index so it never fires -- the fiber owns the
+// budget and the give-up.
+class chunked_download_pacing_strategy final : public default_aws_retry_strategy {
+    unsigned _current_retry;
+
+public:
+    explicit chunked_download_pacing_strategy(unsigned current_retry, s3::throttling_controller& controller)
+        : default_aws_retry_strategy(current_retry + 1, controller), _current_retry(current_retry) {}
+
+    seastar::future<bool> should_retry(std::exception_ptr error, unsigned attempted_retries) const override;
+};
+
 } // namespace aws
