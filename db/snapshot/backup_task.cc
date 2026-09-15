@@ -322,13 +322,20 @@ future<> backup_task_impl::worker::deleted_sstable(sstables::generation_type gen
     //
     // Note: looking up gen in `_sstables_in_snapshot` is safe, although it was
     // created on `backup_shard`, since it is immutable after `process_snapshot_dir` is done.
-    if (_task._sstables_in_snapshot.contains(gen)) {
-        snap_log.debug("SSTable with generation {} was deleted from the table", gen);
-        return smp::submit_to(_task._backup_shard, [this, gen] {
-            _task.on_sstable_deletion(gen);
-        });
+    if (!_task._sstables_in_snapshot.contains(gen)) {
+        co_return;
     }
-    return make_ready_future();
+
+    snap_log.debug("SSTable with generation {} was deleted from the table", gen);
+
+    // Notification break point. Lets tests park a notification that is on its
+    // way to the backup shard, so that the worker can be torn down underneath
+    // it deterministically.
+    co_await utils::get_local_injector().inject("backup_task_deleted_sstable", utils::wait_for_message(std::chrono::minutes(2)));
+
+    co_await smp::submit_to(_task._backup_shard, [this, gen] {
+        _task.on_sstable_deletion(gen);
+    });
 }
 
 future<> backup_task_impl::run() {
