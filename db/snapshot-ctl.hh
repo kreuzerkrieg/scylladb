@@ -151,6 +151,9 @@ public:
     void cancel_expiration(sstring tag, std::vector<sstring> ks_names = {}, sstring table_name = "");
 
     future<> run_snapshot_modify_operation(noncopyable_function<future<>()>&&);
+    // The lock lives on shard 0 and the abort source belongs to the caller, so
+    // this overload must be called there.
+    future<> run_snapshot_modify_operation(seastar::abort_source&, noncopyable_function<future<>()>&&);
     future<> run_snapshot_gate_operation(noncopyable_function<future<>()>&&);
 
 private:

@@ -334,7 +334,7 @@ future<> backup_task_impl::worker::deleted_sstable(sstables::generation_type gen
 future<> backup_task_impl::run() {
     // do_backup() removes a file once it is fully uploaded, so we are actually
     // mutating snapshots.
-    co_await _snap_ctl.run_snapshot_modify_operation([this] {
+    co_await _snap_ctl.run_snapshot_modify_operation(_as, [this] {
         return do_backup();
     });
     snap_log.info("Finished backup");

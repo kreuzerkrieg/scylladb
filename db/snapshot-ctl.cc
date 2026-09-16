@@ -109,6 +109,15 @@ future<> snapshot_ctl::run_snapshot_modify_operation(noncopyable_function<future
     });
 }
 
+future<> snapshot_ctl::run_snapshot_modify_operation(seastar::abort_source& as, noncopyable_function<future<>()>&& f) {
+    if (this_shard_id() != 0) {
+        on_internal_error(snap_log, "run_snapshot_modify_operation(abort_source&) called off shard 0");
+    }
+    auto gh = _ops.hold();
+    auto holder = co_await _lock.hold_write_lock(as);
+    co_await f();
+}
+
 future<> snapshot_ctl::run_snapshot_gate_operation(noncopyable_function<future<>()>&& f) {
     return with_gate(_ops, [f = std::move(f), this] () mutable {
         return container().invoke_on(0, [f = std::move(f)] (snapshot_ctl& snap) mutable {
