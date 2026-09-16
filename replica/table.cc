@@ -22,6 +22,7 @@
 #include "dht/decorated_key.hh"
 #include "readers/mutation_reader.hh"
 #include "replica/database.hh"
+#include "utils/exceptions.hh"
 #include "replica/data_dictionary_impl.hh"
 #include "replica/compaction_group.hh"
 #include "replica/logstor/compaction.hh"
@@ -4449,8 +4450,19 @@ future<table::snapshot_details> table::get_snapshot_details(fs::path snapshot_di
         while (auto de = co_await lister.get()) {
             const auto& name = de->name;
             future<stat_data> (&file_stat)(file& directory, std::string_view name, follow_symlink) noexcept = seastar::file_stat;
-            auto sd = co_await io_check(file_stat, snapshot_directory, name, follow_symlink::no);
-            auto size = sd.allocated_size;
+            std::optional<stat_data> st;
+            try {
+                st = co_await io_check(file_stat, snapshot_directory, name, follow_symlink::no);
+            } catch (...) {
+                // A backup started with move_files unlinks each component once
+                // it is uploaded, so an entry can be gone between the listing
+                // and the stat. Leave it out rather than failing the listing.
+                if (!is_system_error_errno(ENOENT)) {
+                    throw;
+                }
+                continue;
+            }
+            auto size = st->allocated_size;
 
             utils::get_local_injector().inject("per-snapshot-get_snapshot_details", [] {
                 throw std::runtime_error("Injected exception in per-snapshot-get_snapshot_details");
@@ -4462,7 +4474,7 @@ future<table::snapshot_details> table::get_snapshot_details(fs::path snapshot_di
             // add it to the size.
             if (name != "manifest.json" && name != "schema.cql") {
                 details.total += size;
-                if (sd.number_of_links == 1) {
+                if (st->number_of_links == 1) {
                     // File exists only in the snapshot directory.
                     details.live += size;
                     continue;
@@ -4478,10 +4490,10 @@ future<table::snapshot_details> table::get_snapshot_details(fs::path snapshot_di
                 // File exists in the main SSTable directory. Snapshots are not contributing to size
                 auto psd = co_await io_check(file_stat, dir, name, follow_symlink::no);
                 // File in main SSTable directory must be hardlinked to the file in the snapshot dir with the same name.
-                if (psd.device_id != sd.device_id || psd.inode_number != sd.inode_number) {
+                if (psd.device_id != st->device_id || psd.inode_number != st->inode_number) {
                     dblog.warn("[{} device_id={} inode_number={} size={}] is not the same file as [{} device_id={} inode_number={} size={}]",
                             (path / name).native(), psd.device_id, psd.inode_number, psd.size,
-                            (snapshot_dir / name).native(), sd.device_id, sd.inode_number, sd.size);
+                            (snapshot_dir / name).native(), st->device_id, st->inode_number, st->size);
                     co_return false;
                 }
                 co_return true;

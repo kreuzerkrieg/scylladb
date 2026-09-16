@@ -2368,3 +2368,53 @@ async def test_queued_backup_task_is_abortable(manager: ScyllaClusterManager, ob
         # release the lock holder so the keyspace can be dropped
         await manager.api.message_injection(server.ip_addr, "backup_task_pre_upload")
         await manager.api.wait_task(server.ip_addr, holder)
+
+
+@pytest.mark.asyncio
+@pytest.mark.skip_mode(mode='release', reason='error injections are not supported in release mode')
+async def test_snapshot_api_is_responsive_during_backup(manager: ScyllaClusterManager, object_storage):
+    """Listing and clearing snapshots must not wait for a running backup.
+
+    A backup runs for as long as its upload takes, which on a large node is
+    hours. While it does, it must not hold anything that blocks
+    GET/DELETE /storage_service/snapshots.
+    """
+    objconf = object_storage.create_endpoint_conf()
+    cfg = {'enable_user_defined_functions': False,
+           'object_storage_endpoints': objconf,
+           'task_ttl_in_seconds': 300
+           }
+    cmd = ['--logger-log-level', 'snapshots=trace:task_manager=trace:api=info']
+    server = await manager.server_add(config=cfg, cmdline=cmd)
+    cql = manager.get_cql()
+    cf = 'test_cf'
+    async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': '1'}") as ks:
+        await cql.run_async(f"CREATE TABLE {ks}.{cf} ( name text primary key, value text );")
+        await asyncio.gather(*(cql.run_async(f"INSERT INTO {ks}.{cf} ( name, value ) VALUES ('{name}', '{value}');")
+                               for name, value in [('0', 'zero'), ('1', 'one'), ('2', 'two')]))
+        snap_name, _ = await take_snapshot_on_one_server(ks, server, manager, logger)
+
+        await manager.api.enable_injection(server.ip_addr, "backup_task_pre_upload", one_shot=True)
+        log = await manager.server_open_log(server.server_id)
+        mark = await log.mark()
+
+        tid = await manager.api.backup(server.ip_addr, ks, cf, snap_name, object_storage.address,
+                                       object_storage.bucket_name, unique_name('backup_'))
+        await log.wait_for('backup_task_pre_upload: waiting', from_mark=mark)
+
+        # the backup is in flight. both of these used to queue behind it.
+        snapshots = await asyncio.wait_for(
+            manager.api.client.get_json('/storage_service/snapshots', host=server.ip_addr), timeout=30)
+        assert snap_name in [s['key'] for s in snapshots], snapshots
+
+        await asyncio.wait_for(manager.api.delete_snapshot(server.ip_addr, snap_name), timeout=30)
+
+        snapshots = await asyncio.wait_for(
+            manager.api.client.get_json('/storage_service/snapshots', host=server.ip_addr), timeout=30)
+        assert snap_name not in [s['key'] for s in snapshots], snapshots
+
+        # the backup loses the files it was about to upload and gives up
+        await manager.api.message_injection(server.ip_addr, "backup_task_pre_upload")
+        status = await manager.api.wait_task(server.ip_addr, tid)
+        logger.info(f'backup task after its snapshot was cleared: {status}')
+        assert status['state'] in ('failed', 'done'), status

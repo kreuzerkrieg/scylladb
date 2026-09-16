@@ -109,12 +109,12 @@ future<> snapshot_ctl::run_snapshot_modify_operation(noncopyable_function<future
     });
 }
 
-future<> snapshot_ctl::run_snapshot_modify_operation(seastar::abort_source& as, noncopyable_function<future<>()>&& f) {
+future<> snapshot_ctl::run_backup_operation(seastar::abort_source& as, noncopyable_function<future<>()>&& f) {
     if (this_shard_id() != 0) {
-        on_internal_error(snap_log, "run_snapshot_modify_operation(abort_source&) called off shard 0");
+        on_internal_error(snap_log, "run_backup_operation() called off shard 0");
     }
     auto gh = _ops.hold();
-    auto holder = co_await _lock.hold_write_lock(as);
+    auto units = co_await get_units(_backup_sem, 1, as);
     co_await f();
 }
 
