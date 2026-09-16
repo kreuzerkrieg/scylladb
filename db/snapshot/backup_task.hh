@@ -110,6 +110,7 @@ public:
                      sstring bucket,
                      sstring prefix,
                      sstring ks,
+                     sstring table,
                      std::filesystem::path snapshot_dir,
                      bool move_files) noexcept;
 

@@ -151,6 +151,13 @@ public:
     void cancel_expiration(sstring tag, std::vector<sstring> ks_names = {}, sstring table_name = "");
 
     future<> run_snapshot_modify_operation(noncopyable_function<future<>()>&&);
+    // Serializes backups against each other without holding _lock, so that
+    // listing and clearing snapshots stay responsive while a backup uploads.
+    // The semaphore lives on shard 0 and the abort source belongs to the
+    // caller, so this must be called there.
+    // Claim a snapshot for the duration of a backup. Must be called on shard 0.
+    future<> claim_snapshot_for_backup(sstring ks_name, sstring table_name, sstring tag);
+    future<> release_snapshot_for_backup(sstring ks_name, sstring table_name, sstring tag) noexcept;
     future<> run_snapshot_gate_operation(noncopyable_function<future<>()>&&);
 
 private:
@@ -164,6 +171,20 @@ private:
     shared_ptr<snapshot::task_manager_module> _task_manager_module;
     sstables::storage_manager& _storage_manager;
     condition_variable _expiration_cond;
+
+    // A backup unlinks each component of the snapshot it uploads, so it owns
+    // that snapshot for as long as it runs and nothing else may remove it.
+    // Other snapshots, other tables, and listing this one are unaffected.
+    struct backup_claim {
+        sstring ks_name;
+        sstring table_name;
+        sstring tag;
+    };
+    std::vector<backup_claim> _backup_claims;
+
+    // An empty tag, keyspace list or table name matches anything, as in
+    // cancel_expiration().
+    const backup_claim* find_backup_claim(const sstring& tag, const std::vector<sstring>& ks_names, const sstring& table_name) const;
 
     struct expiration_info {
         gc_clock::time_point expires_at;

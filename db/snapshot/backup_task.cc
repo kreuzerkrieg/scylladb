@@ -34,9 +34,10 @@ backup_task_impl::backup_task_impl(tasks::task_manager::module_ptr module,
                                    sstring bucket,
                                    sstring prefix,
                                    sstring ks,
+                                   sstring table,
                                    std::filesystem::path snapshot_dir,
                                    bool move_files) noexcept
-    : tasks::task_manager::task::impl(module, tasks::task_id::create_random_id(), 0, "node", ks, "", "", tasks::task_id::create_null_id())
+    : tasks::task_manager::task::impl(module, tasks::task_id::create_random_id(), 0, "node", ks, table, "", tasks::task_id::create_null_id())
     , _snap_ctl(ctl)
     , _sstm(sstm)
     , _endpoint(std::move(endpoint))
@@ -332,11 +333,27 @@ future<> backup_task_impl::worker::deleted_sstable(sstables::generation_type gen
 }
 
 future<> backup_task_impl::run() {
-    // do_backup() removes a file once it is fully uploaded, so we are actually
-    // mutating snapshots.
-    co_await _snap_ctl.run_snapshot_modify_operation([this] {
-        return do_backup();
-    });
+    // do_backup() unlinks each component once it is uploaded, so this task owns
+    // the snapshot until it is done: claim it, and clear_snapshot() will refuse
+    // to remove it meanwhile. The claim replaces holding the snapshot lock for
+    // the whole upload, which blocked every snapshot operation on the node for
+    // as long as the backup ran.
+    auto tag = _snapshot_dir.filename().native();
+    co_await _snap_ctl.claim_snapshot_for_backup(_status.keyspace, _status.table, tag);
+
+    std::exception_ptr ex;
+    try {
+        co_await _snap_ctl.run_snapshot_modify_operation([this] {
+            return do_backup();
+        });
+    } catch (...) {
+        ex = std::current_exception();
+    }
+    co_await _snap_ctl.release_snapshot_for_backup(_status.keyspace, _status.table, tag);
+    if (ex) {
+        co_await coroutine::return_exception_ptr(std::move(ex));
+    }
+
     snap_log.info("Finished backup");
 }
 

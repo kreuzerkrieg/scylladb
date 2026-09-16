@@ -109,6 +109,51 @@ future<> snapshot_ctl::run_snapshot_modify_operation(noncopyable_function<future
     });
 }
 
+const snapshot_ctl::backup_claim* snapshot_ctl::find_backup_claim(const sstring& tag, const std::vector<sstring>& ks_names, const sstring& table_name) const {
+    auto it = std::ranges::find_if(_backup_claims, [&] (const backup_claim& c) {
+        if (!tag.empty() && c.tag != tag) {
+            return false;
+        }
+        if (!ks_names.empty() && std::ranges::find(ks_names, c.ks_name) == ks_names.end()) {
+            return false;
+        }
+        if (!table_name.empty() && c.table_name != table_name) {
+            return false;
+        }
+        return true;
+    });
+    return it == _backup_claims.end() ? nullptr : &*it;
+}
+
+future<> snapshot_ctl::claim_snapshot_for_backup(sstring ks_name, sstring table_name, sstring tag) {
+    if (this_shard_id() != 0) {
+        on_internal_error(snap_log, "claim_snapshot_for_backup must be called on shard 0");
+    }
+    // Take the lock the snapshot mutators take, so that a claim cannot appear
+    // between clear_snapshot() checking for one and removing the directory.
+    auto holder = co_await _lock.hold_write_lock();
+    _backup_claims.emplace_back(std::move(ks_name), std::move(table_name), std::move(tag));
+}
+
+future<> snapshot_ctl::release_snapshot_for_backup(sstring ks_name, sstring table_name, sstring tag) noexcept {
+    if (this_shard_id() != 0) {
+        on_internal_error(snap_log, "release_snapshot_for_backup must be called on shard 0");
+    }
+    try {
+        auto holder = co_await _lock.hold_write_lock();
+        std::erase_if(_backup_claims, [&] (const backup_claim& c) {
+            return c.ks_name == ks_name && c.table_name == table_name && c.tag == tag;
+        });
+    } catch (...) {
+        // Leaving a claim behind would refuse every later attempt to remove the
+        // snapshot, which is worse than the race the lock protects against.
+        snap_log.error("Failed to release the backup claim on {} of {}.{}: {}", tag, ks_name, table_name, std::current_exception());
+        std::erase_if(_backup_claims, [&] (const backup_claim& c) {
+            return c.ks_name == ks_name && c.table_name == table_name && c.tag == tag;
+        });
+    }
+}
+
 future<> snapshot_ctl::run_snapshot_gate_operation(noncopyable_function<future<>()>&& f) {
     return with_gate(_ops, [f = std::move(f), this] () mutable {
         return container().invoke_on(0, [f = std::move(f)] (snapshot_ctl& snap) mutable {
@@ -246,10 +291,20 @@ future<> snapshot_ctl::clear_snapshot(sstring tag, std::vector<sstring> keyspace
             for (const auto& ks_name : keyspace_names) {
                 resolved_targets.emplace_back(ks_name, resolve_table_name(ks_name, cf_name));
             }
+            for (const auto& [ks_name, resolved_cf_name] : resolved_targets) {
+                if (auto* claim = find_backup_claim(tag, {ks_name}, resolved_cf_name)) {
+                    throw std::invalid_argument(fmt::format("snapshot {} of {}.{} is being backed up; abort the backup task before removing it",
+                            claim->tag, claim->ks_name, claim->table_name));
+                }
+            }
             for (auto& [ks_name, resolved_cf_name] : resolved_targets) {
                 co_await _db.local().clear_snapshot(tag, {ks_name}, std::move(resolved_cf_name));
             }
             co_return;
+        }
+        if (auto* claim = find_backup_claim(tag, keyspace_names, cf_name)) {
+            throw std::invalid_argument(fmt::format("snapshot {} of {}.{} is being backed up; abort the backup task before removing it",
+                    claim->tag, claim->ks_name, claim->table_name));
         }
         co_await _db.local().clear_snapshot(std::move(tag), std::move(keyspace_names), cf_name);
     });
@@ -330,10 +385,15 @@ future<tasks::task_id> snapshot_ctl::start_backup(sstring endpoint, sstring buck
         throw std::invalid_argument(format("snapshot {} not found for table {}.{}", snapshot_name, keyspace, table));
     }
 
+    if (auto* claim = find_backup_claim(snapshot_name, {keyspace}, table)) {
+        throw std::invalid_argument(fmt::format("snapshot {} of {}.{} is already being backed up",
+                claim->tag, claim->ks_name, claim->table_name));
+    }
+
     cancel_expiration(snapshot_name, {keyspace}, table);
 
     auto task = co_await _task_manager_module->make_and_start_task<::db::snapshot::backup_task_impl>(
-        tasks::make_empty_task_info(), *this, _storage_manager.container(), std::move(endpoint), std::move(bucket), std::move(prefix), keyspace, std::move(*dir), move_files);
+        tasks::make_empty_task_info(), *this, _storage_manager.container(), std::move(endpoint), std::move(bucket), std::move(prefix), keyspace, table, std::move(*dir), move_files);
     co_return task->id();
 }
 
