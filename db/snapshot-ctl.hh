@@ -21,6 +21,7 @@
 #include "sstables/types.hh"
 #include <seastar/core/gate.hh>
 #include <seastar/core/rwlock.hh>
+#include <seastar/core/semaphore.hh>
 #include <seastar/core/condition-variable.hh>
 
 using namespace seastar;
@@ -151,6 +152,11 @@ public:
     void cancel_expiration(sstring tag, std::vector<sstring> ks_names = {}, sstring table_name = "");
 
     future<> run_snapshot_modify_operation(noncopyable_function<future<>()>&&);
+    // Serializes backups against each other without holding _lock, so that
+    // listing and clearing snapshots stay responsive while a backup uploads.
+    // The semaphore lives on shard 0 and the abort source belongs to the
+    // caller, so this must be called there.
+    future<> run_backup_operation(seastar::abort_source&, noncopyable_function<future<>()>&&);
     future<> run_snapshot_gate_operation(noncopyable_function<future<>()>&&);
 
 private:
@@ -160,6 +166,7 @@ private:
     sharded<cql3::query_processor>& _qp;
     netw::messaging_service& _ms;
     seastar::rwlock _lock;
+    seastar::named_semaphore _backup_sem{1, named_semaphore_exception_factory{"snapshot_ctl::backup"}};
     seastar::named_gate _ops;
     shared_ptr<snapshot::task_manager_module> _task_manager_module;
     sstables::storage_manager& _storage_manager;
