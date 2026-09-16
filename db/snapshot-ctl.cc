@@ -154,6 +154,15 @@ future<> snapshot_ctl::release_snapshot_for_backup(sstring ks_name, sstring tabl
     }
 }
 
+future<> snapshot_ctl::run_backup_operation(seastar::abort_source& as, noncopyable_function<future<>()>&& f) {
+    if (this_shard_id() != 0) {
+        on_internal_error(snap_log, "run_backup_operation() called off shard 0");
+    }
+    auto gh = _ops.hold();
+    auto units = co_await get_units(_backup_sem, 1, as);
+    co_await f();
+}
+
 future<> snapshot_ctl::run_snapshot_gate_operation(noncopyable_function<future<>()>&& f) {
     return with_gate(_ops, [f = std::move(f), this] () mutable {
         return container().invoke_on(0, [f = std::move(f)] (snapshot_ctl& snap) mutable {

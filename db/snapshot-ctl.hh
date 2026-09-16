@@ -21,6 +21,7 @@
 #include "sstables/types.hh"
 #include <seastar/core/gate.hh>
 #include <seastar/core/rwlock.hh>
+#include <seastar/core/semaphore.hh>
 #include <seastar/core/condition-variable.hh>
 
 using namespace seastar;
@@ -155,6 +156,7 @@ public:
     // listing and clearing snapshots stay responsive while a backup uploads.
     // The semaphore lives on shard 0 and the abort source belongs to the
     // caller, so this must be called there.
+    future<> run_backup_operation(seastar::abort_source&, noncopyable_function<future<>()>&&);
     // Claim a snapshot for the duration of a backup. Must be called on shard 0.
     future<> claim_snapshot_for_backup(sstring ks_name, sstring table_name, sstring tag);
     future<> release_snapshot_for_backup(sstring ks_name, sstring table_name, sstring tag) noexcept;
@@ -167,6 +169,7 @@ private:
     sharded<cql3::query_processor>& _qp;
     netw::messaging_service& _ms;
     seastar::rwlock _lock;
+    seastar::named_semaphore _backup_sem{1, named_semaphore_exception_factory{"snapshot_ctl::backup"}};
     seastar::named_gate _ops;
     shared_ptr<snapshot::task_manager_module> _task_manager_module;
     sstables::storage_manager& _storage_manager;

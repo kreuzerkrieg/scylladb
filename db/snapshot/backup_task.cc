@@ -343,7 +343,7 @@ future<> backup_task_impl::run() {
 
     std::exception_ptr ex;
     try {
-        co_await _snap_ctl.run_snapshot_modify_operation([this] {
+        co_await _snap_ctl.run_backup_operation(_as, [this] {
             return do_backup();
         });
     } catch (...) {
