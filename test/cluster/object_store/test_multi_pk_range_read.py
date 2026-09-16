@@ -169,7 +169,11 @@ async def test_range_read_integrity(manager: ScyllaClusterManager, storage: Stor
         # cassandra-stress' standard1: one row per partition, one blob cell.
         await cql.run_async(
             f"CREATE TABLE {table} (key bigint PRIMARY KEY, c0 blob) "
-            f"WITH compaction = {{'class': 'LeveledCompactionStrategy'}}")
+            f"WITH compaction = {{'class': 'LeveledCompactionStrategy'}} "
+            # The SCT case runs cql-stress's standard1, which is uncompressed.
+            # That matters: an uncompressed sstable takes a different read path
+            # and is only checksummed under integrity_check::yes.
+            f"AND compression = {{}}")
 
         insert = cql.prepare(f"INSERT INTO {table} (key, c0) VALUES (?, ?)")
         insert.consistency_level = ConsistencyLevel.ALL
