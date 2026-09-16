@@ -85,6 +85,7 @@
 #include "replica/data_dictionary_impl.hh"
 #include "replica/global_table_ptr.hh"
 #include "replica/exceptions.hh"
+#include "utils/exceptions.hh"
 #include "readers/multi_range.hh"
 #include "readers/multishard.hh"
 #include "utils/labels.hh"
@@ -3378,6 +3379,28 @@ future<std::optional<std::filesystem::path>> database::find_snapshot_dir(sstring
 
 // For the filesystem operations, this code will assume that all keyspaces are visible in all shards
 // (as we have been doing for a lot of the other operations, like the snapshot itself).
+// A backup started with move_files unlinks each component from the snapshot
+// directory once it is uploaded, so a file can be gone between the listing and
+// the unlink inside recursive_remove_directory. Retry while that is what
+// failed: the backup only ever removes files, so this terminates.
+static future<> remove_snapshot_dir(fs::path dir) {
+    constexpr unsigned max_attempts = 10;
+    for (unsigned attempt = 1; ; attempt++) {
+        try {
+            co_await recursive_remove_directory(dir);
+            co_return;
+        } catch (...) {
+            if (!is_system_error_errno(ENOENT) || attempt == max_attempts) {
+                throw;
+            }
+        }
+        if (!co_await file_exists(dir.native())) {
+            co_return;
+        }
+        dblog.debug("clear_snapshot: {} changed while being removed, retrying ({}/{})", dir, attempt, max_attempts);
+    }
+}
+
 future<> database::clear_snapshot(sstring tag, std::vector<sstring> keyspace_names, const sstring& table_name) {
     std::vector<sstring> data_dirs = _cfg.data_file_directories();
     std::unordered_set<sstring> ks_names_set(keyspace_names.begin(), keyspace_names.end());
@@ -3434,7 +3457,7 @@ future<> database::clear_snapshot(sstring tag, std::vector<sstring> keyspace_nam
                     if (has_snapshots) {
                         if (tag.empty()) {
                             dblog.info("Removing {}", snapshots_dir);
-                            recursive_remove_directory(std::move(snapshots_dir)).get();
+                            remove_snapshot_dir(std::move(snapshots_dir)).get();
                             has_snapshots = false;
                         } else {
                             // if specific snapshots tags were given - filter only these snapshot directories
@@ -3446,7 +3469,7 @@ future<> database::clear_snapshot(sstring tag, std::vector<sstring> keyspace_nam
                                 if (snapshot_ent->name == tag) {
                                     auto snapshot_dir = snapshots_dir / snapshot_ent->name;
                                     dblog.info("Removing {}", snapshot_dir);
-                                    recursive_remove_directory(std::move(snapshot_dir)).get();
+                                    remove_snapshot_dir(std::move(snapshot_dir)).get();
                                 } else {
                                     has_snapshots = true;
                                 }
