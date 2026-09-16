@@ -22,6 +22,7 @@
 #include "dht/decorated_key.hh"
 #include "readers/mutation_reader.hh"
 #include "replica/database.hh"
+#include "utils/exceptions.hh"
 #include "replica/data_dictionary_impl.hh"
 #include "replica/compaction_group.hh"
 #include "replica/logstor/compaction.hh"
@@ -4449,7 +4450,18 @@ future<table::snapshot_details> table::get_snapshot_details(fs::path snapshot_di
         while (auto de = co_await lister.get()) {
             const auto& name = de->name;
             future<stat_data> (&file_stat)(file& directory, std::string_view name, follow_symlink) noexcept = seastar::file_stat;
-            auto sd = co_await io_check(file_stat, snapshot_directory, name, follow_symlink::no);
+            stat_data sd;
+            try {
+                sd = co_await io_check(file_stat, snapshot_directory, name, follow_symlink::no);
+            } catch (...) {
+                // The backup of this snapshot unlinks each component once it is
+                // uploaded, so an entry can be gone between the listing and the
+                // stat. Leave it out rather than failing the listing.
+                if (!is_system_error_errno(ENOENT)) {
+                    throw;
+                }
+                continue;
+            }
             auto size = sd.allocated_size;
 
             utils::get_local_injector().inject("per-snapshot-get_snapshot_details", [] {
