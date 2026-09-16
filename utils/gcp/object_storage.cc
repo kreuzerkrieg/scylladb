@@ -200,6 +200,10 @@ class utils::gcp::storage::client::object_data_source : public seekable_data_sou
     uint64_t _size = 0;
     std::chrono::system_clock::time_point _timestamp;
     seastar::abort_source* _as;
+    // DIAGNOSTIC, SCYLLADB-4293. Survives the state being discarded, so a source
+    // that starts over can be told apart from one that legitimately begins at the
+    // start of the object.
+    bool _ever_served = false;
     struct state {
         uint64_t position = 0;
         // DIAGNOSTIC, SCYLLADB-4293. Where the previous ranged GET made through
@@ -1033,6 +1037,19 @@ future<temporary_buffer<char>> utils::gcp::storage::client::object_data_source::
             // whether the server answered this range or another one.
             const uint64_t want_first = s.position;
             const uint64_t want_last = s.position + to_read - 1;
+            // DIAGNOSTIC, SCYLLADB-4293. hold_state discards the state when a call
+            // leaves through an exception, and the next call builds a fresh one at
+            // zero. This is that rewind actually happening rather than merely being
+            // possible: a source that has already handed out bytes is asking for the
+            // start of the object again. The encrypted source above keeps its own
+            // position, so from here it would decrypt the start of the object under
+            // the IVs for wherever it had reached.
+            if (_ever_served && s.position == 0 && !s.ranged_any) {
+                static thread_local logger::rate_limit rl(std::chrono::seconds(10));
+                gcp_diag.log(log_level::info, rl,
+                        "{}:{} restarted at offset 0 after already serving data from this source",
+                        _bucket, _object_name);
+            }
             if (s.ranged_any && s.position != s.last_range_end) {
                 static thread_local logger::rate_limit rl(std::chrono::seconds(10));
                 gcp_diag.log(log_level::info, rl,
@@ -1117,6 +1134,7 @@ future<temporary_buffer<char>> utils::gcp::storage::client::object_data_source::
             }
             s.last_range_end = s.position;
             s.ranged_any = true;
+            _ever_served = true;
         }
     }
 

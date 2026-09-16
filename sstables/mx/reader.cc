@@ -1251,6 +1251,21 @@ public:
     }
 };
 
+
+// DIAGNOSTIC, SCYLLADB-4293. An uncompressed sstable is only checksummed on read
+// under integrity_check::yes, and user reads pass no - so nothing on the user read
+// path verifies anything at all. The CRC component is computed over the plaintext
+// and the component is encrypted around it, so a chunk that decrypts at the wrong
+// position fails this check at the read that does it, which is the one probe that
+// catches SCYLLADB-4293 in the act rather than inferring it afterwards. Compressed
+// sstables already verify every chunk, so they are left alone.
+static sstables::integrity_check diag_force_integrity(const sstables::shared_sstable& sst, sstables::integrity_check integrity) {
+    if (integrity == sstables::integrity_check::no && !sst->get_shared_components().compression) {
+        return sstables::integrity_check::yes;
+    }
+    return integrity;
+}
+
 class mx_sstable_mutation_reader : public mp_row_consumer_reader_mx {
     using DataConsumeRowsContext = data_consume_rows_context_m<mp_row_consumer_m>;
     using Consumer = mp_row_consumer_m;
@@ -1306,7 +1321,7 @@ public:
             , _fwd(fwd)
             , _fwd_mr(fwd_mr)
             , _monitor(mon)
-            , _integrity(integrity) {
+            , _integrity(diag_force_integrity(_sst, integrity)) {
         sstlog.trace("mx_sstable_mutation_reader {}: init with _pr={}", fmt::ptr(this), _pr.get());
         if (reversed()) {
             if (!_single_partition_read) {
@@ -1943,7 +1958,7 @@ public:
         : mp_row_consumer_reader_mx(std::move(schema), permit, std::move(sst))
         , _consumer(this, _schema, std::move(permit), _schema->full_slice(), std::move(trace_state), streamed_mutation::forwarding::no, _sst)
         , _monitor(mon)
-        , _integrity(integrity) {}
+        , _integrity(diag_force_integrity(_sst, integrity)) {}
 private:
     bool is_initialized() const {
         return bool(_context);

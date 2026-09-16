@@ -733,18 +733,51 @@ class encrypted_data_source : public data_source_impl, public block_encryption_b
     size_t _current_position = 0;
     size_t _skip = 0;
 
+    // DIAGNOSTIC, SCYLLADB-4293. Every byte ever taken out of _input, whether read
+    // or skipped.
+    uint64_t _in_bytes = 0;
+    // DIAGNOSTIC, SCYLLADB-4293. Which component this source is decrypting, so a
+    // report names an object that can be fetched.
+    std::string _what;
+
+    // DIAGNOSTIC, SCYLLADB-4293. Away from eof, every byte drawn from the input has
+    // been decrypted and accounted for in _current_position, is held in _next, or
+    // was skipped. The IV for each block is derived from that position alone
+    // (iv_for: block = pos / block_size), so a position that has drifted from the
+    // file decrypts every block after it under the wrong IV - correct up to the
+    // drift, garbage from there to the end, which is the shape SCYLLADB-4293 has.
+    void check_position(const char* where) const {
+        auto accounted = _current_position + _next.size();
+        if (accounted == _in_bytes) {
+            return;
+        }
+        static thread_local logger::rate_limit rl(std::chrono::seconds(10));
+        enc_diag.log(log_level::info, rl,
+                "{}: position drifted at {}: decrypt position {} + buffered {} = {}, but {} bytes came out of the input (delta {}, {} blocks); next IV would use block {}",
+                _what, where, _current_position, _next.size(), accounted, _in_bytes,
+                int64_t(accounted) - int64_t(_in_bytes),
+                (int64_t(accounted) - int64_t(_in_bytes)) / int64_t(block_size),
+                _current_position / block_size);
+    }
+
 public:
-    encrypted_data_source(data_source source, shared_ptr<symmetric_key> k) 
+    encrypted_data_source(data_source source, shared_ptr<symmetric_key> k, std::string what)
         : block_encryption_base(std::move(k))
-        , _input(std::move(source)) 
+        , _input(std::move(source))
+        , _what(std::move(what))
     {}
 
     future<temporary_buffer<char>> get() override {
+        check_position("get");
         // First, get as much as we can get now (or the remainder of previous call)
-        auto buf1 = _next.empty()
+        const bool buf1_from_input = _next.empty();
+        auto buf1 = buf1_from_input
             ? co_await _input.read()
             : std::exchange(_next, {})
             ;
+        if (buf1_from_input) {
+            _in_bytes += buf1.size();
+        }
 
         // eof?
         if (buf1.empty()) {
@@ -759,6 +792,7 @@ public:
         auto buf2 = _input.eof()
             ? temporary_buffer<char>()
             : co_await _input.read_exactly(fill_size);
+        _in_bytes += buf2.size();
 
         temporary_buffer<char> output(buf1.size() + buf2.size());
 
@@ -825,10 +859,12 @@ public:
                              "suspect skip: n={}, to_skip={}, next={}, position={}",
                              n, to_skip, _next.size(), _current_position);
             }
+            _in_bytes += to_skip - _next.size();
             co_await _input.skip(to_skip - _next.size());
             n -= to_skip;
             _current_position += to_skip;
             _next = {};
+            check_position("skip");
         }
         _skip = n;
         co_return temporary_buffer<char>{};
@@ -840,8 +876,8 @@ public:
 };
 
 
-std::unique_ptr<data_source_impl> make_encrypted_source(data_source source, shared_ptr<symmetric_key> k) {
-    return std::make_unique<encrypted_data_source>(std::move(source), std::move(k));
+std::unique_ptr<data_source_impl> make_encrypted_source(data_source source, shared_ptr<symmetric_key> k, std::string what) {
+    return std::make_unique<encrypted_data_source>(std::move(source), std::move(k), std::move(what));
 }
 }
 
