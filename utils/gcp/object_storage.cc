@@ -254,10 +254,16 @@ class utils::gcp::storage::client::object_data_source : public seekable_data_sou
             }
         }
         ~hold_state() {
+            // Give the state back however this call ended. A read that throws
+            // leaves it describing exactly what it did before - the commit is
+            // all-or-nothing, so the position always matches the buffers - and
+            // the caller is free to retry from where it got to. Dropping it made
+            // the next call build a fresh one at position zero, which is a rewind
+            // to the start of the object rather than a resume, and silent: the
+            // encrypted source above keeps its own position, so it would decrypt
+            // the start of the object under the IVs for wherever it had reached.
             _state->adjust_lease();
-            if (!std::uncaught_exceptions()) {
-                _src._state = std::move(_state);
-            }
+            _src._state = std::move(_state);
         }
         operator state&() const {
             return *_state;
@@ -1036,9 +1042,15 @@ future<temporary_buffer<char>> utils::gcp::storage::client::object_data_source::
                     }
                     auto old = s.position;
                     for (auto&& buf : bufs) {
-                        s.position += buf.size();
-                        _impl->count_read_bytes(buf.size());
+                        // Hand the buffer over before advancing past it. deque's
+                        // push is strongly exception safe, so either the state
+                        // takes the bytes and the position moves, or neither
+                        // happens - the position never describes bytes the
+                        // buffers do not hold.
+                        auto n = buf.size();
                         s.buffers.emplace_back(std::move(buf));
+                        s.position += n;
+                        _impl->count_read_bytes(n);
                     }
                     gcp_storage.debug("Read object {}:{} ({}-{}/{})", _bucket, _object_name, old, s.position, _size);
                 }
