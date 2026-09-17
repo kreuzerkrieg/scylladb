@@ -200,10 +200,6 @@ class utils::gcp::storage::client::object_data_source : public seekable_data_sou
     uint64_t _size = 0;
     std::chrono::system_clock::time_point _timestamp;
     seastar::abort_source* _as;
-    // DIAGNOSTIC, SCYLLADB-4293. Survives the state being discarded, so a source
-    // that starts over can be told apart from one that legitimately begins at the
-    // start of the object.
-    bool _ever_served = false;
     struct state {
         uint64_t position = 0;
         // DIAGNOSTIC, SCYLLADB-4293. Where the previous ranged GET made through
@@ -272,22 +268,16 @@ class utils::gcp::storage::client::object_data_source : public seekable_data_sou
             }
         }
         ~hold_state() {
+            // Give the state back however this call ended. A read that throws
+            // leaves it describing exactly what it did before - the commit is
+            // all-or-nothing, so the position always matches the buffers - and
+            // the caller is free to retry from where it got to. Dropping it made
+            // the next call build a fresh one at position zero, which is a rewind
+            // to the start of the object rather than a resume, and silent: the
+            // encrypted source above keeps its own position, so it would decrypt
+            // the start of the object under the IVs for wherever it had reached.
             _state->adjust_lease();
-            if (!std::uncaught_exceptions()) {
-                _src._state = std::move(_state);
-                return;
-            }
-            // DIAGNOSTIC, SCYLLADB-4293. Leaving through an exception discards
-            // the state, and the next call on this source builds a fresh one at
-            // position zero - a rewind to the start of the object rather than a
-            // resume. Nothing reuses a source after a failed read today, which
-            // is the only reason this is quiet.
-            if (_state->position != 0) {
-                static thread_local logger::rate_limit rl(std::chrono::seconds(10));
-                gcp_diag.log(log_level::info, rl,
-                        "read state for {}:{} discarded at position {}; the next read on this source starts at 0",
-                        _src._bucket, _src._object_name, _state->position);
-            }
+            _src._state = std::move(_state);
         }
         operator state&() const {
             return *_state;
@@ -1037,19 +1027,6 @@ future<temporary_buffer<char>> utils::gcp::storage::client::object_data_source::
             // whether the server answered this range or another one.
             const uint64_t want_first = s.position;
             const uint64_t want_last = s.position + to_read - 1;
-            // DIAGNOSTIC, SCYLLADB-4293. hold_state discards the state when a call
-            // leaves through an exception, and the next call builds a fresh one at
-            // zero. This is that rewind actually happening rather than merely being
-            // possible: a source that has already handed out bytes is asking for the
-            // start of the object again. The encrypted source above keeps its own
-            // position, so from here it would decrypt the start of the object under
-            // the IVs for wherever it had reached.
-            if (_ever_served && s.position == 0 && !s.ranged_any) {
-                static thread_local logger::rate_limit rl(std::chrono::seconds(10));
-                gcp_diag.log(log_level::info, rl,
-                        "{}:{} restarted at offset 0 after already serving data from this source",
-                        _bucket, _object_name);
-            }
             if (s.ranged_any && s.position != s.last_range_end) {
                 static thread_local logger::rate_limit rl(std::chrono::seconds(10));
                 gcp_diag.log(log_level::info, rl,
@@ -1092,9 +1069,15 @@ future<temporary_buffer<char>> utils::gcp::storage::client::object_data_source::
                     }
                     auto old = s.position;
                     for (auto&& buf : bufs) {
-                        s.position += buf.size();
-                        _impl->count_read_bytes(buf.size());
+                        // Hand the buffer over before advancing past it. deque's
+                        // push is strongly exception safe, so either the state
+                        // takes the bytes and the position moves, or neither
+                        // happens - the position never describes bytes the
+                        // buffers do not hold.
+                        auto n = buf.size();
                         s.buffers.emplace_back(std::move(buf));
+                        s.position += n;
+                        _impl->count_read_bytes(n);
                     }
                     gcp_storage.debug("Read object {}:{} ({}-{}/{})", _bucket, _object_name, old, s.position, _size);
 
@@ -1134,7 +1117,6 @@ future<temporary_buffer<char>> utils::gcp::storage::client::object_data_source::
             }
             s.last_range_end = s.position;
             s.ranged_any = true;
-            _ever_served = true;
         }
     }
 
