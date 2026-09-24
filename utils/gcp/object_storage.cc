@@ -1116,6 +1116,21 @@ future<temporary_buffer<char>> utils::gcp::storage::client::object_data_source::
                     if (rep._status != status_type::ok && rep._status != status_type::partial_content) {
                         throw failed_operation(fmt::format("Could not read object {}: {} ({}-{}/{} - {})", _bucket, _object_name, s.position, s.position+to_read, _size, int(rep._status)));
                     }
+                    // Before reading, because read_entire_stream() below accumulates
+                    // whatever arrives into the shared buffers - past the memory lease
+                    // taken for to_read - and the length check after the request would
+                    // only notice once it is all in memory. GCS answers a ranged GET
+                    // with the whole object in some circumstances, which for a Data
+                    // file is gigabytes. A chunked reply declares nothing and is not
+                    // covered here; the length check is what catches that one.
+                    auto declared = rep.content_length;
+                    utils::get_local_injector().inject("gcp_source_oversized_reply", [&declared, to_read] {
+                        declared = to_read + 1;
+                    });
+                    if (declared > to_read) {
+                        throw storage_io_error(EIO, fmt::format("Read of {}:{} declared {} bytes for the {} bytes asked for at offset {} of {}",
+                                _bucket, _object_name, declared, to_read, s.position, _size));
+                    }
                     // send_with_retry() re-runs this handler on every attempt, so
                     // assigning got rather than adding to it is what starts each
                     // attempt over. Nothing is appended before read_entire_stream()
