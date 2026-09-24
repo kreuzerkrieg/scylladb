@@ -1139,6 +1139,12 @@ future<temporary_buffer<char>> utils::gcp::storage::client::object_data_source::
                 , _as
             );
 
+            utils::get_local_injector().inject("gcp_source_short_range", [&got] {
+                // Drop a byte once the range has been read whole, standing in for a
+                // reply that described a shorter range than the one asked for. That is
+                // not a truncation and not retryable, so it has to reach the check below.
+                got -= got > 0 ? 1 : 0;
+            });
             // to_read never runs past the end of the object, so a satisfiable range
             // that came back whole came back complete. Anything else means the reply
             // described a different range than the one asked for, which is not
