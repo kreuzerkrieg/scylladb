@@ -3672,6 +3672,15 @@ future<> database::drain() {
     // flush the system ones after all the rest are done, just in case flushing modifies any system state
     // like CASSANDRA-5151. don't bother with progress tracking since system data is tiny.
     co_await _stop_barrier.arrive_and_wait();
+    // A write landing after the flush would be flushed again when the table
+    // closes, which on object storage needs the sstables registry that
+    // system_keyspace shutdown unplugs.
+    co_await parallel_for_each(get_tables_metadata().filter([this] (auto uuid_and_cf) {
+        auto& ks = uuid_and_cf.second->schema()->ks_name();
+        return !is_system_keyspace(ks) && !_cfg.extensions().is_extension_internal_keyspace(ks);
+    }), [] (auto&& uuid_and_cf) {
+        return uuid_and_cf.second->close_writes();
+    });
     co_await flush_non_system_column_families();
     co_await _stop_barrier.arrive_and_wait();
     co_await flush_system_column_families();
