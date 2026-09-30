@@ -340,7 +340,12 @@ private:
     class cancellable_write_handlers_list;
     std::unique_ptr<cancellable_write_handlers_list> _cancellable_write_handlers_list;
 
-    gate _write_handlers_gate;
+    // Heap-allocated so that wait_for_local_writes() can swap in a fresh
+    // gate: a gate cannot be moved while it has holders.
+    std::unique_ptr<gate> _write_handlers_gate = std::make_unique<gate>();
+    // Held by replica-side write RPC handlers and by background paxos prunes,
+    // which write locally without a write-response handler.
+    gate _replica_writes_gate;
 
     /* This is a pointer to the shard-local part of the sharded cdc_service:
      * storage_proxy needs access to cdc_service to augment mutations.
@@ -596,6 +601,11 @@ public:
 
     future<> cancel_all_write_response_handlers();
     future<> cancel_nonlocal_write_response_handlers();
+    // Waits for the local writes that are in flight, without cancelling them,
+    // so that they land before the database is flushed: write-response
+    // handlers, replica-side write RPC handlers and paxos prunes. New
+    // handlers can still be created; new replica writes are rejected.
+    future<> wait_for_local_writes();
 
 private:
     bool only_me(const locator::effective_replication_map& erm, const host_id_vector_replica_set& replicas) const noexcept;
