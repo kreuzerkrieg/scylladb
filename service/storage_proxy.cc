@@ -546,6 +546,7 @@ private:
             co_return co_await std::move(*f);
         }
 
+        auto writes_holder = _sp._replica_writes_gate.hold();
         utils::chunked_vector<frozen_mutation_and_schema> mutations;
         auto timeout = *t;
         co_await coroutine::parallel_for_each(std::move(fms), [&] (frozen_mutation& fm) {
@@ -574,6 +575,11 @@ private:
             fencing_token fence, auto&& apply_fn1, auto&& forward_fn1) {
         auto apply_fn = std::move(apply_fn1);
         auto forward_fn = std::move(forward_fn1);
+
+        auto writes_holder = _sp._replica_writes_gate.try_hold();
+        if (!writes_holder) {
+            co_return netw::messaging_service::no_wait();
+        }
 
         tracing::trace_state_ptr trace_state_ptr;
 
@@ -1027,6 +1033,7 @@ private:
         }
 
         co_await _sp.apply_fence(fence_opt, src_addr);
+        auto writes_holder = _sp._replica_writes_gate.hold();
 
         if (!cmd.max_result_size) {
             cmd.max_result_size.emplace(cinfo.retrieve_auxiliary<uint64_t>("max_result_size"));
@@ -1072,6 +1079,7 @@ private:
         }
 
         co_await _sp.apply_fence(fence_opt, src_addr);
+        auto writes_holder = _sp._replica_writes_gate.hold();
 
         auto handling_done = defer([tr_state, src_addr] noexcept {
             if (tr_state) {
@@ -1116,6 +1124,11 @@ private:
         }
 
         co_await _sp.apply_fence(fence_opt, src_addr);
+
+        auto prune_holder = _sp._replica_writes_gate.try_hold();
+        if (!prune_holder) {
+            co_return netw::messaging_service::no_wait();
+        }
 
         if (pruning >= pruning_limit) {
             _sp.get_stats().cas_replica_dropped_prune++;
@@ -1782,7 +1795,7 @@ public:
             register_cancellable();
         }
 
-        attach_to(_proxy->_write_handlers_gate);
+        attach_to(*_proxy->_write_handlers_gate);
     }
     void attach_to(gate& g) {
         _holders.push_back(g.hold());
@@ -2738,6 +2751,10 @@ void paxos_response_handler::prune(utils::UUID ballot) {
         _proxy->get_stats().cas_coordinator_dropped_prune++;
         return;
     }
+    auto prune_holder = _proxy->_replica_writes_gate.try_hold();
+    if (!prune_holder) {
+        return;
+    }
      _proxy->get_stats().cas_now_pruning++;
     _proxy->get_stats().cas_prune++;
     auto erm = get_effective_replication_map();
@@ -2753,7 +2770,7 @@ void paxos_response_handler::prune(utils::UUID ballot) {
             tracing::trace(tr_state, "prune: send prune of {} to {}", ballot, peer);
             return _proxy->remote().send_paxos_prune(peer, _timeout, tr_state, _schema->version(), _key.key(), ballot, get_fence());
         }
-    }).then_wrapped([this, h = shared_from_this()] (future<> f) {
+    }).then_wrapped([this, h = shared_from_this(), prune_holder = std::move(*prune_holder)] (future<> f) {
         h->_proxy->get_stats().cas_now_pruning--;
         try {
             f.get();
@@ -7613,12 +7630,21 @@ future<utils::chunked_vector<dht::token_range_endpoints>> storage_proxy::describ
 }
 
 future<> storage_proxy::cancel_all_write_response_handlers() {
-    auto f = _write_handlers_gate.close();
+    auto f = _write_handlers_gate->close();
     while (!_response_handlers.empty()) {
         _response_handlers.begin()->second->timeout_cb();
         co_await coroutine::maybe_yield();
     }
     co_await std::move(f);
+}
+
+future<> storage_proxy::wait_for_local_writes() {
+    // A handler can outlive its removal from _response_handlers, so wait on
+    // the gate every handler holds rather than on the map's contents.
+    auto old_gate = std::exchange(_write_handlers_gate, std::make_unique<gate>());
+    co_await old_gate->close();
+    // A learn that has just completed may have started a prune.
+    co_await _replica_writes_gate.close();
 }
 
 future<> storage_proxy::cancel_nonlocal_write_response_handlers() {
