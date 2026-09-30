@@ -3057,6 +3057,12 @@ future<> storage_service::do_drain() {
         return bm.drain();
     });
 
+    // Local writes still in flight, such as a paxos learn and its prune,
+    // must land before the flush below: a table written after its flush
+    // is flushed again at shutdown, when object storage can no longer
+    // record the new sstable.
+    co_await _qp.proxy().container().invoke_on_all(&service::storage_proxy::wait_for_local_writes);
+
     co_await _db.invoke_on_all(&replica::database::drain);
     co_await _sys_ks.invoke_on_all(&db::system_keyspace::shutdown);
     co_await _repair.invoke_on_all(&repair_service::shutdown);
