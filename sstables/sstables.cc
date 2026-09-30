@@ -59,6 +59,7 @@
 #include <boost/algorithm/string.hpp>
 #include <boost/regex.hpp>
 #include <seastar/core/align.hh>
+#include <seastar/coroutine/switch_to.hh>
 #include "mutation/range_tombstone_list.hh"
 #include "binary_search.hh"
 #include "utils/bloom_filter.hh"
@@ -4288,6 +4289,7 @@ void sstable::unused() {
 }
 
 future<> sstable::destroy() {
+    co_await coroutine::switch_to(_manager._maintenance_sg);
     std::exception_ptr ex;
     try {
         co_await close_files();
