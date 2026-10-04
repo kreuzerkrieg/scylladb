@@ -208,6 +208,8 @@ public:
     // quickly as possible (we do not wait for repairs to finish but rather
     // stop them abruptly).
     future<> shutdown();
+    // Aborts the repairs this node coordinates and waits for them to finish.
+    future<> stop_running_repairs();
 
     // Enable the repair service.
     void enable();

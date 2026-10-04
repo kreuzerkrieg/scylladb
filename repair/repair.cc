@@ -689,6 +689,10 @@ named_semaphore& repair::task_manager_module::range_parallelism_semaphore() {
 }
 
 future<> repair::task_manager_module::run(repair_uniq_id id, std::function<void ()> func) {
+    auto holder = _running_repairs.try_hold();
+    if (!holder) {
+        return make_exception_future<>(gate_closed_exception());
+    }
     return seastar::with_gate(async_gate(), [this, id, func = std::move(func)] () mutable {
         start(id);
         return seastar::async([func = std::move(func)] { func(); }).then([this, id] {
@@ -698,7 +702,13 @@ future<> repair::task_manager_module::run(repair_uniq_id id, std::function<void 
             done(id, false);
             return make_exception_future(std::move(ep));
         });
-    });
+    }).finally([holder = std::move(*holder)] {});
+}
+
+future<> repair::task_manager_module::abort_and_wait_for_running_repairs() {
+    rlogger.info0("Aborting running repairs and waiting for them to finish");
+    abort_source().request_abort();
+    co_await _running_repairs.close();
 }
 
 future<uint64_t> estimate_partitions(seastar::sharded<replica::database>& db, const sstring& keyspace,
@@ -1653,6 +1663,10 @@ future<repair_status> repair_service::await_completion(int id, std::chrono::stea
 
 future<> repair_service::shutdown() {
     co_await remove_repair_meta();
+}
+
+future<> repair_service::stop_running_repairs() {
+    return _repair_module->abort_and_wait_for_running_repairs();
 }
 
 future<> repair_service::abort_all() {
