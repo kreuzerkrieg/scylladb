@@ -3057,6 +3057,11 @@ future<> storage_service::do_drain() {
         return bm.drain();
     });
 
+    // A repair master seals the sstable it is writing when its fiber ends,
+    // which on object storage needs the sstables registry that
+    // system_keyspace shutdown unplugs.
+    co_await _repair.invoke_on_all(&repair_service::stop_running_repairs);
+
     co_await _db.invoke_on_all(&replica::database::drain);
     co_await _sys_ks.invoke_on_all(&db::system_keyspace::shutdown);
     co_await _repair.invoke_on_all(&repair_service::shutdown);
