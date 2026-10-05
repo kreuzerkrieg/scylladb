@@ -9,6 +9,7 @@
 #include <seastar/coroutine/parallel_for_each.hh>
 #include <seastar/coroutine/switch_to.hh>
 #include <cctype>
+#include <charconv>
 #include <ranges>
 #include <unordered_map>
 #include <unordered_set>
@@ -135,9 +136,36 @@ storage_manager::object_storage_endpoint::object_storage_endpoint(db::object_sto
     : cfg(ep)
 {}
 
+// Every scheduling group that sends S3 requests. A request from any other group is a
+// stray to track down, unless object_storage_connections allows that group.
+static const s3::group_connections default_group_connections = {
+    {"service_levels", 128},
+    {"main", 8},
+    {"memtable", 16},
+    {"compaction", 16},
+    {"maintenance_compaction", 16},
+    {"streaming", 64},
+    {"backup", 32},
+    {"maintenance", 16},
+};
+
+static s3::group_connections make_group_connections(const std::unordered_map<sstring, sstring>& overrides) {
+    auto connections = default_group_connections;
+    for (const auto& [group, value] : overrides) {
+        unsigned n = 0;
+        auto end = value.data() + value.size();
+        auto [ptr, ec] = std::from_chars(value.data(), end, n);
+        if (ec != std::errc() || ptr != end || n == 0) {
+            throw std::invalid_argument(fmt::format("object_storage_connections: invalid value '{}' for '{}', expected a positive integer", value, group));
+        }
+        connections[group] = n;
+    }
+    return connections;
+}
+
 storage_manager::storage_manager(const db::config& cfg, config stm_cfg)
     : _object_storage_clients_memory(stm_cfg.object_storage_clients_memory)
-    , _connections_per_shard(cfg.object_storage_connections_per_shard())
+    , _group_connections(make_group_connections(cfg.object_storage_connections()))
     , _config_updater(std::make_unique<config_updater_sync>(cfg, *this))
     , _connections_updater(std::make_unique<connections_updater_sync>(cfg, *this))
 {
@@ -177,7 +205,7 @@ shared_ptr<sstables::object_storage_client> storage_manager::get_endpoint_client
     if (ep.client == nullptr) {
         ep.client = make_object_storage_client(ep.cfg, _object_storage_clients_memory, [&ct = container()] (std::string ep) {
             return ct.local().get_endpoint_client(ep);
-        }, _connections_per_shard);
+        }, _group_connections);
     }
     return ep.client;
 }
@@ -225,12 +253,19 @@ storage_manager::config_updater_sync::config_updater_sync(const db::config& cfg,
 {}
 
 storage_manager::connections_updater_sync::connections_updater_sync(const db::config& cfg, storage_manager& sstm)
-    : observer(cfg.object_storage_connections_per_shard.observe([&sstm] (unsigned new_value) {
-        smlogger.info("connections_updater: updating connections_per_shard to {}", new_value);
-        sstm._connections_per_shard = new_value;
+    : observer(cfg.object_storage_connections.observe([&sstm] (const std::unordered_map<sstring, sstring>& new_value) {
+        s3::group_connections connections;
+        try {
+            connections = make_group_connections(new_value);
+        } catch (...) {
+            smlogger.error("connections_updater: ignoring object_storage_connections update: {}", std::current_exception());
+            return;
+        }
+        smlogger.info("connections_updater: updating object_storage_connections to {}", connections);
+        sstm._group_connections = std::move(connections);
         for (auto& [endpoint, ep] : sstm._object_storage_endpoints) {
             if (ep.client) {
-                ep.client->update_connections_per_shard(new_value);
+                ep.client->update_group_connections(sstm._group_connections);
             }
         }
     }))
