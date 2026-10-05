@@ -139,12 +139,12 @@ storage_manager::object_storage_endpoint::object_storage_endpoint(db::object_sto
 // Every scheduling group that sends S3 requests. A request from any other group is a
 // stray to track down, unless object_storage_connections allows that group.
 static const s3::group_connections default_group_connections = {
-    {"service_levels", 256},
-    {"main", 32},
-    {"memtable", 32},
-    {"compaction", 32},
-    {"maintenance_compaction", 32},
-    {"streaming", 32},
+    {"service_levels", 128},
+    {"main", 8},
+    {"memtable", 16},
+    {"compaction", 16},
+    {"maintenance_compaction", 16},
+    {"streaming", 64},
     {"backup", 32},
     {"maintenance", 16},
 };
