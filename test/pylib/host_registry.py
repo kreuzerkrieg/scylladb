@@ -83,6 +83,7 @@ class HostRegistry:
             raise RuntimeError(
                 f"Failed to acquire a subnet lock after {max_attempts} attempts"
             )
+        self.subnet = subnet
 
         # Never-yet-leased hosts, minted on demand: one for each of the 254 usable 4th-octet values.
         self._new_hosts: Iterator[Host] = (Host(f"{subnet}.{host_id}") for host_id in range(1, 255))
@@ -92,6 +93,11 @@ class HostRegistry:
 
         # Limits the number of leased hosts to the number of usable 4th-octet values: lease #255 waits for a release.
         self._semaphore = asyncio.Semaphore(254)
+
+    @classmethod
+    def subnet_in_use(cls) -> Optional[str]:
+        """The subnet this process leases hosts from, or None if it never created a registry (a call never creates one)."""
+        return cls._instance.subnet if cls._instance is not None else None
 
     async def cleanup(self) -> None:
         if self._lock_filename:
