@@ -45,6 +45,7 @@ from cassandra.policies import WhiteListRoundRobinPolicy  # type: ignore
 from test import TOP_SRC_DIR, TEST_DIR, asan_options, ubsan_options
 from test.pylib.driver_utils import safe_driver_shutdown, safe_shutting_down
 from test.pylib.internal_types import ServerNum, IPAddress, HostID, ServerInfo, ServerUpState
+from test.pylib.port_holders import describe_scylla_bind_failure
 from test.pylib.rest_client import ScyllaRESTAPIClient, HTTPError
 from test.pylib.util import async_rmtree, read_last_line, get_xdist_worker_id, scale_timeout_by_mode
 from test.pylib.version_fetch_utils import fetch_and_install_scylla_version
@@ -897,6 +898,7 @@ class ScyllaServer:
         # Reopen log file if it was closed (e.g., after a previous stop)
         if self.log_file is None or self.log_file.closed:
             self.log_file = self.log_filename.open("ab")  # append mode to preserve previous logs
+        log_offset = self.log_file.tell()
 
         self.cmd = await asyncio.create_subprocess_exec(
             self.exe,
@@ -915,11 +917,13 @@ class ScyllaServer:
         self.start_time = time.time()
         sleep_interval = 0.1
 
-        async def report_error(message: str) -> NoReturn:
+        async def report_error(message: str, details: Optional[str] = None) -> NoReturn:
             message += f", server_id {self.server_id}, IP {self.ip_addr}, workdir {self.workdir.name}"
             message += f", host_id {await self.try_get_host_id(api) or '<missing>'}"
             if expected_error is not None:
                 message += f", the node log was expected to contain the string [{expected_error}]"
+            if details:
+                message += f"\n{details}"
             self.logger.error(message)
             self.logger.error("last line of %s:\n%s", self.log_filename, read_last_line(self.log_filename))
             log_handler = logging.getLogger().handlers[0]
@@ -951,7 +955,7 @@ class ScyllaServer:
                             if re.search(expected_error, line):
                                 return
                         await report_error("the node startup failed, but the log file doesn't contain the expected error")
-                await report_error("failed to start the node")
+                await report_error("failed to start the node", describe_scylla_bind_failure(self.log_filename, log_offset))
             if await self.try_get_host_id(api):
                 if server_up_state == ServerUpState.PROCESS_STARTED:
                     server_up_state = ServerUpState.HOST_ID_QUERIED
