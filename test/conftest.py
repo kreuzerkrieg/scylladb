@@ -8,6 +8,7 @@ import _pytest
 import allure
 import pytest
 from test import TEST_RUNNER
+from test.pylib.port_holders import describe_address_in_use
 from test.pylib.report_plugin import ReportPlugin
 from test.pylib.skip_reason_plugin import SkipReasonPlugin
 from test.pylib.skip_types import SkipType
@@ -49,3 +50,11 @@ def pytest_configure(config: pytest.Config) -> None:
         allure.dynamic.label("skip_type", skip_type)
 
     config.pluginmanager.register(SkipReasonPlugin(SkipType, report_callback=_allure_report))
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_makereport(call: pytest.CallInfo) -> None:
+    # Runs right after the failing phase, while whatever held the address is usually still there.
+    outcome = yield
+    if call.excinfo is not None and (holders := describe_address_in_use(call.excinfo.value)):
+        outcome.get_result().sections.append(("Address already in use", holders))
