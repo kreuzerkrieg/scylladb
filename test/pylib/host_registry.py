@@ -8,12 +8,22 @@ import errno
 import fcntl
 import os
 import random
+import time
+from collections import deque
 from collections.abc import Iterator
+from dataclasses import dataclass
 from pathlib import Path
 from typing import NewType, Optional
 
 
 Host = NewType('Host', str)
+
+
+@dataclass
+class Lease:
+    user: str
+    leased_at: float
+    released_at: Optional[float] = None
 
 
 class HostRegistry:
@@ -94,6 +104,9 @@ class HostRegistry:
         # Limits the number of leased hosts to the number of usable 4th-octet values: lease #255 waits for a release.
         self._semaphore = asyncio.Semaphore(254)
 
+        # Names whoever used an address last when a bind on it fails (SCYLLADB-5288).
+        self._leases: dict[Host, deque[Lease]] = {}
+
     @classmethod
     def subnet_in_use(cls) -> Optional[str]:
         """The subnet this process leases hosts from, or None if it never created a registry (a call never creates one)."""
@@ -104,12 +117,22 @@ class HostRegistry:
             self._lock_filename.unlink()
             self._lock_filename = None
 
+    def leases(self, host: Host) -> list[Lease]:
+        """The last few leases of host, oldest first."""
+        return list(self._leases.get(host, ()))
+
     async def lease_host(self) -> Host:
         await self._semaphore.acquire()
         if self._released_hosts:
-            return self._released_hosts.pop(0)  # use the list as a FIFO queue
-        return next(self._new_hosts)
+            host = self._released_hosts.pop(0)  # use the list as a FIFO queue
+        else:
+            host = next(self._new_hosts)
+        user = os.environ.get('PYTEST_CURRENT_TEST', 'no test')
+        self._leases.setdefault(host, deque(maxlen=3)).append(Lease(user, time.time()))
+        return host
 
     async def release_host(self, host: Host) -> None:
+        if leases := self._leases.get(host):
+            leases[-1].released_at = time.time()
         self._released_hosts.append(host)
         self._semaphore.release()
