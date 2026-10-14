@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <vector>
 #include <seastar/core/sharded.hh>
+#include <seastar/util/bool_class.hh>
 #include "dht/i_partitioner_fwd.hh"
 #include "dht/token.hh"
 #include "schema/schema_fwd.hh"
@@ -42,6 +43,7 @@ class view_building_worker;
 }
 namespace service {
 class storage_service;
+using restore_repair = seastar::bool_class<class restore_repair_tag>;
 }
 namespace locator {
 class effective_replication_map;
@@ -164,7 +166,8 @@ public:
             sstring endpoint, sstring bucket, stream_scope scope, bool primary_replica);
 
     // Takes one backup location per datacenter the keyspace replicates to.
-    future<tasks::task_id> restore_tablets(table_id, sstring keyspace, sstring table, sstring snap_name, std::vector<tablet_restore_location> locations);
+    future<tasks::task_id> restore_tablets(table_id, sstring keyspace, sstring table, sstring snap_name, std::vector<tablet_restore_location> locations,
+            service::restore_repair repair);
 
     replica::database& local_db() {
         return _db.local();

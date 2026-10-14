@@ -149,6 +149,7 @@ using start_hint_manager = seastar::bool_class<class start_hint_manager_tag>;
 using loosen_constraints = seastar::bool_class<class loosen_constraints_tag>;
 using wait_balancer = seastar::bool_class<class wait_balancer_tag>;
 using remove_unset = seastar::bool_class<class remove_unset_tag>;
+using restore_repair = seastar::bool_class<class restore_repair_tag>;
 
 struct token_metadata_change {
     std::vector<locator::mutable_token_metadata_ptr> pending_token_metadata_ptr{this_smp_shard_count()};
@@ -1007,7 +1008,7 @@ public:
     future<> move_tablet(table_id, dht::token, locator::tablet_replica src, locator::tablet_replica dst, loosen_constraints force = loosen_constraints::no);
     future<> add_tablet_replica(table_id, dht::token, locator::tablet_replica dst, loosen_constraints force = loosen_constraints::no);
     future<> del_tablet_replica(table_id, dht::token, locator::tablet_replica dst, loosen_constraints force = loosen_constraints::no);
-    future<> restore_tablets(table_id, sstring snap_name);
+    future<> restore_tablets(table_id, sstring snap_name, restore_repair repair);
     future<> abort_restore_tablets(table_id);
     future<> set_tablet_balancing_enabled(bool);
 

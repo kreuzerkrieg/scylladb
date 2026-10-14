@@ -1266,6 +1266,7 @@ class sstables_loader::tablet_restore_task_impl : public tasks::task_manager::ta
     // back to them once the restore is done.
     std::optional<size_t> _original_min_tablet_count;
     std::optional<size_t> _original_max_tablet_count;
+    service::restore_repair _repair;
     tasks::task_manager::task::progress _progress;
     seastar::named_gate _gate{"progress_updater"};
     timer<seastar::lowres_clock> _progress_update_timer;
@@ -1292,7 +1293,7 @@ class sstables_loader::tablet_restore_task_impl : public tasks::task_manager::ta
 public:
     tablet_restore_task_impl(tasks::task_manager::module_ptr module, sharded<sstables_loader>& loader, sstring ks,
             table_id tid, sstring snap_name, manifest_summary ms,
-            std::optional<size_t> original_min_tablet_count, std::optional<size_t> original_max_tablet_count) noexcept
+            std::optional<size_t> original_min_tablet_count, std::optional<size_t> original_max_tablet_count, service::restore_repair repair) noexcept
         : tasks::task_manager::task::impl(module, tasks::task_id::create_random_id(), 0, "node", ks, "", "", tasks::task_id::create_null_id())
         , _loader(loader)
         , _tid(std::move(tid))
@@ -1300,6 +1301,7 @@ public:
         , _tablet_count(ms.tablet_count)
         , _original_min_tablet_count(original_min_tablet_count)
         , _original_max_tablet_count(original_max_tablet_count)
+        , _repair(repair)
         , _progress_update_timer([this] {
             if (auto gh = _gate.try_hold()) {
                 std::ignore = update_progress().finally([this, gh = std::move(*gh)] {
@@ -1359,7 +1361,7 @@ protected:
 
         std::exception_ptr eptr;
         try {
-            co_await loader._ss.local().restore_tablets(_tid, _snap_name);
+            co_await loader._ss.local().restore_tablets(_tid, _snap_name, _repair);
         } catch (...) {
             llog.error("Failed to restore tablets for table_id {}. Error: {:t}", _tid, std::current_exception());
             eptr = std::current_exception();
@@ -1412,7 +1414,8 @@ static void check_datacenter_coverage(const replica::table& t, const std::vector
     }
 }
 
-future<tasks::task_id> sstables_loader::restore_tablets(table_id tid, sstring keyspace, sstring table, sstring snap_name, std::vector<tablet_restore_location> locations) {
+future<tasks::task_id> sstables_loader::restore_tablets(table_id tid, sstring keyspace, sstring table, sstring snap_name, std::vector<tablet_restore_location> locations,
+        service::restore_repair repair) {
     if (!_db.local().find_column_family(tid).uses_tablets()) {
         throw std::invalid_argument(fmt::format("Table {}.{} does not use tablets", keyspace, table));
     }
@@ -1472,6 +1475,6 @@ future<tasks::task_id> sstables_loader::restore_tablets(table_id tid, sstring ke
     auto original_hints = original_schema->tablet_options();
 
     auto task = co_await _task_manager_module->make_and_start_task<tablet_restore_task_impl>(tasks::make_empty_task_info(), container(), keyspace, tid, std::move(snap_name), summary,
-            original_hints.min_tablet_count, original_hints.max_tablet_count);
+            original_hints.min_tablet_count, original_hints.max_tablet_count, repair);
     co_return task->id();
 }
