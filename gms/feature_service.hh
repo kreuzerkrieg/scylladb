@@ -200,6 +200,9 @@ public:
     gms::feature small_table_optimization_size_probe { *this, "SMALL_TABLE_OPTIMIZATION_SIZE_PROBE"sv };
     gms::feature alternator_composite_gsi_keys { *this, "ALTERNATOR_COMPOSITE_GSI_KEYS"sv };
     gms::feature cluster_config_registry_v0 { *this, "CLUSTER_CONFIG_REGISTRY_V0"sv };
+    // Gates repairing each tablet after tablet-aware restore. A restore-kind transition then
+    // passes through the repair stages, which every replica must recognize as being repaired.
+    gms::feature tablet_restore_repair { *this, "TABLET_RESTORE_REPAIR"sv };
 public:
 
     const std::unordered_map<sstring, std::reference_wrapper<feature>>& registered_features() const;
