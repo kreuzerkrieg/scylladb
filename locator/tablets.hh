@@ -337,6 +337,11 @@ struct tablet_transition_info {
                            sstring snapshot_name = {},
                            bool cancelled = false);
 
+    // In the stages of a tablet repair, which a restore transition passes through as well.
+    bool is_repairing() const noexcept {
+        return stage == tablet_transition_stage::repair || stage == tablet_transition_stage::end_repair;
+    }
+
     bool operator==(const tablet_transition_info&) const = default;
 };
 
