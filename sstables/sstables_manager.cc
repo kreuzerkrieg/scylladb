@@ -144,6 +144,8 @@ static const s3::group_connections default_group_connections = {
     {"service_levels", 128},
     {"main", 8},
     {"memtable", 16},
+    // Post-flush open_data() HEADs moved here from main, so main's cap: 8, SCT peak 1-2.
+    {"memtable_to_cache", 8},
     {"compaction", 16},
     {"maintenance_compaction", 16},
     {"streaming", 64},

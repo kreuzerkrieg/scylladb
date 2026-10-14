@@ -243,9 +243,9 @@ Tuning options
        group, as a map from the group name to a positive count. The key
        ``service_levels`` covers all service-level groups, which share one pool.
        Entries override the built-in values: ``service_levels: 128``,
-       ``main: 8``, ``memtable: 16``, ``compaction: 16``,
-       ``maintenance_compaction: 16``, ``streaming: 64``, ``backup: 32``,
-       ``maintenance: 16``. A group that has neither aborts the node on its
+       ``main: 8``, ``memtable: 16``, ``memtable_to_cache: 8``,
+       ``compaction: 16``, ``maintenance_compaction: 16``, ``streaming: 64``,
+       ``backup: 32``, ``maintenance: 16``. A group that has neither aborts the node on its
        first S3 request. Live-updateable; removing an entry keeps the cap of a
        pool that already exists. The GCS backend ignores this option.
    * - ``object_storage_connections_per_shard``
