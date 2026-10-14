@@ -6350,13 +6350,22 @@ future<> storage_service::abort_restore_tablets(table_id table) {
         auto builder = tablet_mutation_builder_for_base_table(guard.write_timestamp(), table);
         co_await tmap.for_each_tablet([&] (locator::tablet_id tid, const locator::tablet_info& info) -> future<> {
             auto* trinfo = tmap.get_tablet_transition_info(tid);
-            if (!trinfo || trinfo->transition != locator::tablet_transition_kind::restore || !trinfo->session_id) {
+            if (!trinfo || trinfo->transition != locator::tablet_transition_kind::restore) {
                 co_return;
             }
             auto last_token = tmap.get_last_token(tid);
-            // Deleting the session aborts the restore: see the restore handling in the
-            // topology coordinator.
-            builder.del_session(last_token);
+            if (trinfo->session_id) {
+                // Deleting the session aborts the restore, or the repair that follows it: see
+                // the restore and repair handling in the topology coordinator.
+                builder.del_session(last_token);
+            }
+            // A failed repair keeps its request, and the load balancer would then repair the
+            // tablet again after the restore was aborted.
+            bool repairing = trinfo->stage == locator::tablet_transition_stage::repair
+                    || trinfo->stage == locator::tablet_transition_stage::end_repair;
+            if (repairing && info.repair_task_info) {
+                builder.del_repair_task_info(last_token, _feature_service);
+            }
         });
 
         co_await updates.add(builder.build());

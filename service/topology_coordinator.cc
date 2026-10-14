@@ -2164,13 +2164,18 @@ class topology_coordinator : public endpoint_lifecycle_subscriber
             }
         }
 
-        // Build table_id -> request_id mapping for ongoing restore requests
-        // so that we can find the owning request when a restore transition fails.
-        std::unordered_map<table_id, utils::UUID> restore_request_for_table;
+        // Build table_id -> request mapping for ongoing restore requests, so that we can
+        // find the owning request when a restore transition fails, and whether it repairs
+        // each tablet once the tablet is restored.
+        struct restore_request_info {
+            utils::UUID id;
+            bool repair;
+        };
+        std::unordered_map<table_id, restore_request_info> restore_request_for_table;
         for (const auto& req_id : _topo_sm._topology.ongoing_restore_requests) {
             auto req_entry = co_await _sys_ks.get_topology_request_entry(req_id);
             if (req_entry.restore_table_id) {
-                restore_request_for_table[*req_entry.restore_table_id] = req_id;
+                restore_request_for_table[*req_entry.restore_table_id] = {req_id, req_entry.restore_repair};
             }
         }
 
@@ -2632,6 +2637,10 @@ class topology_coordinator : public endpoint_lifecycle_subscriber
                         if (do_barrier()) {
                             auto& tinfo = tmap.get_tablet_info(gid.tablet);
                             _tablet_ops_metrics.inc_failed(tinfo.repair_task_info ? tinfo.repair_task_info->request_type : locator::tablet_task_type::none);
+                            if (trinfo.transition == locator::tablet_transition_kind::restore) {
+                                rtlogger.warn("Repair of tablet {} after restoring it failed. The restore completes without it; the tablet "
+                                        "keeps its repair request and is repaired again later", gid);
+                            }
                             get_mutation_builder()
                                     .set_stage(last_token, locator::tablet_transition_stage::end_repair)
                                     .del_session(last_token);
@@ -2746,7 +2755,7 @@ class topology_coordinator : public endpoint_lifecycle_subscriber
                         // Record error on the ongoing restore request so it's propagated to the caller.
                         if (auto it = restore_request_for_table.find(gid.table); it != restore_request_for_table.end()) {
                             updates.add(
-                                topology_request_tracking_mutation_builder(it->second)
+                                topology_request_tracking_mutation_builder(it->second.id)
                                     .set("error", format("Restore failed for tablet {}: {:t}", gid, ep))
                                     .build());
                         }
@@ -2773,6 +2782,24 @@ class topology_coordinator : public endpoint_lifecycle_subscriber
                             rtlogger.debug("Tablet {} restored on {}", gid, r.host);
                         });
                     })) {
+                        if (auto it = restore_request_for_table.find(gid.table); it != restore_request_for_table.end() && it->second.repair) {
+                            // The transition kind stays restore, so the restore request stays open
+                            // until the repair finishes. All tablets of one restore share the request
+                            // id as their repair task id, which makes them a single repair task.
+                            auto repair_task_info = locator::tablet_task_info::make_user_repair_request({}, {},
+                                    locator::tablet_repair_incremental_mode::incremental);
+                            repair_task_info.tablet_task_id = locator::tablet_task_id(it->second.id);
+                            repair_task_info.sched_nr++;
+                            repair_task_info.sched_time = db_clock::now();
+                            rtlogger.debug("Tablet {} restored, repairing it as tablet repair task {}", gid, repair_task_info.tablet_task_id);
+                            _tablets.erase(gid);
+                            get_mutation_builder()
+                                    .del_snapshot_name(last_token)
+                                    .set_stage(last_token, locator::tablet_transition_stage::repair)
+                                    .set_repair_task_info(last_token, repair_task_info, _feature_service)
+                                    .set_session(last_token, session_id(utils::UUID_gen::get_time_UUID()));
+                            break;
+                        }
                         rtlogger.debug("Clearing restore transition for {}", gid);
                         _tablets.erase(gid);
                         get_mutation_builder().del_transition(last_token).del_snapshot_name(last_token).del_session(last_token);
