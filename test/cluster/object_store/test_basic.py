@@ -387,6 +387,42 @@ async def get_object_storage_written_bytes(server_ip, storage_type: str) -> floa
     return written
 
 
+async def get_object_storage_read_bytes(server_ip, storage_type: str) -> float:
+    label = storage_type.lower()
+    metrics = await ScyllaMetricsClient().query(server_ip)
+    read = metrics.get('scylla_object_storage_total_read_bytes', {'type': label})
+    assert read is not None, f'No scylla_object_storage_total_read_bytes for type={label}'
+    return read
+
+
+async def test_point_read_fetches_only_the_partition(manager: ScyllaClusterManager, object_storage):
+    '''A point read in the middle of a Data component fetches about the partition's
+    bytes, not everything up to the download source's chunk size (SCYLLADB-5592)'''
+    objconf = object_storage.create_endpoint_conf()
+    server = await manager.server_add(config={'object_storage_endpoints': objconf})
+    cql = manager.get_cql()
+
+    async with new_test_keyspace(manager, keyspace_options(object_storage)) as ks:
+        # One tablet, so a single flush leaves one sstable, larger than the 8 MiB GCS download chunk.
+        await cql.run_async(f"CREATE TABLE {ks}.test (pk int PRIMARY KEY, value blob) WITH tablets = {{'max_tablet_count': 1}};")
+        insert = cql.prepare(f"INSERT INTO {ks}.test (pk, value) VALUES (?, ?)")
+        rows = 12000
+        for start in range(0, rows, 500):
+            await asyncio.gather(*[cql.run_async(insert, [k, os.urandom(1024)]) for k in range(start, min(start + 500, rows))])
+        await manager.api.flush_keyspace(server.ip_addr, ks)
+
+        keys = [r.pk for r in cql.execute(f"SELECT pk FROM {ks}.test BYPASS CACHE")]
+        assert len(keys) == rows
+        # The first partition sits at offset 0, which still takes the download source.
+        key = keys[len(keys) // 2]
+
+        before = await get_object_storage_read_bytes(server.ip_addr, object_storage.type)
+        res = cql.execute(f"SELECT pk FROM {ks}.test WHERE pk = {key} BYPASS CACHE").one()
+        assert res.pk == key
+        fetched = await get_object_storage_read_bytes(server.ip_addr, object_storage.type) - before
+        assert fetched < 1024 * 1024, f'A point read of a 1 KiB partition fetched {fetched} bytes'
+
+
 async def test_create_keyspace_after_config_update(manager: ScyllaClusterManager, object_storage):
     print('Trying to create a keyspace with an endpoint not configured in object_storage_endpoints should trip storage_manager::is_known_endpoint()')
     server = await manager.server_add()
