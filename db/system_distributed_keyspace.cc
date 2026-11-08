@@ -716,7 +716,7 @@ future<snapshot_sstables_progress> snapshot_table_helper::get_snapshot_sstables_
             progress.nr_downloaded_sstables++;
         }
         return make_ready_future<stop_iteration>(stop_iteration::no);
-    }, internal_distributed_query_state());
+    });
     co_return progress;
 }
 
