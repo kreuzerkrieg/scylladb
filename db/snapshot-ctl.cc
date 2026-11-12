@@ -407,6 +407,26 @@ future<tasks::task_id> snapshot_ctl::start_global_backup(std::unordered_map<sstr
         }
     }
 
+    // An existing snapshot is backed up as it is, so it must hold every table named here.
+    // Tables that come from a whole keyspace are not checked: some may be newer than the snapshot.
+    snapshot_table_helper sth(_qp.local());
+    const bool names_tables = std::ranges::any_of(requested | std::views::values, std::not_fn(&sstring::empty));
+    if (const auto committed_name = names_tables ? co_await sth.find_committed_snapshot_name(tag) : std::nullopt) {
+        std::set<std::pair<sstring, sstring>> in_snapshot;
+        for (const auto& t : co_await sth.get_snapshot_tables(*committed_name)) {
+            in_snapshot.emplace(t.keyspace_name, t.table_name);
+        }
+        std::vector<sstring> missing;
+        for (const auto& [ks_name, table] : requested) {
+            if (!table.empty() && !in_snapshot.contains({ks_name, table})) {
+                missing.push_back(format("{}.{}", ks_name, table));
+            }
+        }
+        if (!missing.empty()) {
+            throw std::invalid_argument(fmt::format("Snapshot {} does not contain {}", tag, fmt::join(missing, ", ")));
+        }
+    }
+
     // A set, as a table can be named both on its own and through its keyspace.
     std::set<std::pair<sstring, sstring>> tables;
 
