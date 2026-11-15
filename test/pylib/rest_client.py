@@ -457,7 +457,7 @@ class ScyllaRESTAPIClient:
         return await self.client.post_json(f"/storage_service/restore", host=node_ip, params=params, json=sstables)
 
     async def restore_tablets(self, node_ip: str, ks: str, cf: str, snap: str, datacenter: str, endpoint: str, bucket: str, manifests = None, prefix: str = '',
-                              source_ks: Optional[str] = None, source_cf: Optional[str] = None) -> str:
+                              source_ks: Optional[str] = None, source_cf: Optional[str] = None, repair: Optional[str] = None) -> str:
         """Restore tablets from a single backup location. Without manifests, the node finds the manifest by the snapshot name."""
         backup_location = [
             {
@@ -468,10 +468,11 @@ class ScyllaRESTAPIClient:
                 **({"manifests": manifests} if manifests is not None else {}),
             }
         ]
-        return await self.restore_tablets_multidc(node_ip, ks, cf, snap, backup_location, source_ks, source_cf)
+        return await self.restore_tablets_multidc(node_ip, ks, cf, snap, backup_location, source_ks, source_cf, repair=repair)
 
     async def restore_tablets_multidc(self, node_ip: str, ks: str, cf: str, snap: str, locations: list[dict],
-                                      source_ks: Optional[str] = None, source_cf: Optional[str] = None) -> str:
+                                      source_ks: Optional[str] = None, source_cf: Optional[str] = None,
+                                      repair: Optional[str] = None) -> str:
         """Restore tablets from a list of per-datacenter backup locations"""
         params = {
             "keyspace": ks,
@@ -480,6 +481,8 @@ class ScyllaRESTAPIClient:
             **({"source_keyspace": source_ks} if source_ks is not None else {}),
             **({"source_table": source_cf} if source_cf is not None else {}),
         }
+        if repair is not None:
+            params["repair"] = repair
         return await self.client.post_json(f"/storage_service/tablets/restore", host=node_ip, params=params, json=locations)
 
     async def take_snapshot(self, node_ip: str, ks: str, tag: str, tables: list[str] = None, ttl: Optional[str] = None) -> None:
