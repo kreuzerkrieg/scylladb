@@ -23,6 +23,10 @@ static auto format_url(std::string_view host, unsigned port, bool use_https) {
     return fmt::format("{}://{}:{}", use_https ? "https" : "http", host, port);
 }
 
+static std::string bucket_member(const std::string& bucket) {
+    return bucket.empty() ? "" : fmt::format(", \"bucket\": \"{}\"", bucket);
+}
+
 db::object_storage_endpoint_param::object_storage_endpoint_param(s3_storage s)
     : _data(std::move(s))
 {}
@@ -38,19 +42,19 @@ db::object_storage_endpoint_param::object_storage_endpoint_param(const object_st
 
 std::string db::object_storage_endpoint_param::s3_storage::to_json_string() const {
     if (!name.empty()) {
-        return fmt::format("{{ \"type\": \"s3\", \"uri\": \"{}\", \"aws_region\": \"{}\", \"iam_role_arn\": \"{}\" }}",
-            endpoint, region, iam_role_arn
+        return fmt::format("{{ \"type\": \"s3\", \"uri\": \"{}\", \"aws_region\": \"{}\", \"iam_role_arn\": \"{}\"{} }}",
+            endpoint, region, iam_role_arn, bucket_member(bucket)
         );
     }
     if (!legacy_format) {
-        return fmt::format("{{ \"type\": \"s3\", \"aws_region\": \"{}\", \"iam_role_arn\": \"{}\" }}",
-            region, iam_role_arn
+        return fmt::format("{{ \"type\": \"s3\", \"aws_region\": \"{}\", \"iam_role_arn\": \"{}\"{} }}",
+            region, iam_role_arn, bucket_member(bucket)
         );
     }
 
     auto url = utils::http::parse_simple_url(endpoint);
-    return fmt::format("{{ \"port\": {}, \"use_https\": {}, \"aws_region\": \"{}\", \"iam_role_arn\": \"{}\" }}",
-        url.port, url.is_https(), region, iam_role_arn
+    return fmt::format("{{ \"port\": {}, \"use_https\": {}, \"aws_region\": \"{}\", \"iam_role_arn\": \"{}\"{} }}",
+        url.port, url.is_https(), region, iam_role_arn, bucket_member(bucket)
     );
 }
 
@@ -72,12 +76,12 @@ std::string db::object_storage_endpoint_param::s3_storage::key() const {
 
 std::string db::object_storage_endpoint_param::gs_storage::to_json_string() const {
     if (!name.empty()) {
-        return fmt::format("{{ \"type\": \"gs\", \"uri\": \"{}\", \"credentials_file\": \"{}\" }}",
-            endpoint, credentials_file
+        return fmt::format("{{ \"type\": \"gs\", \"uri\": \"{}\", \"credentials_file\": \"{}\"{} }}",
+            endpoint, credentials_file, bucket_member(bucket)
         );
     }
-    return fmt::format("{{ \"type\": \"gs\", \"credentials_file\": \"{}\" }}",
-        credentials_file
+    return fmt::format("{{ \"type\": \"gs\", \"credentials_file\": \"{}\"{} }}",
+        credentials_file, bucket_member(bucket)
     );
 }
 
@@ -169,6 +173,7 @@ db::object_storage_endpoint_param db::object_storage_endpoint_param::decode(cons
             throw std::invalid_argument(fmt::format("Endpoint {} has no region, set aws_region or AWS_DEFAULT_REGION", ep.endpoint));
         }
         ep.iam_role_arn = get_opt(node, "iam_role_arn", ""s);
+        ep.bucket = get_opt(node, "bucket", ""s);
 
         return object_storage_endpoint_param{std::move(ep)};
     }
@@ -181,6 +186,7 @@ db::object_storage_endpoint_param db::object_storage_endpoint_param::decode(cons
             ep.endpoint = uri.as<std::string>();
         }
         ep.credentials_file = get_opt(node, "credentials_file", ""s);
+        ep.bucket = get_opt(node, "bucket", ""s);
 
         return object_storage_endpoint_param(std::move(ep));
     }

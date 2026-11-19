@@ -30,6 +30,8 @@ public:
         bool legacy_format; // FIXME convert it to bool_class after seastar#3198
         // Set when the entry gives its address in `uri`; the entry is then looked up by this name.
         std::string name;
+        // Where a keyspace that names no bucket of its own keeps its data. Optional.
+        std::string bucket;
 
         std::strong_ordering operator<=>(const s3_storage&) const = default;
         std::string to_json_string() const;
@@ -40,6 +42,8 @@ public:
         std::string credentials_file; // optional
         // Set when the entry gives its address in `uri`; the entry is then looked up by this name.
         std::string name;
+        // Where a keyspace that names no bucket of its own keeps its data. Optional.
+        std::string bucket;
 
         std::strong_ordering operator<=>(const gs_storage&) const = default;
         std::string to_json_string() const;
