@@ -40,6 +40,18 @@ UPDATE system.config SET value = '[{"name": "http://127.0.0.1:9000", "aws_region
     WHERE name = 'object_storage_endpoints';
 ```
 
+An entry can have a `uri`. The client then connects to the `uri`, and the
+`name` is only the key that a keyspace refers to:
+```yaml
+object_storage_endpoints:
+  - name: primary
+    uri: https://s3.us-east-1.amazonaws.com:443
+    aws_region: us-east-1
+```
+The `storage_manager` keeps one client per address. Entries with the same `uri`
+share it, and each entry has a forwarding client that follows a change of its
+`uri` in a live configuration update.
+
 ## Configuring GCP storage access
 
 Similarly to AWS, define endpoint details in `scylla.yaml` like:
