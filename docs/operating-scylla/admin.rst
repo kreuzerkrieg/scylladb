@@ -213,6 +213,54 @@ ScyllaDB closes the connections to it, and reads from the sstables that are
 already open fail until the node opens them again. Restart the node after you
 change a ``uri``. ScyllaDB does not move the data.
 
+.. _admin-object-storage-cql:
+
+Setting the endpoints with CQL
+==============================
+
+You can set the endpoint list with CQL, with no change to ``scylla.yaml``. The
+list is the :doc:`cluster configuration </cql/cluster-config>` option
+``object_storage_endpoints``. Its value is a JSON list with the same entries as
+in ``scylla.yaml``, on one line:
+
+.. code-block:: cql
+
+   ALTER CLUSTER WITH object_storage_endpoints =
+     '[{"name": "store", "type": "s3", "uri": "https://s3.us-east-1.amazonaws.com", "aws_region": "us-east-1"}]';
+
+You can set the option for the cluster, a datacenter, a rack or a node. Use the
+same name with a different ``uri`` in each datacenter to let each datacenter
+use the storage of its own region:
+
+.. code-block:: cql
+
+   ALTER DATACENTER dc1 WITH object_storage_endpoints =
+     '[{"name": "store", "type": "s3", "uri": "https://s3.us-east-1.amazonaws.com", "aws_region": "us-east-1"}]';
+   ALTER DATACENTER dc2 WITH object_storage_endpoints =
+     '[{"name": "store", "type": "s3", "uri": "https://s3.eu-west-1.amazonaws.com", "aws_region": "eu-west-1"}]';
+
+Obey these rules:
+
+* The list that applies to a node replaces the ``object_storage_endpoints``
+  list of its ``scylla.yaml``. ScyllaDB does not merge the two lists, and does
+  not merge the lists of different scopes: the node uses the list of the
+  narrowest scope that has one.
+* ScyllaDB rejects a value in which an entry is not valid. Give ``aws_region``
+  in each S3 entry: a node does not accept an S3 entry with no region unless
+  its own ``AWS_DEFAULT_REGION`` is set.
+* ``credentials_file`` is a path on each node.
+* Before you create a keyspace on an endpoint, make sure that the nodes of
+  every datacenter have an endpoint with that name. ScyllaDB checks the name
+  only on the node that receives the ``CREATE KEYSPACE`` statement.
+* ``= NULL`` removes the list of that scope. Do not remove an endpoint that a
+  keyspace uses.
+
+To see the endpoints that a node uses, query ``system.config`` on that node:
+
+.. code-block:: cql
+
+   SELECT source, value FROM system.config WHERE name = 'object_storage_endpoints';
+
 S3 credentials
 ==============
 

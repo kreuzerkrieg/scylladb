@@ -259,3 +259,12 @@ node's own value on every node it applies to:
      - The goal for the maximum number of tablet replicas per shard that the tablet load balancer
        tries to keep; see :doc:`Tablets </architecture/tablets>`. Range: 1 to 4294967295. Without
        a stored value, each node uses its ``scylla.yaml`` value (default ``100``).
+   * - ``object_storage_endpoints``
+     - text
+     - ``CLUSTER``, ``DATACENTER``, ``RACK``, ``NODE``
+     - The object storage endpoints the node can use, as a JSON list of the entries that
+       ``scylla.yaml`` takes, on one line and at most 4096 bytes long. The list replaces the
+       node's ``scylla.yaml`` list as a whole, and a list at a narrower scope replaces the list of
+       a broader one; entries are not merged. See
+       :ref:`Configuring Object Storage <admin-object-storage-cql>`. Without a stored value, each
+       node uses its ``scylla.yaml`` list.
