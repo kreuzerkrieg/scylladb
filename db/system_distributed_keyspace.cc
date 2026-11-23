@@ -1484,6 +1484,26 @@ future<> snapshot_table_helper::delete_snapshot_schema_rows(std::string_view sna
     });
 }
 
+future<> snapshot_table_helper::delete_snapshot_table_schema_row(std::string_view snapshot_name, std::string_view ks, std::string_view table,
+        int64_t write_timestamp, db::consistency_level cl) {
+    static const sstring table_query = format("DELETE FROM {}.{} USING TIMESTAMP ? WHERE snapshot_name = ? AND keyspace_name = ? AND table_name = ?",
+            system_distributed_keyspace::NAME, system_distributed_keyspace::SNAPSHOT_TABLES);
+    static const sstring keyspace_query = format("DELETE FROM {}.{} USING TIMESTAMP ? WHERE snapshot_name = ? AND keyspace_name = ?",
+            system_distributed_keyspace::NAME, system_distributed_keyspace::SNAPSHOT_KEYSPACES);
+    co_await _qp.execute_internal(
+            table_query,
+            cl, internal_distributed_query_state(),
+            { write_timestamp, sstring(snapshot_name), sstring(ks), sstring(table) },
+            cql3::query_processor::cache_internal::yes).discard_result();
+    if ((co_await get_snapshot_tables(snapshot_name, ks, {}, cl)).empty()) {
+        co_await _qp.execute_internal(
+                keyspace_query,
+                cl, internal_distributed_query_state(),
+                { write_timestamp, sstring(snapshot_name), sstring(ks) },
+                cql3::query_processor::cache_internal::yes).discard_result();
+    }
+}
+
 future<> snapshot_table_helper::delete_snapshot_nodes_rows(std::string_view snapshot_name, int64_t write_timestamp, db::consistency_level cl) {
     static const sstring query = format("DELETE FROM {}.{} USING TIMESTAMP ? WHERE snapshot_name = ?",
             system_distributed_keyspace::NAME, system_distributed_keyspace::SNAPSHOT_NODES);

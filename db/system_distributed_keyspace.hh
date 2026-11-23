@@ -218,6 +218,11 @@ public:
     future<> delete_snapshot_schema_rows(std::string_view snapshot_name, int64_t write_timestamp,
             db::consistency_level cl = db::consistency_level::QUORUM);
 
+    /* Deletes the snapshot_tables row of one table, and the snapshot_keyspaces
+     * row of its keyspace when that was the keyspace's last table. */
+    future<> delete_snapshot_table_schema_row(std::string_view snapshot_name, std::string_view ks, std::string_view table, int64_t write_timestamp,
+            db::consistency_level cl = db::consistency_level::QUORUM);
+
     /* Deletes one name's snapshot_nodes partition with a tombstone at the
      * given timestamp. The rows have no regular column to read a write
      * timestamp from, so the caller picks it; nothing writes under a failed
