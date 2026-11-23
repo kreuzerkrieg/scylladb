@@ -64,7 +64,10 @@ backup_sstables(db::snapshot_ctl&, table_id table_id, std::string tag, std::stri
 // the tag is unknown, when its marker names no attempt, when it is backed up
 // or left by a failed attempt and `force` is not set, or when a backup of it
 // is in progress.
+// With `table`, a (keyspace, table) pair, it clears that table alone and the
+// snapshot keeps its other tables. Clearing the last table clears the snapshot.
 future<tasks::task_id>
-start_cluster_clear_snapshot(db::snapshot_ctl&, tasks::task_manager::module_ptr, std::string snapshot_name, bool force);
+start_cluster_clear_snapshot(db::snapshot_ctl&, tasks::task_manager::module_ptr, std::string snapshot_name, bool force,
+        std::optional<std::pair<sstring, sstring>> table = std::nullopt);
 
 }
