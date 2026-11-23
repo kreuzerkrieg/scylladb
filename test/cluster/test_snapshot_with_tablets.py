@@ -3,12 +3,16 @@
 #
 # SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
 #
+import asyncio
 import logging
 import os
 import json
 
+import pytest
+
 from test.pylib.scylla_cluster_manager import ScyllaClusterManager
 from test.pylib.internal_types import ServerInfo
+from test.pylib.rest_client import HTTPError
 from test.cluster.object_store.test_backup import do_test_snapshot_on_all_nodes, create_cluster, topo
 from test.cluster.util import new_test_keyspace, new_test_table
 from test.pylib.util import unique_name
@@ -130,3 +134,79 @@ async def test_list_cluster_snapshots(manager: ScyllaClusterManager):
                 }
                 assert all(snapshot['created_at'] for snapshot in snapshots)
 
+
+async def test_clear_cluster_snapshot_table(manager: ScyllaClusterManager):
+    """
+    Tests that clearing one table of a cluster snapshot removes that table's
+    snapshot directories and catalog rows on every node and keeps the other
+    table, and that clearing the last table clears the snapshot.
+    """
+    servers, _ = await create_cluster(topo(rf=3, nodes=3, racks=3, dcs=1), manager, logger)
+    cql = manager.get_cql()
+
+    def listed(snapshots):
+        return {s['tag']: {(t['keyspace'], t['table']) for t in s['tables']} for s in snapshots}
+
+    async def clear(tag, ks, cf):
+        tid = await manager.api.clear_cluster_snapshot(servers[0].ip_addr, tag, keyspace=ks, table=cf)
+        status = await manager.api.wait_task(servers[0].ip_addr, tid)
+        assert status is not None and status.get('state') == 'done', f'Clear of {ks}.{cf} in {tag}: {status}'
+
+    async def snapshot_dirs(ks, cf, tag):
+        paths = [await get_snapshot_path(manager, s, ks, cf, tag) for s in servers]
+        return [p for p in paths if os.path.isdir(p)]
+
+    def catalog_rows(name, ks, cf):
+        rows = list(cql.execute(f"SELECT * FROM system_distributed.snapshot_tables WHERE snapshot_name = '{name}'"
+                                f" AND keyspace_name = '{ks}' AND table_name = '{cf}'"))
+        for s in servers:
+            rows += list(cql.execute(f"SELECT * FROM system_distributed.snapshot_sstables WHERE snapshot_name = '{name}'"
+                                     f" AND \"keyspace\" = '{ks}' AND \"table\" = '{cf}'"
+                                     f" AND datacenter = '{s.datacenter}' AND rack = '{s.rack}'"))
+            rows += list(cql.execute(f"SELECT * FROM system_distributed.snapshot_tablets WHERE snapshot_name = '{name}'"
+                                     f" AND keyspace_name = '{ks}' AND table_name = '{cf}' AND datacenter = '{s.datacenter}'"))
+        return rows
+
+    async with new_test_keyspace(manager, "WITH REPLICATION = { 'replication_factor' : 3 } AND tablets = { 'initial': 2 }") as ks:
+        async with new_test_table(manager, ks, "pk int primary key") as t1, new_test_table(manager, ks, "pk int primary key") as t2:
+            cf1, cf2 = t1.split('.')[1], t2.split('.')[1]
+            for t in (t1, t2):
+                await asyncio.gather(*(cql.run_async(f"INSERT INTO {t} (pk) VALUES ({i})") for i in range(20)))
+            await asyncio.gather(*(manager.api.flush_keyspace(s.ip_addr, ks) for s in servers))
+
+            tag = unique_name('snap_')
+            await manager.api.take_cluster_snapshot(servers[0].ip_addr, ks, tag=tag)
+            attempts = list(cql.execute(f"SELECT attempt, committed FROM system_distributed.snapshot_attempts WHERE tag = '{tag}'"))
+            assert [r.committed for r in attempts] == [True]
+            name = f'{tag}/{attempts[0].attempt}'
+            for cf in (cf1, cf2):
+                assert len(await snapshot_dirs(ks, cf, tag)) == len(servers)
+                assert catalog_rows(name, ks, cf)
+
+            with pytest.raises(HTTPError, match='has no table') as e:
+                await manager.api.clear_cluster_snapshot(servers[0].ip_addr, tag, keyspace=ks, table='no_such_table')
+            assert e.value.code == 400
+            with pytest.raises(HTTPError, match='must be given together') as e:
+                await manager.api.clear_cluster_snapshot(servers[0].ip_addr, tag, table=cf1)
+            assert e.value.code == 400
+
+            await clear(tag, ks, cf1)
+
+            assert not await snapshot_dirs(ks, cf1, tag), f'A snapshot directory of {cf1} survived the clear'
+            assert not catalog_rows(name, ks, cf1), f'Catalog rows of {cf1} survived the clear'
+            assert len(await snapshot_dirs(ks, cf2, tag)) == len(servers)
+            assert catalog_rows(name, ks, cf2)
+            assert [r.committed for r in cql.execute(
+                f"SELECT committed FROM system_distributed.snapshot_attempts WHERE tag = '{tag}'")] == [True]
+            for s in servers:
+                assert listed(await manager.api.list_cluster_snapshots(s.ip_addr)) == {tag: {(ks, cf2)}}
+
+            await clear(tag, ks, cf2)
+
+            assert not await snapshot_dirs(ks, cf2, tag), f'A snapshot directory of {cf2} survived the clear'
+            assert not catalog_rows(name, ks, cf2), f'Catalog rows of {cf2} survived the clear'
+            assert not list(cql.execute(f"SELECT * FROM system_distributed.snapshots WHERE name = '{tag}'"))
+            assert not list(cql.execute(f"SELECT * FROM system_distributed.snapshot_attempts WHERE tag = '{tag}'"))
+            assert not list(cql.execute(f"SELECT * FROM system_distributed.snapshot_nodes WHERE snapshot_name = '{name}'"))
+            for s in servers:
+                assert await manager.api.list_cluster_snapshots(s.ip_addr) == []
