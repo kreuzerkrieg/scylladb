@@ -568,15 +568,40 @@ static future<clear_snapshot_state> read_clear_snapshot_state(db::snapshot_table
     co_return state;
 }
 
+// The attempt that holds the snapshot of a committed tag. A clear of one table
+// uncommits it while it runs, so when such a clear failed, the marker is left
+// with no committed attempt. The holder is then the newest attempt: a tag in
+// the catalog takes no new attempt, and the attempts that failed before the
+// commit are older.
+static std::optional<utils::UUID> snapshot_holder_attempt(const clear_snapshot_state& state) {
+    std::optional<utils::UUID> holder;
+    for (const auto& n : state.names) {
+        if (n.committed) {
+            return n.attempt;
+        }
+        if (state.marker && (!holder || utils::timeuuid_tri_compare(n.attempt, *holder) > 0)) {
+            holder = n.attempt;
+        }
+    }
+    return holder;
+}
+
 // Narrows the clear to one table of the tag, the rest of the snapshot stays.
 // Returns false when the tag has no other table, so the whole snapshot goes.
 // Throws std::invalid_argument when the tag does not have the table.
 static bool narrow_clear_to_table(clear_snapshot_state& state, const std::string& tag, const std::pair<sstring, sstring>& table) {
+    // Whether other tables remain is decided by the attempt holding the snapshot:
+    // the rows a failed attempt left for another table do not keep the snapshot.
+    const auto holder = snapshot_holder_attempt(state);
     bool found = false;
     bool others = false;
     for (const auto& n : state.names) {
         for (const auto& t : n.tables) {
-            (t == table ? found : others) = true;
+            if (t == table) {
+                found = true;
+            } else if (!holder || n.attempt == *holder) {
+                others = true;
+            }
         }
     }
     if (!found) {
@@ -631,6 +656,7 @@ static future<> do_cluster_clear_snapshot(db::snapshot_ctl& snap_ctl, const task
 
     auto state = co_await read_clear_snapshot_state(sth, tag);
     check_clear_snapshot_preconditions(module, state, tag, force);
+    const auto holder = snapshot_holder_attempt(state);
     const bool one_table = table && narrow_clear_to_table(state, tag, *table);
 
     auto& db = snap_ctl.db().local();
@@ -658,10 +684,9 @@ static future<> do_cluster_clear_snapshot(db::snapshot_ctl& snap_ctl, const task
 
     // Uncommit the tag, blocks backups from being taken
     // FIXME: not necessary once backup and clearsnapshot become topology operations
-    // A clear of one table leaves the tag committed: its other tables stay
-    // usable, also when the clear fails halfway and is run again.
+    // A clear of one table commits the tag again when it is done.
     for (const auto& n : state.names) {
-        if (n.committed && !one_table) {
+        if (n.committed) {
             co_await sth.insert_snapshot_attempt(tag, n.attempt, db::snapshot_attempt_committed::no);
         }
     }
@@ -769,6 +794,9 @@ static future<> do_cluster_clear_snapshot(db::snapshot_ctl& snap_ctl, const task
     }
 
     if (one_table) {
+        if (holder) {
+            co_await sth.insert_snapshot_attempt(tag, *holder, db::snapshot_attempt_committed::yes);
+        }
         total_progress.completed += 1;
         snap_log.info("Cleared table {}.{} of snapshot '{}'", table->first, table->second, tag);
         co_return;

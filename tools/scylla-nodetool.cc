@@ -2611,6 +2611,40 @@ end: {}
     }
 }
 
+void cluster_listsnapshots_operation(scylla_rest_client& client, const bpo::variables_map& vm) {
+    const auto snapshots = client.get("/storage_service/tablets/snapshots");
+
+    if (snapshots.GetArray().Empty()) {
+        fmt::print(std::cout, "There are no cluster snapshots\n");
+        return;
+    }
+
+    std::array<std::string, 4> header_row{"Snapshot name", "Created at", "Keyspace name", "Table name"};
+    std::vector<std::array<std::string, 4>> rows;
+    for (const auto& snapshot : snapshots.GetArray()) {
+        const auto tag = std::string(rjson::to_string_view(snapshot["tag"]));
+        const auto created_at = std::string(rjson::to_string_view(snapshot["created_at"]));
+        for (const auto& table : snapshot["tables"].GetArray()) {
+            rows.push_back({tag, created_at, std::string(rjson::to_string_view(table["keyspace"])), std::string(rjson::to_string_view(table["table"]))});
+        }
+    }
+
+    std::array<size_t, 4> width{};
+    for (size_t c = 0; c < header_row.size(); ++c) {
+        width[c] = header_row[c].size();
+        for (const auto& r : rows) {
+            width[c] = std::max(width[c], r[c].size());
+        }
+    }
+    auto print_row = [&] (const std::array<std::string, 4>& r) {
+        fmt::print(std::cout, "{:<{}} {:<{}} {:<{}} {:<{}}\n", r[0], width[0], r[1], width[1], r[2], width[2], r[3], width[3]);
+    };
+    print_row(header_row);
+    for (const auto& r : rows) {
+        print_row(r);
+    }
+}
+
 void cluster_clearsnapshot_operation(scylla_rest_client& client, const bpo::variables_map& vm) {
     if (!vm.contains("tag")) {
         throw std::invalid_argument("Missing required parameter \"tag\"");
@@ -2620,11 +2654,22 @@ void cluster_clearsnapshot_operation(scylla_rest_client& client, const bpo::vari
     if (vm.contains("force")) {
         params["force"] = "true";
     }
+    if (vm.contains("keyspace") != vm.contains("table")) {
+        throw std::invalid_argument("keyspace and table must be given together");
+    }
+    if (vm.contains("table")) {
+        params["keyspace"] = vm["keyspace"].as<sstring>();
+        params["table"] = vm["table"].as<sstring>();
+    }
 
-    const auto clear_res = client.del("/storage_service/tablets/snapshots", std::move(params));
+    const auto clear_res = client.del("/storage_service/tablets/snapshots", params);
     const auto task_id = rjson::to_string_view(clear_res);
 
-    fmt::print(std::cout, "Requested clearing of cluster snapshot [{}]\n", tag);
+    if (vm.contains("table")) {
+        fmt::print(std::cout, "Requested clearing of table {}.{} of cluster snapshot [{}]\n", params["keyspace"], params["table"], tag);
+    } else {
+        fmt::print(std::cout, "Requested clearing of cluster snapshot [{}]\n", tag);
+    }
 
     if (vm.contains("nowait")) {
         fmt::print(R"(The task id of this operation is {}
@@ -4320,12 +4365,32 @@ bucket references of its tables on object storage, and its entries in the
 snapshot catalog. A snapshot that was backed up with cluster backup is not
 cleared unless --force is given, which deletes the backup along with it.
 
+Given a keyspace and a table, only that table is cleared and the snapshot keeps
+its other tables. Clearing the last table of a snapshot clears the snapshot.
+
 For more information, see: {}
 )", doc_link("operating-scylla/nodetool-commands/cluster/clearsnapshot.html")),
                         {
                             typed_option<sstring>("tag,t", "The name of the snapshot to clear"),
                             typed_option<>("force", "Also delete the snapshot's backup, or the leftovers of a snapshot that was never committed"),
                             typed_option<>("nowait", "Don't wait on the clear process"),
+                        },
+                        {
+                            typed_option<sstring>("keyspace", "The keyspace of the table to clear", 1),
+                            typed_option<sstring>("table", "The table to clear from the snapshot, the other tables stay", 1),
+                        },
+                    },
+                    {
+                        "listsnapshots",
+                        "List the cluster-wide snapshots and their tables",
+fmt::format(R"(
+Lists the snapshots taken with cluster snapshot, with the tables each of them
+contains. Every node returns the same list. Snapshots taken on one node only
+are listed by listsnapshots.
+
+For more information, see: {}
+)", doc_link("operating-scylla/nodetool-commands/cluster/listsnapshots.html")),
+                        {
                         },
                         {
                         },
@@ -4348,6 +4413,9 @@ For more information, see: {}
                     },
                     {
                         "clearsnapshot", { cluster_clearsnapshot_operation }
+                    },
+                    {
+                        "listsnapshots", { cluster_listsnapshots_operation }
                     },
                 }
             }
